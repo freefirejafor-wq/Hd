@@ -874,15 +874,12 @@ export async function loadSubtitleTrackByUrl(
     return parsedCues.map((c) => ({ ...c }));
   }
 
-  const isAlreadyBangla =
-    track.lang === 'ben' ||
-    track.lang === 'bn' ||
-    /[\u0980-\u09FF]/.test(
-      parsedCues
-        .slice(0, 8)
-        .map((c) => c.text)
-        .join(' ')
-    );
+  const isAlreadyBangla = /[\u0980-\u09FF]/.test(
+    parsedCues
+      .slice(0, 15)
+      .map((c) => c.text)
+      .join(' ')
+  );
 
   if (isAlreadyBangla) {
     parsedCues.forEach((c) => {
@@ -1010,21 +1007,28 @@ async function fetchOpenSubtitlesTracksForCandidates(
       scored.sort((a: { score: number }, b: { score: number }) => b.score - a.score);
 
       const tracks: AvailableSubtitleTrack[] = [];
-      const seenUrls = new Set<string>();
+      const bestBangla = scored.find((item: { isBn: boolean }) => item.isBn) || scored[0];
+      const bestEnglish = scored.find((item: { isBn: boolean }) => !item.isBn) || scored[0];
 
-      for (const item of scored) {
-        if (seenUrls.has(item.url)) continue;
-        seenUrls.add(item.url);
-
+      if (bestBangla) {
         tracks.push({
-          id: item.rawId,
-          url: item.url,
-          lang: item.isBn ? 'bn' : 'en',
-          label: `${item.isBn ? 'বাংলা অরিজিনাল' : 'বাংলা Auto-Sync'} #${tracks.length + 1} (${item.tag})`,
-          releaseName: item.releaseRaw.slice(0, 65),
+          id: `os-bn-${bestBangla.rawId}`,
+          url: bestBangla.url,
+          lang: 'bn',
+          label: 'বাংলা',
+          releaseName: bestBangla.releaseRaw.slice(0, 65),
+          keepOriginalScript: false,
         });
-
-        if (tracks.length >= 6) break;
+      }
+      if (bestEnglish) {
+        tracks.push({
+          id: `os-en-${bestEnglish.rawId}`,
+          url: bestEnglish.url,
+          lang: 'en',
+          label: 'English',
+          releaseName: bestEnglish.releaseRaw.slice(0, 65),
+          keepOriginalScript: true,
+        });
       }
 
       if (tracks.length > 0) {
@@ -1124,11 +1128,14 @@ export async function fetchOrGenerateAutoBanglaSubtitles(params: {
 
         if (rawCaptions.length > 0) {
           const mbTracks: AvailableSubtitleTrack[] = [];
-          const nativeBanglaCap = rawCaptions.find((c) =>
-            /^(bn|ben)$/i.test(c.lan) || /bangla|bengali|বাংলা/i.test(c.lanName)
+          const nativeBanglaCap = rawCaptions.find(
+            (c) => /^(bn|ben)$/i.test(c.lan) || /bangla|bengali|বাংলা/i.test(c.lanName)
           );
           const englishCap =
             rawCaptions.find((c) => /^en/i.test(c.lan) || /english/i.test(c.lanName)) ||
+            rawCaptions.find(
+              (c) => !(/^(bn|ben)$/i.test(c.lan) || /bangla|bengali|বাংলা/i.test(c.lanName))
+            ) ||
             rawCaptions[0];
 
           if (nativeBanglaCap) {
@@ -1136,7 +1143,7 @@ export async function fetchOrGenerateAutoBanglaSubtitles(params: {
               id: `mb-cap-bn-${nativeBanglaCap.id}`,
               url: nativeBanglaCap.url,
               lang: 'bn',
-              label: 'বাংলা (CinePulse Official)',
+              label: 'বাংলা',
               releaseName: `${params.title} • Official Bangla`,
               keepOriginalScript: false,
             });
@@ -1145,22 +1152,19 @@ export async function fetchOrGenerateAutoBanglaSubtitles(params: {
               id: `mb-cap-auto-bn-${englishCap.id}`,
               url: englishCap.url,
               lang: 'bn',
-              label: 'বাংলা (CinePulse Auto-Translate)',
-              releaseName: `${params.title} • Official Sync`,
+              label: 'বাংলা',
+              releaseName: `${params.title} • Official Bangla`,
               keepOriginalScript: false,
             });
           }
 
-          for (const cap of rawCaptions) {
-            const isBn =
-              /^(bn|ben)$/i.test(cap.lan) || /bangla|bengali|বাংলা/i.test(cap.lanName);
-            if (isBn) continue;
+          if (englishCap) {
             mbTracks.push({
-              id: `mb-cap-orig-${cap.id}-${cap.lan}`,
-              url: cap.url,
-              lang: cap.lan || 'en',
-              label: `${cap.lanName || 'English'} (CinePulse Official)`,
-              releaseName: `${params.title} • ${cap.lanName}`,
+              id: `mb-cap-orig-${englishCap.id}-en`,
+              url: englishCap.url,
+              lang: 'en',
+              label: 'English',
+              releaseName: `${params.title} • Official English`,
               keepOriginalScript: true,
             });
           }

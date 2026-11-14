@@ -255,3 +255,11 @@ export interface LiveSportMatch {
   detailUrl: string;
 }
 
+export interface UserAccountSession {
+  userId: string;
+  username: string;
+  isGuest: boolean;
+  token: string;
+  watchlist?: MovieCardItem[];
+  continueWatching?: WatchProgressItem[];
+}

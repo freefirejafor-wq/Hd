@@ -1,4 +1,5 @@
 import type { MovieCardItem } from '../types/cinema.ts';
+import { cloakImageUrl } from './securityShield.ts';
 
 const UPLOAD_TS_STORAGE_KEY = 'cp_live_upload_ts_v8';
 
@@ -576,6 +577,8 @@ export function normalizeMovieCardItem(
 
   return {
     ...item,
+    poster: cloakImageUrl(item.poster),
+    previewImage: item.previewImage ? cloakImageUrl(item.previewImage) : item.previewImage,
     uploadedAtMs,
     timeAgo: liveTimeAgo,
     episodePill: cleaned.episodePill,
@@ -596,7 +599,7 @@ export function normalizeMovieCardList(items: MovieCardItem[], nowMs = Date.now(
 }
 
 /**
- * Sorts all combined MovieCardItems from MovieBox HD, MovieLinkBD, and MyFlixBD naturally:
+ * Sorts all combined MovieCardItems from MovieBox HD and MovieLinkBD naturally:
  * 1. Top Hot/Dhamaka items lead at the top.
  * 2. Brand-new uploads (minutes/hours ago) follow immediately so every newly uploaded title is visible.
  * 3. Remaining current and archive items follow in natural recency and hype order without omitting any item.

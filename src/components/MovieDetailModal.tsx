@@ -1,4 +1,5 @@
-import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { cloakStreamUrl } from '../utils/securityShield';
 import {
   ArrowUpDown,
   Check,
@@ -285,7 +286,7 @@ function pickBestSourceIndexForNet(sources: StreamSource[], autoNet: boolean): n
   const isNativeMp4Stream = (s: StreamSource) =>
     isDirectStream(s) &&
     (s.type === 'mp4' ||
-      /\/api\/mb-stream|\/api\/mb-ep-stream|\.(mp4|m4v)(\?|$)/i.test(s.url || ''));
+      /\/_s\/v\.mp4|\/api\/mb-stream|\/api\/mb-ep-stream|\.(mp4|m4v)(\?|$)/i.test(s.url || ''));
   const isLightweightH264 = (s: StreamSource) =>
     isDirectStream(s) &&
     !/\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${s.name} ${s.qualityLabel}`) &&
@@ -393,8 +394,8 @@ function buildInstantMovieBoxBootstrapDetail(movie: MovieCardItem | null): Movie
       audio: lang,
       audioLanguages: [lang],
       provider: 'CinePulse HD 480p',
-      url: `${baseStreamUrl}&q=480`,
-      downloadUrl: `${baseStreamUrl}&q=480&dl=1`,
+      url: cloakStreamUrl(`${baseStreamUrl}&q=480`),
+      downloadUrl: cloakStreamUrl(`${baseStreamUrl}&q=480&dl=1`),
       type: 'mp4',
       name: `${movie.title} (480p)`,
     },
@@ -405,8 +406,8 @@ function buildInstantMovieBoxBootstrapDetail(movie: MovieCardItem | null): Movie
       audio: lang,
       audioLanguages: [lang],
       provider: 'CinePulse HD 720p',
-      url: `${baseStreamUrl}&q=720`,
-      downloadUrl: `${baseStreamUrl}&q=720&dl=1`,
+      url: cloakStreamUrl(`${baseStreamUrl}&q=720`),
+      downloadUrl: cloakStreamUrl(`${baseStreamUrl}&q=720&dl=1`),
       type: 'mp4',
       name: `${movie.title} (720p)`,
     },
@@ -417,8 +418,8 @@ function buildInstantMovieBoxBootstrapDetail(movie: MovieCardItem | null): Movie
       audio: lang,
       audioLanguages: [lang],
       provider: 'CinePulse HD 1080p',
-      url: `${baseStreamUrl}&q=1080`,
-      downloadUrl: `${baseStreamUrl}&q=1080&dl=1`,
+      url: cloakStreamUrl(`${baseStreamUrl}&q=1080`),
+      downloadUrl: cloakStreamUrl(`${baseStreamUrl}&q=1080&dl=1`),
       type: 'mp4',
       name: `${movie.title} (1080p)`,
     },
@@ -547,9 +548,10 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
   const [playerMode, setPlayerMode] = useState<'stream' | 'trailer'>('stream');
   const [videoError, setVideoError] = useState(false);
-  // Use native continuous <video> streaming on Android/Desktop for zero segment transitions,
-  // and Client-Side MP4 Remuxer on iPhone/iPad Safari (or as automatic fallback if native stream errors).
-  const [useHlsBridge, setUseHlsBridge] = useState<boolean>(() => isAppleWebKitDevice());
+  // Native continuous <video> for H.264 MP4 on all devices (including iPhone/iPad Safari);
+  // only activate Client-Side MKV-to-MP4 Remuxer when an active source on Apple WebKit is raw .mkv!
+  const [useHlsBridge, setUseHlsBridge] = useState<boolean>(false);
+  const desiredResumeSecRef = useRef<number | null>(null);
   const [iosBlobUrl, setIosBlobUrl] = useState<string>('');
   const [iosSegmentStartSec, setIosSegmentStartSec] = useState<number>(0);
   const [iosCurrentSegIndex, setIosCurrentSegIndex] = useState<number>(0);
@@ -1016,7 +1018,8 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     setEpisodeSearchQuery('');
     setEpisodeSortOrder('asc');
     setFailedSourceIndices([]);
-    setUseHlsBridge(isAppleWebKitDevice());
+    setUseHlsBridge(false);
+    desiredResumeSecRef.current = null;
     setPlayerMode('stream');
     setVideoError(false);
     setHasStartedPlayback(false);
@@ -1052,20 +1055,20 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
           : 0;
       if (!isAlreadyMountedInstant) {
         setDetail((prev) => {
-          // Only preserve Episode 0's bootstrap URL if <video> has ALREADY decoded metadata/frames (readyState >= 1).
-          // If <video> is still at readyState === 0, switch immediately to the pre-signed /api/mb-stream.mp4 URLs!
+          // Preserve Episode 0's active bootstrap stream connection unless <video> encountered an error,
+          // so full-length movies never abort their in-flight moov header download when /api/details finishes!
           const vEl = videoRef.current;
-          const isVideoAlreadyDecoding = Boolean(vEl && vEl.readyState >= 1 && !vEl.error);
+          const isVideoHealthy = Boolean(!vEl || !vEl.error);
           const prevEp0 = prev?.episodes?.[0];
           const nextEp0 = eps[0];
           const isPrevBootstrap = prevEp0?.sources?.[0]?.id?.startsWith('mb-boot-');
           if (
-            isVideoAlreadyDecoding &&
+            isVideoHealthy &&
             isPrevBootstrap &&
             prevEp0 &&
             nextEp0 &&
             initEpIdx === 0 &&
-            prevEp0.kind === nextEp0.kind
+            (nextEp0.sources?.length || 0) > 0
           ) {
             const resolvedSources = nextEp0.sources || [];
             const enrichedSources = prevEp0.sources.map((bSrc) => {
@@ -1169,26 +1172,6 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     };
   }, [movie?.path, movie?.url, activeNodeId]);
 
-  const [myflixData, setMyflixData] = useState<{
-    embedServers?: Array<{ label: string; url: string }>;
-    seasonsData?: Array<{
-      index?: number;
-      episodes?: Array<{
-        index?: number;
-        title?: string;
-        servers?: Array<{ label?: string; url?: string }>;
-      }>;
-    }>;
-    year?: string;
-    genre?: string;
-    runtime?: string;
-    director?: string;
-    release?: string;
-    rating?: string;
-    screenshots?: string[];
-    cast?: Array<{ name: string; role: string; photo: string }>;
-    downloads?: Array<{ label: string; url: string }>;
-  } | null>(null);
   const [showSeasonDropdown, setShowSeasonDropdown] = useState(false);
   const [showDubDropdown, setShowDubDropdown] = useState(false);
   const [showAllScreenshots, setShowAllScreenshots] = useState(false);
@@ -1196,7 +1179,6 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   const castScrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
-    setMyflixData(null);
     setShowSeasonDropdown(false);
     setShowDubDropdown(false);
     setShowAllScreenshots(false);
@@ -1224,48 +1206,8 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     if (effectiveDetail?.episodes && effectiveDetail.episodes.length > 0) {
       return effectiveDetail.episodes;
     }
-    if (loading) {
-      return [];
-    }
-    if (myflixData?.seasonsData && myflixData.seasonsData.length > 0) {
-      const built: EpisodeItem[] = [];
-      let globalIdx = 0;
-      for (const sObj of myflixData.seasonsData) {
-        const sNum = Number(sObj?.index) || 1;
-        for (const epObj of sObj?.episodes || []) {
-          globalIdx++;
-          const epNum = Number(epObj?.index) || globalIdx;
-          const epTitle = epObj?.title || `Episode ${epNum}`;
-          const srvs = (epObj?.servers || []).filter((s) => s?.url);
-          if (srvs.length > 0) {
-            built.push({
-              id: `mf-s${sNum}-e${epNum}`,
-              label: `S${String(sNum).padStart(2, '0')}E${String(epNum).padStart(2, '0')} • ${epTitle}`,
-              number: epNum,
-              rangeStart: epNum,
-              rangeEnd: epNum,
-              season: sNum,
-              kind: 'episode',
-              sources: srvs.map((srv, idx) => ({
-                id: `mf-ep-${sNum}-${epNum}-${idx}`,
-                name: srv.label || `Cloud Server ${idx + 1}`,
-                quality: 1080,
-                qualityLabel: 'Cloud HLS',
-                audio: movie?.language || 'Multi Audio',
-                audioLanguages: [movie?.language || 'Multi'],
-                provider: srv.label || `Cloud Server ${idx + 1}`,
-                url: String(srv.url),
-                downloadUrl: String(srv.url),
-                type: 'embed',
-              })),
-            });
-          }
-        }
-      }
-      if (built.length > 0) return built;
-    }
     return [];
-  }, [effectiveDetail?.episodes, loading, myflixData?.seasonsData, movie?.language]);
+  }, [effectiveDetail?.episodes]);
 
   const activeEpisode: EpisodeItem | undefined = episodes[selectedEpIdx] || episodes[0];
   const sources = useMemo<StreamSource[]>(() => {
@@ -1280,7 +1222,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     const score = (src: StreamSource) => {
       const url = src.url || '';
       const isMovieBox =
-        src.id?.startsWith('mb-') || /\/api\/mb-stream|\/api\/mb-ep-stream/i.test(url);
+        src.id?.startsWith('mb-') || /\/_s\/v\.mp4|\/api\/mb-stream|\/api\/mb-ep-stream/i.test(url);
       if (isMovieBox) {
         // Prioritize fast-start 480p and 360p first for <0.3s instant playback without waiting on 1.5GB+ HD files!
         const szMatch = (src.name || '').match(/(\d+)\s*MB/i);
@@ -1313,13 +1255,13 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
     const sortedDirect = [...directVideoSources].sort((a, b) => score(b) - score(a));
 
-    const myflixFirst: StreamSource[] = [];
+    const cleanOrdered: StreamSource[] = [];
     const seen = new Set<string>();
 
     for (const [idx, d] of sortedDirect.entries()) {
       if (d.url && !seen.has(d.url)) {
         seen.add(d.url);
-        myflixFirst.push({
+        cleanOrdered.push({
           ...d,
           name: d.name || `CinePulse HD #${idx + 1} (${d.quality || 480}p)`,
           provider: d.provider || `CinePulse HD ${d.quality || 480}p`,
@@ -1327,7 +1269,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       }
     }
 
-    return myflixFirst;
+    return cleanOrdered;
   }, [activeEpisode?.sources]);
   const activeSource: StreamSource | undefined = sources[selectedSourceIdx] || sources[0];
   const isEmbedSource = Boolean(
@@ -1529,13 +1471,16 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
           );
           const englishCap =
             rawCaptions.find((c) => /^en/i.test(c.lan) || /english/i.test(c.lanName)) ||
+            rawCaptions.find(
+              (c) => !(/^(bn|ben)$/i.test(c.lan) || /bangla|bengali|বাংলা/i.test(c.lanName))
+            ) ||
             rawCaptions[0];
           if (nativeBangla) {
             mbTracks.push({
               id: `mb-cap-bn-${nativeBangla.id}`,
               url: nativeBangla.url,
               lang: 'bn',
-              label: 'বাংলা (CinePulse Official)',
+              label: 'বাংলা',
               releaseName: 'Official Bangla',
               keepOriginalScript: false,
             });
@@ -1544,19 +1489,18 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
               id: `mb-cap-auto-bn-${englishCap.id}`,
               url: englishCap.url,
               lang: 'bn',
-              label: 'বাংলা (CinePulse Auto-Translate)',
-              releaseName: 'Official Sync',
+              label: 'বাংলা',
+              releaseName: 'Official Bangla',
               keepOriginalScript: false,
             });
           }
-          for (const cap of rawCaptions) {
-            if (/^(bn|ben)$/i.test(cap.lan) || /bangla|bengali|বাংলা/i.test(cap.lanName)) continue;
+          if (englishCap) {
             mbTracks.push({
-              id: `mb-cap-orig-${cap.id}-${cap.lan}`,
-              url: cap.url,
-              lang: cap.lan || 'en',
-              label: `${cap.lanName || 'English'} (CinePulse Official)`,
-              releaseName: cap.lanName || 'Official',
+              id: `mb-cap-orig-${englishCap.id}-en`,
+              url: englishCap.url,
+              lang: 'en',
+              label: 'English',
+              releaseName: 'Official English',
               keepOriginalScript: true,
             });
           }
@@ -1661,12 +1605,23 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     currentTime,
   ]);
 
+  // Only enable MKV Client-Side Remuxer when Apple WebKit actually plays a raw MKV file (never on native MP4!)
+  useEffect(() => {
+    const rawUrl = activeSource?.url || '';
+    const isAlreadyNativeMp4 =
+      /\.(mp4|m4v|m3u8)(\?|$)/i.test(rawUrl) ||
+      /\/_s\/v\.mp4|\/api\/mb-stream|\/api\/mb-ep-stream/i.test(rawUrl) ||
+      activeSource?.type === 'mp4';
+    const shouldUseMkvBridge = isAppleWebKitDevice() && Boolean(rawUrl) && !isAlreadyNativeMp4 && !isEmbedSource;
+    setUseHlsBridge(shouldUseMkvBridge);
+  }, [activeSource?.url, activeSource?.type, isEmbedSource]);
+
   // Client-Side In-Browser Turbo Micro-Chunk MKV-to-MP4 Engine (700KB Instant Start + 650KB Exact Cues Seek)
   useEffect(() => {
     const rawUrl = activeSource?.url || '';
     const isAlreadyNativeMp4 =
       /\.(mp4|m4v|m3u8)(\?|$)/i.test(rawUrl) ||
-      /\/api\/mb-stream|\/api\/mb-ep-stream/i.test(rawUrl) ||
+      /\/_s\/v\.mp4|\/api\/mb-stream|\/api\/mb-ep-stream/i.test(rawUrl) ||
       activeSource?.type === 'mp4';
 
     if (!useHlsBridge || !rawUrl || isAlreadyNativeMp4 || isEmbedSource) {
@@ -1699,7 +1654,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
             (savedProgress.episodeIdx === undefined ||
               savedProgress.episodeIdx === selectedEpIdx) &&
             savedProgress.progressSeconds &&
-            savedProgress.progressSeconds > 20
+            savedProgress.progressSeconds >= 4
           ? savedProgress.progressSeconds
           : 0;
 
@@ -1767,7 +1722,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     if (!rawUrl) return '';
     const isAlreadyNativeMp4 =
       /\.(mp4|m4v|m3u8)(\?|$)/i.test(rawUrl) ||
-      /\/api\/mb-stream|\/api\/mb-ep-stream/i.test(rawUrl) ||
+      /\/_s\/v\.mp4|\/api\/mb-stream|\/api\/mb-ep-stream/i.test(rawUrl) ||
       activeSource?.type === 'mp4';
     if (useHlsBridge && !isAlreadyNativeMp4 && !isEmbedSource) {
       return iosBlobUrl;
@@ -2289,7 +2244,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   const isMovieBoxStream = Boolean(
     movie?.path?.startsWith('/mb/') ||
       activeSource?.id?.startsWith('mb-') ||
-      /\/api\/mb-stream|\/api\/mb-ep-stream/i.test(activeSource?.url || '')
+      /\/_s\/v\.mp4|\/api\/mb-stream|\/api\/mb-ep-stream/i.test(activeSource?.url || '')
   );
 
   // Enforces 0% volume & muted state during the 0s..13.5s upstream voice-tag window
@@ -2400,12 +2355,13 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
       savedProgress &&
       (savedProgress.episodeIdx === undefined || savedProgress.episodeIdx === selectedEpIdx) &&
       savedProgress.progressSeconds &&
-      savedProgress.progressSeconds > 15 &&
-      (!v.duration || savedProgress.progressSeconds < v.duration - 20);
+      savedProgress.progressSeconds >= 4 &&
+      (!v.duration || savedProgress.progressSeconds < v.duration - 15);
 
     hasAppliedIntroSkipRef.current = true;
 
     if (canResumeSaved && savedProgress?.progressSeconds) {
+      desiredResumeSecRef.current = savedProgress.progressSeconds;
       try {
         v.currentTime = savedProgress.progressSeconds;
         lastRecordedSecondRef.current = Math.floor(savedProgress.progressSeconds);
@@ -2486,6 +2442,46 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
     setIsBuffering(false);
     setVideoError(true);
+  };
+
+  const flushCurrentProgress = useCallback(() => {
+    const v = videoRef.current;
+    if (!movie || !v) return;
+    const globalSec = Math.floor(
+      useHlsBridge ? iosSegmentStartSecRef.current + v.currentTime : v.currentTime
+    );
+    const totalFromCtrl = iosControllerRef.current?.getTotalDurationSec() || 0;
+    const dur = Math.floor(totalFromCtrl > 0 ? totalFromCtrl : v.duration || duration || 0);
+    if (globalSec >= 4) {
+      onRecordWatchProgress(
+        movie,
+        activeEpisode,
+        selectedEpIdx,
+        activeSource,
+        globalSec,
+        dur
+      );
+    }
+  }, [movie, useHlsBridge, duration, activeEpisode, selectedEpIdx, activeSource, onRecordWatchProgress]);
+
+  useEffect(() => {
+    if (!movie) return;
+    const onHiddenFlush = () => {
+      if (document.visibilityState === 'hidden') {
+        flushCurrentProgress();
+      }
+    };
+    window.addEventListener('pagehide', flushCurrentProgress);
+    document.addEventListener('visibilitychange', onHiddenFlush);
+    return () => {
+      window.removeEventListener('pagehide', flushCurrentProgress);
+      document.removeEventListener('visibilitychange', onHiddenFlush);
+    };
+  }, [movie, flushCurrentProgress]);
+
+  const handleModalClose = () => {
+    flushCurrentProgress();
+    onClose();
   };
 
   const handleTogglePlayPause = () => {
@@ -3421,7 +3417,6 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     const add = (u?: string) => {
       if (u && u.startsWith('http') && !list.includes(u)) list.push(u);
     };
-    (myflixData?.screenshots || []).forEach(add);
     (effectiveDetail?.screenshots || []).forEach(add);
     if (list.length === 0) {
       add(effectiveDetail?.backdrop);
@@ -3443,7 +3438,6 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
         photo: c.photo || '',
       });
     };
-    (myflixData?.cast || []).forEach(add);
     (effectiveDetail?.cast || []).forEach(add);
     return list;
   })();
@@ -3474,32 +3468,20 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
         });
       }
     }
-    for (const mDl of myflixData?.downloads || []) {
-      if (mDl.url && !seen.has(mDl.url)) {
-        seen.add(mDl.url);
-        list.push({
-          label: mDl.label,
-          subLabel: 'Cloud Mirror Download',
-          url: mDl.url,
-        });
-      }
-    }
     return list;
   })();
 
   const displayYear =
-    myflixData?.year ||
     effectiveDetail?.releaseDate?.match(/\b(20\d{2}|19\d{2})\b/)?.[1] ||
     (movie.title.match(/\b(20\d{2}|19\d{2})\b/)?.[1] ?? '2026');
   const displayGenre =
-    myflixData?.genre ||
     effectiveDetail?.genre ||
     (movie.typeBadge === 'SERIES' ? 'Drama, Crime, Series' : 'Action, Drama, Thriller');
-  const displayDirector = myflixData?.director || 'CinePulse Original';
+  const displayDirector = 'CinePulse Original';
   const displayRelease =
-    myflixData?.release || effectiveDetail?.releaseDate || normalizeMovieCardItem(movie).timeAgo;
+    effectiveDetail?.releaseDate || normalizeMovieCardItem(movie).timeAgo;
   const displayRating =
-    myflixData?.rating || normalizeMovieCardItem(movie).rating || ratingScore || '8.7';
+    normalizeMovieCardItem(movie).rating || ratingScore || '8.7';
   const currentEpBadgeText = activeEpisode
     ? formatEpisodeTileBadge(activeEpisode, selectedEpIdx)
     : '1';
@@ -3565,14 +3547,14 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
           : 'fixed inset-0 z-50 w-full h-[100dvh] max-w-[100vw] bg-[#050505] text-[#e5e5e5] flex flex-col overflow-hidden'
       }
     >
-      {/* Top Clean MyFlixBD-Style Navbar (Locked at Top; Hidden in Mini Player or Fullscreen) */}
+      {/* Top Clean CinePulse Navbar (Locked at Top; Hidden in Mini Player or Fullscreen) */}
       {!isMiniPlayer && !isLandscapeMode && !isFullscreen && !isPortraitFullscreen && (
         <header className="shrink-0 relative z-40 w-full bg-[#0a0a0a]/95 backdrop-blur-md border-b border-white/[0.08]">
           <div className="max-w-5xl mx-auto px-3 sm:px-6 h-13 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2.5 min-w-0">
               <button
                 type="button"
-                onClick={onClose}
+                onClick={handleModalClose}
                 aria-label="Back to Home"
                 className="w-9 h-9 rounded-lg bg-[#151515] hover:bg-[#222222] border border-white/[0.08] flex items-center justify-center text-white active:scale-95 transition-all shrink-0"
               >
@@ -3580,7 +3562,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
               </button>
               <button
                 type="button"
-                onClick={onClose}
+                onClick={handleModalClose}
                 className="flex items-center gap-2 text-left group truncate"
               >
                 <span className="w-7 h-7 rounded-md bg-[#dc2626] flex items-center justify-center text-white shadow-[0_0_12px_rgba(220,38,38,0.5)] shrink-0">
@@ -3885,7 +3867,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
         </header>
       )}
 
-      {/* Main MyFlixBD Container — Video Pinned at Top (shrink-0), Lower Page Scrolls Independently */}
+      {/* Main CinePulse Container — Video Pinned at Top (shrink-0), Lower Page Scrolls Independently */}
       <div
         className={
           isMiniPlayer
@@ -4013,7 +3995,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                         data-mini-close="true"
                         onClick={(e) => {
                           e.stopPropagation();
-                          onClose();
+                          handleModalClose();
                         }}
                         className="pointer-events-auto w-6 h-6 rounded-full bg-black/75 text-white hover:text-red-400 flex items-center justify-center border border-white/20"
                       >
@@ -4196,9 +4178,25 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                         // ignore
                       }
                     }}
-                    onPause={() => {
+                    onPause={(e) => {
                       if (!isSeekingRef.current && !iosTransitioningRef.current) {
                         setIsPlaying(false);
+                        const v = e.currentTarget;
+                        const globalSec = Math.floor(
+                          useHlsBridge ? iosSegmentStartSecRef.current + v.currentTime : v.currentTime
+                        );
+                        const totalFromCtrl = iosControllerRef.current?.getTotalDurationSec() || 0;
+                        const dur = Math.floor(totalFromCtrl > 0 ? totalFromCtrl : v.duration || duration || 0);
+                        if (globalSec >= 4) {
+                          onRecordWatchProgress(
+                            movie,
+                            activeEpisode,
+                            selectedEpIdx,
+                            activeSource,
+                            globalSec,
+                            dur
+                          );
+                        }
                       }
                     }}
                     onPlaying={(e) => {
@@ -4211,6 +4209,17 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                         window.clearTimeout(startupWatchdogTimerRef.current);
                         startupWatchdogTimerRef.current = null;
                       }
+                      if (
+                        !useHlsBridge &&
+                        desiredResumeSecRef.current &&
+                        desiredResumeSecRef.current >= 4 &&
+                        v.currentTime < desiredResumeSecRef.current - 3
+                      ) {
+                        try {
+                          v.currentTime = desiredResumeSecRef.current;
+                        } catch {}
+                      }
+                      desiredResumeSecRef.current = null;
                       setIsPlaying(true);
                       setHasStartedPlayback(true);
                       setIsBuffering(false);
@@ -4227,6 +4236,16 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                       const v = e.currentTarget;
                       isSeekingRef.current = false;
                       iosTransitioningRef.current = false;
+                      if (
+                        !useHlsBridge &&
+                        desiredResumeSecRef.current &&
+                        desiredResumeSecRef.current >= 4 &&
+                        v.currentTime < desiredResumeSecRef.current - 3
+                      ) {
+                        try {
+                          v.currentTime = desiredResumeSecRef.current;
+                        } catch {}
+                      }
                       setHasStartedPlayback(true);
                       setIsBuffering(false);
                       syncCleanAudioVolume(v);
@@ -4250,6 +4269,16 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                       if (startupWatchdogTimerRef.current) {
                         window.clearTimeout(startupWatchdogTimerRef.current);
                         startupWatchdogTimerRef.current = null;
+                      }
+                      if (
+                        !useHlsBridge &&
+                        desiredResumeSecRef.current &&
+                        desiredResumeSecRef.current >= 4 &&
+                        v.currentTime < desiredResumeSecRef.current - 3
+                      ) {
+                        try {
+                          v.currentTime = desiredResumeSecRef.current;
+                        } catch {}
                       }
                       isSeekingRef.current = false;
                       setHasStartedPlayback(true);
@@ -4306,6 +4335,14 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                       setHasStartedPlayback(true);
                       setIsBuffering(false);
                       syncCleanAudioVolume(v);
+                      const globalSec = Math.floor(
+                        useHlsBridge ? iosSegmentStartSecRef.current + v.currentTime : v.currentTime
+                      );
+                      const totalFromCtrl = iosControllerRef.current?.getTotalDurationSec() || 0;
+                      const dur = Math.floor(totalFromCtrl > 0 ? totalFromCtrl : v.duration || duration || 0);
+                      if (globalSec >= 4) {
+                        onRecordWatchProgress(movie, activeEpisode, selectedEpIdx, activeSource, globalSec, dur);
+                      }
                     }}
                     onLoadedMetadata={handleVideoLoadedMetadata}
                     onTimeUpdate={(e) => {
@@ -4381,7 +4418,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                         lastRecordedSecondRef.current = globalSec;
                         setCurrentTime(globalSec);
                         if (dur > 0 && dur !== duration) setDuration(dur);
-                        if (globalSec > 5 && globalSec % 10 === 0) {
+                        if (globalSec >= 4 && globalSec % 3 === 0) {
                           onRecordWatchProgress(
                             movie,
                             activeEpisode,
@@ -4810,24 +4847,14 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                 <button
                   type="button"
                   onClick={() => {
+                    setShowSubSyncPanel((v) => !v);
                     if (!autoBanglaSubEnabled) {
                       setAutoBanglaSubEnabled(true);
-                      triggerHud('toast', 'Subtitles (CC): ON');
-                    } else if (availableSubTracks.length > 1) {
-                      const nextIdx = (activeSubTrackIdx + 1) % (availableSubTracks.length + 1);
-                      if (nextIdx === availableSubTracks.length) {
-                        setAutoBanglaSubEnabled(false);
-                        triggerHud('toast', 'Subtitles (CC): OFF');
-                      } else {
-                        handleSelectSubtitleTrack(nextIdx);
-                      }
-                    } else {
-                      setAutoBanglaSubEnabled(false);
-                      triggerHud('toast', 'Subtitles (CC): OFF');
+                      triggerHud('toast', 'CC: বাংলা');
                     }
                   }}
                   className={`h-9 px-3.5 rounded-full text-xs sm:text-sm font-medium flex items-center gap-1.5 shrink-0 transition-colors cursor-pointer ${
-                    autoBanglaSubEnabled
+                    autoBanglaSubEnabled || showSubSyncPanel
                       ? 'bg-[#dc2626]/25 border border-[#dc2626] text-white'
                       : 'bg-[#1b1d21] hover:bg-[#25282e] text-gray-200'
                   }`}
@@ -4837,7 +4864,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                     {loadingAutoSub
                       ? 'Loading CC...'
                       : autoBanglaSubEnabled
-                        ? availableSubTracks[activeSubTrackIdx]?.label || 'বাংলা Sub: ON'
+                        ? `CC: ${availableSubTracks[activeSubTrackIdx]?.label || 'বাংলা'}`
                         : 'Subtitles (CC)'}
                   </span>
                 </button>
@@ -4863,6 +4890,60 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   className="hidden"
                 />
               </div>
+
+              {/* Separate Dedicated Subtitle Bar (ONLY 2 languages: বাংলা & English + Off) */}
+              {showSubSyncPanel && (
+                <div className="mt-2 p-2.5 rounded-xl bg-[#14161b] border border-white/15 flex flex-wrap items-center gap-2">
+                  <span className="text-xs font-bold text-gray-300 mr-1 flex items-center gap-1">
+                    <Subtitles className="w-3.5 h-3.5 text-[#dc2626]" />
+                    <span>Subtitles:</span>
+                  </span>
+                  {(availableSubTracks.length > 0
+                    ? availableSubTracks.slice(0, 2)
+                    : [
+                        { id: 'default-bn', url: '', lang: 'bn', label: 'বাংলা', keepOriginalScript: false },
+                        { id: 'default-en', url: '', lang: 'en', label: 'English', keepOriginalScript: true },
+                      ]
+                  ).map((track, idx) => {
+                    const isSelected = autoBanglaSubEnabled && activeSubTrackIdx === idx;
+                    return (
+                      <button
+                        key={track.id || track.label}
+                        type="button"
+                        onClick={() => {
+                          if (availableSubTracks[idx]) {
+                            void handleSelectSubtitleTrack(idx);
+                          } else {
+                            setActiveSubTrackIdx(idx);
+                            setAutoBanglaSubEnabled(true);
+                          }
+                        }}
+                        className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                          isSelected
+                            ? 'bg-[#dc2626] text-white shadow-md'
+                            : 'bg-[#1f2229] text-gray-300 hover:bg-[#2a2e37]'
+                        }`}
+                      >
+                        {track.label}
+                      </button>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAutoBanglaSubEnabled(false);
+                      triggerHud('toast', 'Subtitles (CC): OFF');
+                    }}
+                    className={`px-3.5 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer ${
+                      !autoBanglaSubEnabled
+                        ? 'bg-[#dc2626] text-white shadow-md'
+                        : 'bg-[#1f2229] text-gray-300 hover:bg-[#2a2e37]'
+                    }`}
+                  >
+                    Off
+                  </button>
+                </div>
+              )}
 
               {/* Separate Dedicated Sound Booster Bar (Opens when tapping Sound Boost pill) */}
               {showSoundBoostBar && (
@@ -5461,7 +5542,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                             key={idx}
                             type="button"
                             onClick={() => {
-                              onClose();
+                              handleModalClose();
                               onSearchByActor(actor.name);
                             }}
                             className="w-20 shrink-0 flex flex-col items-center text-center cursor-pointer"

@@ -31,17 +31,20 @@ interface MovieRequestModalProps {
   onClearWatchHistory?: () => void;
 }
 
-function getUploaderSiteInfo(_path?: string): {
-  id: 'MOVIEBOX' | 'MOVIELINKBD' | 'MYFLIX';
+function getUploaderSiteInfo(path?: string): {
+  id: 'MOVIEBOX' | 'MOVIELINKBD';
   name: string;
   uploaderText: string;
   badgeClass: string;
 } {
+  const isMb = !path || path.startsWith('/mb/');
   return {
-    id: 'MOVIEBOX',
-    name: 'CinePulse HD',
-    uploaderText: 'CinePulse HD',
-    badgeClass: 'bg-emerald-600/90 text-white border-emerald-400/50',
+    id: isMb ? 'MOVIEBOX' : 'MOVIELINKBD',
+    name: isMb ? 'CinePulse HD' : 'CinePulse Bangla Hub',
+    uploaderText: isMb ? 'CinePulse HD' : 'CinePulse Bangla Hub',
+    badgeClass: isMb
+      ? 'bg-emerald-600/90 text-white border-emerald-400/50'
+      : 'bg-sky-600/90 text-white border-sky-400/50',
   };
 }
 
@@ -138,7 +141,7 @@ export const MovieRequestModal: React.FC<MovieRequestModalProps> = ({
   onClearWatchHistory,
 }) => {
   const [activeModalTab, setActiveModalTab] = useState<'UPLOADS_24H' | 'REQUEST_FORM'>('UPLOADS_24H');
-  const [siteFilter, setSiteFilter] = useState<'ALL' | 'MOVIEBOX' | 'MOVIELINKBD' | 'MYFLIX'>('ALL');
+  const [siteFilter, setSiteFilter] = useState<'ALL' | 'MOVIEBOX' | 'MOVIELINKBD'>('ALL');
   const [justRefreshed, setJustRefreshed] = useState(false);
 
   // Movie Request / Broken Link Report state
@@ -169,14 +172,12 @@ export const MovieRequestModal: React.FC<MovieRequestModalProps> = ({
   const siteCounts = useMemo(() => {
     let mb = 0;
     let mlbd = 0;
-    let mf = 0;
     for (const item of last24hItems) {
       const info = getUploaderSiteInfo(item.path);
       if (info.id === 'MOVIEBOX') mb++;
-      else if (info.id === 'MYFLIX') mf++;
       else mlbd++;
     }
-    return { total: last24hItems.length, mb, mlbd, mf };
+    return { total: last24hItems.length, mb, mlbd };
   }, [last24hItems]);
 
   const filtered24h = useMemo(() => {
@@ -512,12 +513,17 @@ export const MovieRequestModal: React.FC<MovieRequestModalProps> = ({
               <div className="grid grid-cols-1 gap-1.5">
                 {[
                   { id: 'node-moviebox', label: 'CinePulse HD (Official Global 4K/1080p Server)' },
+                  { id: 'node-mlbd', label: 'CinePulse Bangla & South Hub (Natok / Cartoon / Bangla)' },
                 ].map((nd) => (
                   <button
                     key={nd.id}
                     type="button"
                     onClick={() => onSelectNode(nd.id)}
-                    className="h-8 rounded-lg text-[11px] font-bold border transition-all bg-emerald-600/90 text-white border-emerald-400"
+                    className={`h-8 rounded-lg text-[11px] font-bold border transition-all ${
+                      activeNodeId === nd.id
+                        ? 'bg-emerald-600/90 text-white border-emerald-400'
+                        : 'bg-[#0c0e14] text-gray-300 border-white/10 hover:text-white'
+                    }`}
                   >
                     {nd.label}
                   </button>

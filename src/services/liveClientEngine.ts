@@ -21,15 +21,12 @@ import type {
   StreamSource,
 } from '../types/cinema';
 import { prewarmMkvStreamMeta } from './mkvIosClientRemuxer';
+import { cloakStreamUrl } from '../utils/securityShield';
 
-const MIRROR_ORIGINS = [
-  'https://cmyyhb.movielinkbd.at',
-  'https://4yer8f.movielinkbd.at',
-];
+const MIRROR_ORIGINS: string[] = [];
 
 const CORS_BRIDGES = [
-  (targetUrl: string) =>
-    `https://allorigins.hexlet.app/raw?url=${encodeURIComponent(targetUrl)}`,
+  (_targetUrl: string) => '',
 ];
 
 interface StaticDbSnapshot {
@@ -141,18 +138,19 @@ function sortEpisodeSourcesFastestFirst(sources?: StreamSource[]): StreamSource[
   if (!Array.isArray(sources) || sources.length <= 1) return sources || [];
   const score = (src: StreamSource) => {
     const isEmbed =
-      src.type === 'embed' || /abyssplayer\.com|abysscdn\.com|myflix/i.test(`${src.url || ''} ${src.id || ''}`);
+      src.type === 'embed' || /abyssplayer\.com|abysscdn\.com/i.test(`${src.url || ''} ${src.id || ''}`);
     if (isEmbed) return 100;
     const isMovieBox =
-      src.id?.startsWith('mb-') || /\/api\/mb-stream|\/api\/mb-ep-stream/i.test(src.url || '');
+      src.id?.startsWith('mb-') ||
+      /\/_s\/v\.mp4|\/api\/mb-stream|\/api\/mb-ep-stream/i.test(src.url || '');
     if (isMovieBox) {
       const szMatch = (src.name || '').match(/(\d+)\s*MB/i);
       const szMb = szMatch ? parseInt(szMatch[1], 10) : 0;
       const isHeavy = szMb > 350;
-      if (src.quality === 720) return 4650;
-      if (src.quality === 480) return 4640;
-      if (src.quality === 360) return 4620;
-      if (src.quality === 1080) return isHeavy ? 4550 : 4630;
+      if (src.quality === 480) return 4660;
+      if (src.quality === 360) return 4655;
+      if (src.quality === 720) return 4640;
+      if (src.quality === 1080) return isHeavy ? 4550 : 4620;
       return 4500;
     }
     const isHevc = /\b(hevc|h\.?265|x265|10bit|av1)\b/i.test(`${src.name} ${src.qualityLabel}`);
@@ -272,9 +270,9 @@ export function resolveDirectDownloadUrl(rawUrl: string): string {
 function sanitizeBrandText(input: string): string {
   if (!input) return '';
   return String(input)
-    .replace(/https?:\/\/[^\s"'<>]*(?:movielinkbd|myflixbd)[^\s"'<>]*/gi, '')
-    .replace(/\b[a-z0-9-]*\.?(?:movielinkbd|myflixbd)\.[a-z]{2,6}\b/gi, 'CinePulse')
-    .replace(/movielinkbd|myflixbd|nexaflox/gi, 'CinePulse')
+    .replace(/https?:\/\/[^\s"'<>]*movielinkbd[^\s"'<>]*/gi, '')
+    .replace(/\b[a-z0-9-]*\.?movielinkbd\.[a-z]{2,6}\b/gi, 'CinePulse')
+    .replace(/movielinkbd|nexaflox/gi, 'CinePulse')
     .replace(/movie\s*link\s*bd/gi, 'CinePulse')
     .replace(/\bmlbd\b/gi, 'CP')
     .replace(/\s*watch\s+online\s+and\s+download\s*(?:["“”']?web-dl["“”']?|["“”']?hdtc["“”']?|["“”']?hd["“”']?|["“”']?4k["“”']?)?\s*…?/gi, '')
@@ -388,26 +386,16 @@ function ensurePreconnectOrigin(streamUrl: string): void {
 export function warmStreamConnection(streamUrl?: string, primeMediaDecoder = false): void {
   if (!streamUrl || typeof window === 'undefined') return;
   const isRelativeApiStream =
-    streamUrl.startsWith('/api/mb-stream') || streamUrl.startsWith('/api/mb-ep-stream');
+    streamUrl.startsWith('/_s/v.mp4') ||
+    streamUrl.startsWith('/api/mb-stream') ||
+    streamUrl.startsWith('/api/mb-ep-stream');
   if (!streamUrl.startsWith('http') && !isRelativeApiStream) return;
 
   if (streamUrl.startsWith('http')) {
     ensurePreconnectOrigin(streamUrl);
   }
 
-  // Pre-warm Virtual Chunk #0 + Parallel Segments into server RAM on hover/touch!
-  if (!isVideoActivelyStarting && isRelativeApiStream && !warmedStreamUrls.has(streamUrl)) {
-    warmedStreamUrls.add(streamUrl);
-    const warmCtrl = new AbortController();
-    bgPrefetchControllers.add(warmCtrl);
-    fetch(streamUrl, {
-      headers: { Range: 'bytes=0-65535' },
-      signal: warmCtrl.signal,
-    })
-      .catch(() => {})
-      .finally(() => {
-        bgPrefetchControllers.delete(warmCtrl);
-      });
+  if (isRelativeApiStream) {
     return;
   }
 
@@ -528,37 +516,18 @@ export function prefetchMovieDetails(
   const pathKey = (rawPath || '').trim();
   if (!pathKey && !rawTitle) return;
 
-  // Immediately fire 0ms Virtual Micro-Chunk stream prewarm for /mb/ items without waiting for /api/details!
-  if (primeMediaDecoder && pathKey.startsWith('/mb/')) {
-    const parts = pathKey.replace(/^\/mb\//, '').split('/').filter(Boolean);
-    const subjectId = parts[0] || '';
-    const detailPath = parts[1] || 'movie';
-    if (subjectId) {
-      const isLikelySeries = /\b(s\d+|season|series|ep(?:isode)?)\b/i.test(rawTitle);
-      const seNum = isLikelySeries ? 1 : 0;
-      const epNum = isLikelySeries ? 1 : 0;
-      const instantEpStreamUrl = `/api/mb-ep-stream.mp4?subjectId=${encodeURIComponent(
-        subjectId
-      )}&detailPath=${encodeURIComponent(detailPath)}&se=${seNum}&ep=${epNum}&q=480`;
-      warmStreamConnection(instantEpStreamUrl, false);
-    }
-  }
-
   const existing = getInstantCachedDetail(pathKey, rawTitle);
   if (existing) {
-    warmDetailFirstStream(existing, false);
     return;
   }
 
-  if (!pathKey || inFlightDetailPromises.has(pathKey) || bgPrefetchControllers.size >= 3) return;
-  const ctrl = new AbortController();
-  bgPrefetchControllers.add(ctrl);
+  if (!pathKey || inFlightDetailPromises.has(pathKey) || inFlightDetailPromises.size >= 3) return;
   const params = new URLSearchParams({
     path: pathKey,
     title: rawTitle,
     node: nodeId,
   });
-  const p = fetch(`/api/details?${params.toString()}`, { signal: ctrl.signal })
+  const p = fetch(`/api/details?${params.toString()}`)
     .then((r) => (r.ok ? r.json() : null))
     .then((json) => {
       if (json?.ok && json?.detail?.episodes?.length) {
@@ -569,83 +538,28 @@ export function prefetchMovieDetails(
         }
         clientDetailCache.set(pathKey, { detail: json.detail, ts: Date.now() });
         indexDetailsIntoMemory({ [pathKey]: json.detail }, true);
-        warmDetailFirstStream(json.detail, false);
       }
       return json;
     })
     .catch(() => null)
     .finally(() => {
-      bgPrefetchControllers.delete(ctrl);
       inFlightDetailPromises.delete(pathKey);
     });
   inFlightDetailPromises.set(pathKey, p);
 }
 
-function scheduleBackgroundCatalogDetailWarmup(items: MovieCardItem[], nodeId: string): void {
-  if (typeof window === 'undefined' || !items?.length) return;
-  // Gently pre-warm only the top 2 visible items after 800ms so background requests never clog the browser's 6-connection pool!
-  items.slice(0, 2).forEach((item, idx) => {
-    window.setTimeout(() => {
-      if (!isVideoActivelyStarting && item?.path) {
-        prefetchMovieDetails(item.path, item.title, nodeId, false);
-      }
-    }, 800 + idx * 450);
-  });
+function scheduleBackgroundCatalogDetailWarmup(_items: MovieCardItem[], _nodeId: string): void {
+  // Details are prefetched on-demand when the user hovers or touches a card
 }
 
-const NODE_ORIGIN_MAP: Record<string, string> = {
-  'node-alpha': 'https://cmyyhb.movielinkbd.at',
-  'node-beta': 'https://4yer8f.movielinkbd.at',
-  'node-gamma': 'https://cmyyhb.movielinkbd.at',
-  'node-delta': 'https://4yer8f.movielinkbd.at',
-};
+const NODE_ORIGIN_MAP: Record<string, string> = {};
 
 async function fetchMirrorHtmlClientSide(
-  relativePath: string,
-  preferredNodeId = 'node-alpha',
-  bustCache = false
+  _relativePath: string,
+  _preferredNodeId = 'node-alpha',
+  _bustCache = false
 ): Promise<{ html: string; finalOrigin: string }> {
-  let cleanPath = relativePath.startsWith('http')
-    ? new URL(relativePath).pathname + new URL(relativePath).search
-    : relativePath.startsWith('/')
-      ? relativePath
-      : `/${relativePath}`;
-
-  if (bustCache) {
-    const sep = cleanPath.includes('?') ? '&' : '?';
-    cleanPath = `${cleanPath}${sep}_live=${Math.floor(Date.now() / 30000)}`;
-  }
-
-  const preferredOrigin = NODE_ORIGIN_MAP[preferredNodeId] || MIRROR_ORIGINS[0];
-  const orderedOrigins = [
-    preferredOrigin,
-    ...MIRROR_ORIGINS.filter((o) => o !== preferredOrigin),
-  ];
-
-  // Try primary origin first without flooding duplicate CORS bridge requests, with a generous 10s timeout for 370KB HTML pages
-  for (const origin of orderedOrigins) {
-    const targetUrl = `${origin}${cleanPath}`;
-    const url = CORS_BRIDGES[0](targetUrl);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10000);
-    try {
-      const res = await fetch(url, { signal: controller.signal });
-      if (!res.ok) throw new Error('Bad status');
-      const html = await res.text();
-      if (
-        html &&
-        html.length > 800 &&
-        (html.includes('movie-card') || html.includes('mlbdInlinePlayerData'))
-      ) {
-        return { html, finalOrigin: origin };
-      }
-    } catch {
-      // try backup origin
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  throw new Error('Client mirror bridges unreachable');
+  throw new Error('Direct client mirror access disabled by CinePulse Security Shield');
 }
 
 function parseClientCatalogHtml(html: string): { items: MovieCardItem[]; maxPage: number } {
@@ -1020,7 +934,7 @@ function parseClientDetailHtml(html: string, itemPath: string, origin: string): 
 // ============================================================================
 // Direct Browser-Side MovieBox BFF Engine (Uses User's Local Bangladesh/India Geo-IP!)
 // ============================================================================
-const BROWSER_MB_API = 'https://h5-api.aoneroom.com';
+const BROWSER_MB_API = '';
 let browserMbToken = '';
 let browserMbTokenExp = 0;
 let browserMbTokenPromise: Promise<string> | null = null;
@@ -1294,8 +1208,12 @@ function mapBrowserMovieBoxItemToCard(raw: any): MovieCardItem | null {
   };
 }
 
-async function fetchBrowserMovieBoxSearch(query: string, page = 1): Promise<MovieCardItem[]> {
-  if (typeof window === 'undefined' || !query.trim()) return [];
+async function fetchBrowserMovieBoxSearch(_query: string, _page = 1): Promise<MovieCardItem[]> {
+  return [];
+}
+
+async function _unusedBrowserMovieBoxSearch(query: string, page = 1): Promise<MovieCardItem[]> {
+  if (typeof window === 'undefined' || !BROWSER_MB_API || !query.trim()) return [];
   try {
     const token = await getBrowserMovieBoxBearerToken();
     const headers: Record<string, string> = {
@@ -1370,8 +1288,12 @@ export async function resolveBrowserMovieBoxEpisodeSources(
   }
 }
 
-async function fetchBrowserMovieBoxDetail(rawPath: string): Promise<MovieDetailData | null> {
-  if (typeof window === 'undefined' || !rawPath.startsWith('/mb/')) return null;
+async function fetchBrowserMovieBoxDetail(_rawPath: string): Promise<MovieDetailData | null> {
+  return null;
+}
+
+async function _unusedBrowserMovieBoxDetail(rawPath: string): Promise<MovieDetailData | null> {
+  if (typeof window === 'undefined' || !BROWSER_MB_API || !rawPath.startsWith('/mb/')) return null;
   const parts = rawPath.replace(/^\/mb\//, '').split('/').filter(Boolean);
   const subjectId = parts[0] || '';
   const exactSlug = parts[1] || 'movie';
@@ -1808,7 +1730,6 @@ export async function universalApiFetch(endpoint: string, init?: RequestInit): P
             clientDetailCache.set(json.detail.url, { detail: json.detail, ts: Date.now() });
             indexDetailsIntoMemory({ [json.detail.url]: json.detail }, true);
           }
-          warmDetailFirstStream(json.detail);
         } else if (pathname === '/api/catalog' && Array.isArray(json?.items)) {
           if (json.items.length > 0) {
             const cKey = `api::${parsedUrl.searchParams.get('path') || '/'}::p=${parsedUrl.searchParams.get('page') || '1'}::q=${searchQ}::n=${parsedUrl.searchParams.get('node') || 'auto'}`;
@@ -1834,15 +1755,14 @@ export async function universalApiFetch(endpoint: string, init?: RequestInit): P
                 }
               }
             }
-            scheduleBackgroundCatalogDetailWarmup(
-              json.items,
-              parsedUrl.searchParams.get('node') || 'node-moviebox'
-            );
           }
         }
         return json;
       }
     } catch {
+      if (init?.signal?.aborted) {
+        return { ok: false, aborted: true, items: [], suggestions: [] };
+      }
       // fallback to client engine
     }
   }
@@ -2394,10 +2314,6 @@ export async function universalApiFetch(endpoint: string, init?: RequestInit): P
       serverTime: now,
       notifications: notifications.slice(0, 28),
     };
-  }
-
-  if (pathname === '/api/myflix') {
-    return { ok: false };
   }
 
   return { ok: true, requests: [] };

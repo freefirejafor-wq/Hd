@@ -205,30 +205,6 @@ export const PWAInstallModal: React.FC<PWAInstallModalProps> = ({
           </div>
         )}
 
-        {/* 3. GitHub Automatic Hosting Ready Card */}
-        <div className="rounded-2xl bg-[#0c0e12] border border-emerald-500/25 p-4 space-y-2.5">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-extrabold text-white">
-              GitHub Auto-Hosting (ফ্রি লাইভ হোস্টিং রেডি):
-            </span>
-            <span className="text-[10px] px-2 py-0.5 rounded bg-[#00e68a]/15 text-[#00e68a] font-bold">
-              Configured ✓
-            </span>
-          </div>
-          <ol className="text-xs text-slate-300 space-y-1.5 list-decimal list-inside leading-relaxed">
-            <li>
-              AI Studio-এর একদম উপরে <strong className="text-white">GitHub</strong> বাটনে চাপ দিয়ে রিপোজিটরি তৈরি করুন।
-            </li>
-            <li>
-              আমরা ভেতরে <code className="text-[#00e68a]">.github/workflows/deploy.yml</code> ও{' '}
-              <code className="text-[#00e68a]">render.yaml</code> যুক্ত করে দিয়েছি।
-            </li>
-            <li>
-              GitHub-এ গিয়ে <strong className="text-white">Settings ➔ Pages ➔ Source: GitHub Actions</strong> সিলেক্ট করলেই অটোমেটিক আপনার স্থায়ী গিটহাব লিংক লাইভ হয়ে যাবে!
-            </li>
-          </ol>
-        </div>
-
         <button
           type="button"
           onClick={onClose}

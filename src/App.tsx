@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Bell,
   BookOpen,
@@ -15,11 +15,14 @@ import {
   Home,
   Layers,
   Loader2,
+  LogIn,
+  LogOut,
   Mic,
   Play,
   ScanLine,
   Search,
   Settings,
+  ShieldCheck,
   SlidersHorizontal,
   Star,
   Trash2,
@@ -27,6 +30,7 @@ import {
   Tv,
   Upload,
   User,
+  UserPlus,
   WifiOff,
   X,
 } from 'lucide-react';
@@ -42,14 +46,12 @@ import type {
   MovieBoxHomePayload,
   MovieCardItem,
   StreamSource,
+  UserAccountSession,
   UserMovieRequest,
   WatchlistFolder,
   WatchProgressItem,
 } from './types/cinema';
 import { usePWAInstall } from './hooks/usePWAInstall';
-import { MovieDetailModal } from './components/MovieDetailModal';
-import { PWAInstallModal } from './components/PWAInstallModal';
-import { MovieRequestModal } from './components/MovieRequestModal';
 import {
   getInstantCatalogCache,
   getInstantSuggestCache,
@@ -67,8 +69,21 @@ import {
   sortItemsByRecentUpload,
 } from './utils/timeAgo';
 
-const WATCHLIST_STORAGE_KEY = 'cp_iphone_watchlist_v2';
-const CONTINUE_STORAGE_KEY = 'cp_iphone_continue_v2';
+const MovieDetailModal = React.lazy(() =>
+  import('./components/MovieDetailModal').then((m) => ({ default: m.MovieDetailModal }))
+);
+const PWAInstallModal = React.lazy(() =>
+  import('./components/PWAInstallModal').then((m) => ({ default: m.PWAInstallModal }))
+);
+const MovieRequestModal = React.lazy(() =>
+  import('./components/MovieRequestModal').then((m) => ({ default: m.MovieRequestModal }))
+);
+
+const USER_SESSION_STORAGE_KEY = 'cp_user_session_v3';
+const WATCHLIST_LEGACY_KEY = 'cp_iphone_watchlist_v2';
+const CONTINUE_LEGACY_KEY = 'cp_iphone_continue_v2';
+const getUserWatchlistKey = (uid: string) => `cp_watchlist_u_${uid}`;
+const getUserContinueKey = (uid: string) => `cp_continue_u_${uid}`;
 const RECENT_SEARCH_STORAGE_KEY = 'cp_recent_searches_v1';
 const ACTIVE_NODE_STORAGE_KEY = 'cp_active_node_v1';
 const READ_NOTIFS_STORAGE_KEY = 'cp_read_notifications_v1';
@@ -101,12 +116,77 @@ function formatShortLanguage(lang: string): string {
   return 'English';
 }
 
-function getCardSourceInfo(_path?: string): { id: 'MOVIEBOX' | 'MOVIELINKBD' | 'MYFLIX'; label: string; badgeClass: string } {
+function getCardSourceInfo(path?: string): { id: 'MOVIEBOX' | 'MOVIELINKBD'; label: string; badgeClass: string } {
+  const isMb = Boolean(path && path.startsWith('/mb/'));
   return {
-    id: 'MOVIEBOX',
+    id: isMb ? 'MOVIEBOX' : 'MOVIELINKBD',
     label: 'CinePulse',
     badgeClass: 'bg-emerald-600/90 text-white border-emerald-400/40',
   };
+}
+
+function transliterateClientQuery(raw: string): string {
+  const trimmed = (raw || '').trim();
+  if (!trimmed) return '';
+  if (!/[\u0980-\u09FF]/.test(trimmed)) return trimmed.toLowerCase();
+  const dict: Array<[RegExp, string]> = [
+    [/গোপাল\s*ভাঁড়|গোপাল\s*ভার/g, 'gopal bhar'],
+    [/গোপাল/g, 'gopal'],
+    [/গোলমাল/g, 'golmaal'],
+    [/তুফান/g, 'toofan'],
+    [/বহুরূপী/g, 'bohurupi'],
+    [/বরবাদ/g, 'borbaad'],
+    [/দাগি/g, 'daagi'],
+    [/চক্কর/g, 'chokkor'],
+    [/জংলি/g, 'jongli'],
+    [/তাণ্ডব/g, 'tandob'],
+    [/মির্জাপুর/g, 'mirzapur'],
+    [/পুষ্পা/g, 'pushpa'],
+    [/স্কুইড\s*গেম/g, 'squid game'],
+    [/ওয়ান\s*পিস|ওয়ান\s*পিস/g, 'one piece'],
+    [/নারুতো/g, 'naruto'],
+    [/পঞ্চায়েত|পঞ্চায়েত/g, 'panchayat'],
+    [/অ্যানিম্যাল|এনিমেল/g, 'animal'],
+    [/পাঠান/g, 'pathaan'],
+    [/জওয়ান|জওয়ান/g, 'jawan'],
+    [/কল্কি/g, 'kalki'],
+    [/স্ত্রী/g, 'stree'],
+    [/দৃশ্যম/g, 'drishyam'],
+    [/কেজিএফ/g, 'kgf'],
+    [/বাহুবলী/g, 'baahubali'],
+    [/সালার/g, 'salaar'],
+    [/লিও/g, 'leo'],
+    [/জেলার/g, 'jailer'],
+    [/ব্যাচেলর\s*পয়েন্ট|ব্যাচেলর\s*পয়েন্ট/g, 'bachelor point'],
+    [/হাওয়া|হাওয়া/g, 'hawa'],
+    [/সুড়ঙ্গ|সুড়ঙ্গ/g, 'surongo'],
+    [/প্রিয়তমা|প্রিয়তমা/g, 'priyotoma'],
+    [/রাজকুমার/g, 'rajkumar'],
+    [/দরদ/g, 'dorod'],
+  ];
+  let out = trimmed;
+  for (const [rx, rep] of dict) {
+    out = out.replace(rx, ` ${rep} `);
+  }
+  const charMap: Record<string, string> = {
+    'অ': 'o', 'আ': 'a', 'ই': 'i', 'ঈ': 'i', 'উ': 'u', 'ঊ': 'u', 'ঋ': 'ri',
+    'এ': 'e', 'ঐ': 'oi', 'ও': 'o', 'ঔ': 'ou',
+    'া': 'a', 'ি': 'i', 'ী': 'i', 'ু': 'u', 'ূ': 'u', 'ৃ': 'ri',
+    'ে': 'e', 'ৈ': 'oi', 'ো': 'o', 'ৌ': 'ou',
+    'ক': 'k', 'খ': 'kh', 'গ': 'g', 'ঘ': 'gh', 'ঙ': 'ng',
+    'চ': 'ch', 'ছ': 'chh', 'জ': 'j', 'ঝ': 'jh', 'ঞ': 'n',
+    'ট': 't', 'ঠ': 'th', 'ড': 'd', 'ঢ': 'dh', 'ণ': 'n',
+    'ত': 't', 'থ': 'th', 'দ': 'd', 'ধ': 'dh', 'ন': 'n',
+    'প': 'p', 'ফ': 'f', 'ব': 'b', 'ভ': 'bh', 'ম': 'm',
+    'য': 'j', 'র': 'r', 'ল': 'l', 'শ': 'sh', 'ষ': 'sh', 'স': 's', 'হ': 'h',
+    'ড়': 'r', 'ঢ়': 'rh', 'য়': 'y', 'ৎ': 't',
+    'ং': 'ng', 'ঃ': 'h', 'ঁ': '', '্': '', '়': '',
+  };
+  let mapped = '';
+  for (const ch of out) {
+    mapped += charMap[ch] !== undefined ? charMap[ch] : ch;
+  }
+  return mapped.replace(/\s+/g, ' ').trim().toLowerCase();
 }
 
 export default function App() {
@@ -140,7 +220,7 @@ export default function App() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
 
   // Advanced Filters & Sorting (Default: HOT_HYPE so popular, high-rating, dhamaka items stay on top)
-  const [sourceFilter, setSourceFilter] = useState<'ALL' | 'MOVIEBOX' | 'MOVIELINKBD' | 'MYFLIX'>('ALL');
+  const [sourceFilter, setSourceFilter] = useState<'ALL' | 'MOVIEBOX' | 'MOVIELINKBD'>('ALL');
   const [audioFilter, setAudioFilter] = useState<'ALL' | 'BANGLA' | 'HINDI' | 'DUAL' | 'SUB'>('ALL');
   const [qualityFilter, setQualityFilter] = useState<'ALL' | '4K' | '1080P' | 'WEBDL' | 'HDTC'>('ALL');
   const [yearFilter, setYearFilter] = useState<'ALL' | '2026' | '2025' | 'OLDER'>('ALL');
@@ -184,11 +264,11 @@ export default function App() {
   });
   const pushedSetRef = useRef<Set<string>>(new Set(pushedPhoneNotifIds));
 
-  // Tick live clock every 20 seconds so upload times ("4 mins ago" -> "5 mins ago" -> "1 hour ago") update dynamically!
+  // Tick live clock every 3 minutes so upload times update gently without causing frequent full-tree re-renders
   useEffect(() => {
     const clockTimer = window.setInterval(() => {
       setLiveClockNow(Date.now());
-    }, 20_000);
+    }, 180_000);
     return () => window.clearInterval(clockTimer);
   }, []);
 
@@ -264,10 +344,37 @@ export default function App() {
     }
   }, [showRequestModal, refreshLatest3SiteUploads]);
 
+  // Strictly Isolated Per-User Account Session + Watchlist & Continue Watching
+  const [userSession, setUserSession] = useState<UserAccountSession | null>(() => {
+    try {
+      const raw = localStorage.getItem(USER_SESSION_STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return parsed?.userId && parsed?.token ? parsed : null;
+    } catch {
+      return null;
+    }
+  });
+  const [authPanelOpen, setAuthPanelOpen] = useState<boolean>(false);
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('register');
+  const [authUsername, setAuthUsername] = useState<string>('');
+  const [authPin, setAuthPin] = useState<string>('');
+  const [authCarryGuestData, setAuthCarryGuestData] = useState<boolean>(false);
+  const [authBusy, setAuthBusy] = useState<boolean>(false);
+  const [authMessage, setAuthMessage] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  const hydratingUserRef = useRef<boolean>(true);
+  const userSyncTimerRef = useRef<number | null>(null);
+
   const [watchlist, setWatchlist] = useState<MovieCardItem[]>(() => {
     try {
-      const raw = localStorage.getItem(WATCHLIST_STORAGE_KEY);
-      return raw ? JSON.parse(raw) : [];
+      const rawSess = localStorage.getItem(USER_SESSION_STORAGE_KEY);
+      const sess = rawSess ? JSON.parse(rawSess) : null;
+      if (sess?.userId) {
+        const raw = localStorage.getItem(getUserWatchlistKey(sess.userId));
+        return raw ? JSON.parse(raw) : [];
+      }
+      return [];
     } catch {
       return [];
     }
@@ -275,35 +382,387 @@ export default function App() {
 
   const [continueWatching, setContinueWatching] = useState<WatchProgressItem[]>(() => {
     try {
-      const raw = localStorage.getItem(CONTINUE_STORAGE_KEY);
-      const parsed: WatchProgressItem[] = raw ? JSON.parse(raw) : [];
-      return parsed.map((entry) => ({
-        ...entry,
-        movie: {
-          ...entry.movie,
-          uploadedAtMs: undefined,
-        },
-      }));
+      const rawSess = localStorage.getItem(USER_SESSION_STORAGE_KEY);
+      const sess = rawSess ? JSON.parse(rawSess) : null;
+      if (sess?.userId) {
+        const raw = localStorage.getItem(getUserContinueKey(sess.userId));
+        const parsed: WatchProgressItem[] = raw ? JSON.parse(raw) : [];
+        return parsed.map((entry) => ({
+          ...entry,
+          movie: {
+            ...entry.movie,
+            uploadedAtMs: undefined,
+          },
+        }));
+      }
+      return [];
     } catch {
       return [];
     }
   });
 
+  const persistUserSessionLocal = useCallback(
+    (sess: UserAccountSession | null, wl: MovieCardItem[], cw: WatchProgressItem[]) => {
+      try {
+        if (sess?.userId && sess?.token) {
+          localStorage.setItem(
+            USER_SESSION_STORAGE_KEY,
+            JSON.stringify({
+              userId: sess.userId,
+              username: sess.username,
+              isGuest: sess.isGuest,
+              token: sess.token,
+            })
+          );
+          localStorage.setItem(getUserWatchlistKey(sess.userId), JSON.stringify(wl));
+          localStorage.setItem(getUserContinueKey(sess.userId), JSON.stringify(cw));
+        }
+      } catch {
+        // ignore
+      }
+    },
+    []
+  );
+
+  // Initialize or restore strictly isolated per-user session on boot
   useEffect(() => {
+    let cancelled = false;
+    hydratingUserRef.current = true;
+
+    const applySessionFromServer = (serverUser: any, fallbackLocalWl: MovieCardItem[], fallbackLocalCw: WatchProgressItem[]) => {
+      if (cancelled || !serverUser?.userId || !serverUser?.token) return;
+      const serverWl: MovieCardItem[] = Array.isArray(serverUser.watchlist) ? serverUser.watchlist : [];
+      const serverCw: WatchProgressItem[] = Array.isArray(serverUser.continueWatching)
+        ? serverUser.continueWatching
+        : [];
+      const finalWl =
+        serverUser.isGuest && serverWl.length === 0 && fallbackLocalWl.length > 0
+          ? fallbackLocalWl
+          : serverWl;
+      const finalCw =
+        serverUser.isGuest && serverCw.length === 0 && fallbackLocalCw.length > 0
+          ? fallbackLocalCw
+          : serverCw;
+
+      const nextSess: UserAccountSession = {
+        userId: serverUser.userId,
+        username: serverUser.username,
+        isGuest: Boolean(serverUser.isGuest),
+        token: serverUser.token,
+        watchlist: finalWl,
+        continueWatching: finalCw,
+      };
+      setUserSession(nextSess);
+      setWatchlist(finalWl);
+      setContinueWatching(finalCw);
+      persistUserSessionLocal(nextSess, finalWl, finalCw);
+      window.setTimeout(() => {
+        hydratingUserRef.current = false;
+      }, 60);
+    };
+
+    const bootUserSession = async () => {
+      const existingToken = userSession?.token || '';
+      const existingUid = userSession?.userId || '';
+      if (existingToken && existingUid) {
+        try {
+          const res = await fetch('/api/user/me', {
+            headers: { 'X-CP-User-Token': existingToken },
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data?.ok && data?.user) {
+              let localWl: MovieCardItem[] = [];
+              let localCw: WatchProgressItem[] = [];
+              try {
+                const rawW = localStorage.getItem(getUserWatchlistKey(existingUid));
+                const rawC = localStorage.getItem(getUserContinueKey(existingUid));
+                localWl = rawW ? JSON.parse(rawW) : [];
+                localCw = rawC ? JSON.parse(rawC) : [];
+              } catch {
+                // ignore
+              }
+              applySessionFromServer(data.user, localWl, localCw);
+              return;
+            }
+          }
+        } catch {
+          if (!cancelled) {
+            window.setTimeout(() => {
+              hydratingUserRef.current = false;
+            }, 60);
+          }
+          return;
+        }
+      }
+
+      // First visit or expired token: mint a fresh isolated private guest session
+      try {
+        const res = await fetch('/api/user/auth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: 'guest' }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data?.ok && data?.user) {
+            let legacyWl: MovieCardItem[] = [];
+            let legacyCw: WatchProgressItem[] = [];
+            try {
+              const rawLegacyW = localStorage.getItem(WATCHLIST_LEGACY_KEY);
+              const rawLegacyC = localStorage.getItem(CONTINUE_LEGACY_KEY);
+              legacyWl = rawLegacyW ? JSON.parse(rawLegacyW) : [];
+              legacyCw = rawLegacyC ? JSON.parse(rawLegacyC) : [];
+              localStorage.removeItem(WATCHLIST_LEGACY_KEY);
+              localStorage.removeItem(CONTINUE_LEGACY_KEY);
+            } catch {
+              // ignore
+            }
+            applySessionFromServer(data.user, legacyWl, legacyCw);
+            return;
+          }
+        }
+      } catch {
+        // ignore offline fallback
+      }
+
+      if (!cancelled) {
+        const offlineUid = `local_${Math.random().toString(36).slice(2, 10)}`;
+        setUserSession({
+          userId: offlineUid,
+          username: `Guest-${offlineUid.slice(-4).toUpperCase()}`,
+          isGuest: true,
+          token: '',
+          watchlist: [],
+          continueWatching: [],
+        });
+        window.setTimeout(() => {
+          hydratingUserRef.current = false;
+        }, 60);
+      }
+    };
+
+    void bootUserSession();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Save per-user local cache & sync to isolated server profile
+  useEffect(() => {
+    const uid = userSession?.userId;
+    if (!uid) return;
     try {
-      localStorage.setItem(WATCHLIST_STORAGE_KEY, JSON.stringify(watchlist));
+      localStorage.setItem(getUserWatchlistKey(uid), JSON.stringify(watchlist));
+      localStorage.setItem(getUserContinueKey(uid), JSON.stringify(continueWatching));
     } catch {
       // ignore
     }
-  }, [watchlist]);
+
+    if (hydratingUserRef.current || !userSession?.token) return;
+    if (userSyncTimerRef.current) window.clearTimeout(userSyncTimerRef.current);
+    const activeToken = userSession.token;
+    const wlSnapshot = watchlist;
+    const cwSnapshot = continueWatching;
+    userSyncTimerRef.current = window.setTimeout(() => {
+      fetch('/api/user/state', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CP-User-Token': activeToken,
+        },
+        body: JSON.stringify({
+          watchlist: wlSnapshot,
+          continueWatching: cwSnapshot,
+        }),
+      }).catch(() => {});
+    }, 550);
+
+    return () => {
+      if (userSyncTimerRef.current) window.clearTimeout(userSyncTimerRef.current);
+    };
+  }, [watchlist, continueWatching, userSession?.userId, userSession?.token]);
+
+  // Flush user state immediately when user minimizes/closes browser (crucial for iPhone Safari!)
+  const latestStateRef = useRef<{
+    token: string;
+    watchlist: MovieCardItem[];
+    continueWatching: WatchProgressItem[];
+  }>({
+    token: '',
+    watchlist: [],
+    continueWatching: [],
+  });
+  useEffect(() => {
+    latestStateRef.current = {
+      token: userSession?.token || '',
+      watchlist,
+      continueWatching,
+    };
+  }, [userSession?.token, watchlist, continueWatching]);
 
   useEffect(() => {
+    const flushUserStateOnHide = () => {
+      const snap = latestStateRef.current;
+      if (!snap.token || hydratingUserRef.current) return;
+      try {
+        fetch('/api/user/state', {
+          method: 'PUT',
+          keepalive: true,
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CP-User-Token': snap.token,
+          },
+          body: JSON.stringify({
+            watchlist: snap.watchlist,
+            continueWatching: snap.continueWatching,
+          }),
+        }).catch(() => {});
+      } catch {
+        // ignore
+      }
+    };
+    const onVisChange = () => {
+      if (document.visibilityState === 'hidden') flushUserStateOnHide();
+    };
+    window.addEventListener('pagehide', flushUserStateOnHide);
+    document.addEventListener('visibilitychange', onVisChange);
+    return () => {
+      window.removeEventListener('pagehide', flushUserStateOnHide);
+      document.removeEventListener('visibilitychange', onVisChange);
+    };
+  }, []);
+
+  const handleAccountAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanName = authUsername.trim();
+    const cleanPin = authPin.trim();
+    if (cleanName.length < 2) {
+      setAuthMessage({ type: 'err', text: 'কমপক্ষে ২ অক্ষরের ইউজারনেম লিখুন' });
+      return;
+    }
+    if (cleanPin.length < 4) {
+      setAuthMessage({ type: 'err', text: 'কমপক্ষে ৪ সংখ্যার পিন/পাসওয়ার্ড দিন' });
+      return;
+    }
+
+    setAuthBusy(true);
+    setAuthMessage(null);
     try {
-      localStorage.setItem(CONTINUE_STORAGE_KEY, JSON.stringify(continueWatching));
+      const res = await fetch('/api/user/auth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: authMode,
+          username: cleanName,
+          pin: cleanPin,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.ok || !data?.user) {
+        setAuthMessage({
+          type: 'err',
+          text: data?.error || 'লগইন বা রেজিস্ট্রেশন ব্যর্থ হয়েছে',
+        });
+        return;
+      }
+
+      if (userSyncTimerRef.current) window.clearTimeout(userSyncTimerRef.current);
+      hydratingUserRef.current = true;
+
+      let nextWl: MovieCardItem[] = Array.isArray(data.user.watchlist) ? data.user.watchlist : [];
+      let nextCw: WatchProgressItem[] = Array.isArray(data.user.continueWatching)
+        ? data.user.continueWatching
+        : [];
+
+      // Only carry over guest items into newly registered account if user explicitly opted in
+      if (authMode === 'register' && authCarryGuestData && nextWl.length === 0 && nextCw.length === 0) {
+        nextWl = [...watchlist];
+        nextCw = [...continueWatching];
+        if (nextWl.length > 0 || nextCw.length > 0) {
+          fetch('/api/user/state', {
+            method: 'PUT',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-CP-User-Token': data.user.token,
+            },
+            body: JSON.stringify({ watchlist: nextWl, continueWatching: nextCw }),
+          }).catch(() => {});
+        }
+      }
+
+      const nextSess: UserAccountSession = {
+        userId: data.user.userId,
+        username: data.user.username,
+        isGuest: false,
+        token: data.user.token,
+        watchlist: nextWl,
+        continueWatching: nextCw,
+      };
+      setUserSession(nextSess);
+      setWatchlist(nextWl);
+      setContinueWatching(nextCw);
+      persistUserSessionLocal(nextSess, nextWl, nextCw);
+      setAuthPin('');
+      setAuthPanelOpen(false);
+      setAuthMessage({
+        type: 'ok',
+        text:
+          authMode === 'register'
+            ? `@${nextSess.username} একাউন্ট তৈরি হয়েছে — এখন শুধু আপনার ওয়াচলিস্ট আলাদা থাকবে!`
+            : `স্বাগতম @${nextSess.username}! আপনার ব্যক্তিগত ওয়াচলিস্ট ও প্লেব্যাক হিস্ট্রি লোড হয়েছে।`,
+      });
+      window.setTimeout(() => {
+        hydratingUserRef.current = false;
+      }, 80);
+    } catch {
+      setAuthMessage({ type: 'err', text: 'সার্ভারের সাথে সংযোগ করা যায়নি, আবার চেষ্টা করুন' });
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const handleLogoutToNewGuest = async () => {
+    setAuthBusy(true);
+    setAuthMessage(null);
+    if (userSyncTimerRef.current) window.clearTimeout(userSyncTimerRef.current);
+    hydratingUserRef.current = true;
+    try {
+      const res = await fetch('/api/user/auth', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: 'guest' }),
+      });
+      const data = await res.json();
+      if (data?.ok && data?.user) {
+        const nextSess: UserAccountSession = {
+          userId: data.user.userId,
+          username: data.user.username,
+          isGuest: true,
+          token: data.user.token,
+          watchlist: [],
+          continueWatching: [],
+        };
+        setUserSession(nextSess);
+        setWatchlist([]);
+        setContinueWatching([]);
+        persistUserSessionLocal(nextSess, [], []);
+        setAuthUsername('');
+        setAuthPin('');
+        setAuthMessage({
+          type: 'ok',
+          text: `নতুন আলাদা প্রোফাইল (${nextSess.username}) চালু হয়েছে।`,
+        });
+      }
     } catch {
       // ignore
+    } finally {
+      setAuthBusy(false);
+      window.setTimeout(() => {
+        hydratingUserRef.current = false;
+      }, 80);
     }
-  }, [continueWatching]);
+  };
 
   useEffect(() => {
     try {
@@ -339,7 +798,7 @@ export default function App() {
     ]);
   }, [items, mbHomeData]);
 
-  // 0ms Instant Local + Cached Prefix Search + 45ms Live MovieBox Suggest (Starts from 1st character!)
+  // 0ms Instant Local + Cached Prefix Search + 15ms Live MovieBox Suggest (Supports English, Phonetic & Bengali script!)
   useEffect(() => {
     const q = searchQuery.trim();
     if (q.length < 1) {
@@ -349,15 +808,23 @@ export default function App() {
     }
 
     const lower = q.toLowerCase();
-    const cachedSuggest = getInstantSuggestCache(q) || [];
+    const romanQ = transliterateClientQuery(q);
+    const qWords = Array.from(
+      new Set(
+        `${lower} ${romanQ}`
+          .split(/\s+/)
+          .map((w) => w.replace(/[^a-z0-9\u0980-\u09FF]/gi, ''))
+          .filter((w) => w.length >= 2)
+      )
+    );
+    const cachedSuggest = getInstantSuggestCache(q) || getInstantSuggestCache(romanQ) || [];
     const localInstant = deduplicateMovieCards([
       ...cachedSuggest,
-      ...localSearchPool.filter(
-        (item) =>
-          item?.title?.toLowerCase().includes(lower) ||
-          item?.language?.toLowerCase().includes(lower) ||
-          item?.sportGenre?.toLowerCase().includes(lower)
-      ),
+      ...localSearchPool.filter((item) => {
+        const hay = `${item?.title || ''} ${item?.language || ''} ${item?.sportGenre || ''}`.toLowerCase();
+        if (hay.includes(lower) || (romanQ && hay.includes(romanQ))) return true;
+        return qWords.length > 0 && qWords.some((w) => w.length >= 3 && hay.includes(w));
+      }),
     ]).slice(0, 36);
 
     if (localInstant.length > 0) {
@@ -386,7 +853,7 @@ export default function App() {
       } finally {
         if (!cancelled) setLoadingSuggestions(false);
       }
-    }, 45);
+    }, 15);
 
     return () => {
       cancelled = true;
@@ -427,29 +894,18 @@ export default function App() {
     fetchCatalog(currentCategory.path, currentPage, submittedSearch, activeNodeId);
   }, [currentCategory.path, currentPage, submittedSearch, activeNodeId, fetchCatalog]);
 
-  // Automatic Real-Time Background Sync for New Movies & Episodes (Paused while video player is open!)
+  // Gentle Visibility Sync Only (Zero wasteful 45s background polling!)
   useEffect(() => {
-    if (selectedMovie) return;
-    const interval = setInterval(() => {
-      if (document.visibilityState === 'visible' && activeTab === 'browse') {
-        setLiveClockNow(Date.now());
-        fetchCatalog(currentCategory.path, currentPage, submittedSearch, activeNodeId, true, true);
-      }
-    }, 45_000);
-
     const handleVisibility = () => {
       if (document.visibilityState === 'visible' && activeTab === 'browse' && !selectedMovie) {
         setLiveClockNow(Date.now());
-        fetchCatalog(currentCategory.path, currentPage, submittedSearch, activeNodeId, false, true);
       }
     };
     document.addEventListener('visibilitychange', handleVisibility);
-
     return () => {
-      clearInterval(interval);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [activeTab, currentCategory.path, currentPage, submittedSearch, activeNodeId, selectedMovie, fetchCatalog]);
+  }, [activeTab, selectedMovie]);
 
   // Prevent background page rubber-banding / scrolling when Fullscreen Movie Player or Modals are open
   // (Keep scrolling UNLOCKED when player is minimized to Floating Mini Player!)
@@ -775,15 +1231,32 @@ export default function App() {
     setShowSearchDropdown(false);
     setActiveTab('browse');
 
-    // 0ms Instant Category Seed from RAM cache or Home Shelves so switching tabs has zero lag!
+    // 0ms Instant Category Seed from RAM cache or Home Shelves so switching tabs & Hero Banner has zero lag!
     const ramHit = getInstantCatalogCache(cat.path, 1, '', activeNodeId);
     if (ramHit && ramHit.items.length > 0) {
       setItems(normalizeMovieCardList(ramHit.items));
       setMaxPage(ramHit.maxPage);
       return;
     }
-    const matchingShelves = (mbHomeData?.sections || [])
-      .filter((s) => s.categoryPath === cat.path)
+    const allHomeSections = mbHomeData?.sections || [];
+    const matchingShelves = allHomeSections
+      .filter((s) => {
+        if (s.categoryPath === cat.path) return true;
+        const st = (s.title || '').toLowerCase();
+        const cp = cat.path.toLowerCase();
+        if (cp === '/mostwatch/7d') return /trending|hot|popular|top/i.test(st);
+        if (cp === '/type/movies') return /movie|bollywood|hollywood|bengali|south/i.test(st);
+        if (cp === '/type/series') return /series|drama|tv|show/i.test(st);
+        if (cp === '/anime' || cp === '/category/anime-hindi') return /anime|animation/i.test(st);
+        if (cp === '/language/bangla') return /bengali|bangla/i.test(st);
+        if (cp === '/bollywood') return /bollywood|hindi/i.test(st);
+        if (cp === '/southindian') return /south|tamil|telugu/i.test(st);
+        if (cp === '/language/english') return /hollywood|english|western/i.test(st);
+        if (cp === '/drama') return /drama|korean|k-drama|asian/i.test(st);
+        if (cp === '/category/short-tv') return /short|drama/i.test(st);
+        if (cp === '/category/western-tv') return /western|hollywood|series/i.test(st);
+        return false;
+      })
       .flatMap((s) => s.items || []);
     const fallbackSeed = INITIAL_FALLBACK_MOVIES[cat.path] || [];
     const instantSeed = deduplicateMovieCards([...matchingShelves, ...fallbackSeed]);
@@ -797,7 +1270,12 @@ export default function App() {
     const trimmed = searchQuery.trim();
     setSourceFilter('ALL');
     setSubmittedSearch(trimmed);
-    if (trimmed) saveRecentSearch(trimmed);
+    if (trimmed) {
+      saveRecentSearch(trimmed);
+      if (suggestions.length > 0) {
+        setItems(normalizeMovieCardList(suggestions));
+      }
+    }
     setCurrentPage(1);
     setShowSearchDropdown(false);
     setActiveTab('browse');
@@ -859,6 +1337,21 @@ export default function App() {
       setContinueWatching((prev) => {
         const existing = prev.find((p) => p.movie.path === movie.path || p.movie.title === movie.title);
         const filtered = prev.filter((p) => p.movie.path !== movie.path && p.movie.title !== movie.title);
+
+        const resolvedDuration =
+          typeof duration === 'number' && duration > 0 ? Math.floor(duration) : existing?.durationSeconds || 0;
+
+        let resolvedSeconds = existing?.progressSeconds || 0;
+        if (typeof seconds === 'number' && seconds > 0) {
+          const floored = Math.floor(seconds);
+          // If finished within last 15 seconds of a full-length video, reset resume marker cleanly to 0
+          if (resolvedDuration > 60 && floored >= resolvedDuration - 15) {
+            resolvedSeconds = 0;
+          } else {
+            resolvedSeconds = floored;
+          }
+        }
+
         const entry: WatchProgressItem = {
           movie,
           episodeId: episode?.id ?? existing?.episodeId,
@@ -867,16 +1360,16 @@ export default function App() {
           quality: source?.quality ?? existing?.quality,
           audio: source?.audio ?? existing?.audio,
           updatedAt: Date.now(),
-          progressSeconds: seconds && seconds > 0 ? seconds : existing?.progressSeconds || 0,
-          durationSeconds: duration && duration > 0 ? duration : existing?.durationSeconds || 0,
+          progressSeconds: resolvedSeconds,
+          durationSeconds: resolvedDuration,
         };
-        return [entry, ...filtered].slice(0, 18);
+        return [entry, ...filtered].slice(0, 24);
       });
     },
     []
   );
 
-  // Automatically add opened movie/series to Watch History so it appears in Me -> Watch History immediately
+  // Automatically add opened movie/series to Watch History while preserving exact saved resume timestamp
   useEffect(() => {
     if (selectedMovie) {
       handleRecordWatchProgress(selectedMovie);
@@ -1026,69 +1519,92 @@ export default function App() {
   }, [items, audioPoolItems, mbHomeData, sourceFilter, audioFilter, qualityFilter, yearFilter, sortBy, submittedSearch, searchQuery, liveClockNow]);
 
   const heroSlides = useMemo(() => {
-    const mbBanners = mbHomeData?.banners || [];
-    const pool = normalizeMovieCardList(
-      currentCategory.path === '/'
-        ? [...mbBanners, ...TOP_10_THIS_WEEK_ITEMS, ...displayedItems, ...INITIAL_FALLBACK_MOVIES['/']]
-        : displayedItems,
-      liveClockNow
-    );
     const seen = new Set<string>();
-    const mbPopular: MovieCardItem[] = [];
-    const mlbdPopular: MovieCardItem[] = [];
-    const fallbackList: MovieCardItem[] = [];
+    const slides: MovieCardItem[] = [];
 
-    for (const item of pool) {
-      const tk = item.title.toLowerCase().replace(/[^a-z0-9]/g, '');
-      if (!seen.has(item.path) && !seen.has(tk) && item.poster && !brokenImages[item.id] && !item.isAdult) {
-        seen.add(item.path);
-        seen.add(tk);
-        if (item.path?.startsWith('/mb/')) {
-          mbPopular.push(item);
-        } else if (!item.path?.startsWith('/mf/')) {
-          mlbdPopular.push(item);
-        } else {
-          fallbackList.push(item);
+    const pushUnique = (list: MovieCardItem[]) => {
+      for (const item of list) {
+        if (!item?.title || !item?.path) continue;
+        const img = item.previewImage || item.poster;
+        if (!img || brokenImages[item.id]) continue;
+        if (currentCategory.path !== '/adult18plus' && item.isAdult) continue;
+        const tk = item.title.toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (!seen.has(item.path) && !seen.has(tk)) {
+          seen.add(item.path);
+          seen.add(tk);
+          slides.push(item);
+          if (slides.length >= 10) break;
         }
       }
+    };
+
+    if (currentCategory.path === '/') {
+      const mbBanners = mbHomeData?.banners || [];
+      const sectionLeads = (mbHomeData?.sections || []).flatMap((s) => (s.items || []).slice(0, 2));
+      pushUnique(
+        normalizeMovieCardList([
+          ...mbBanners,
+          ...sectionLeads,
+          ...TOP_10_THIS_WEEK_ITEMS,
+          ...displayedItems,
+          ...(INITIAL_FALLBACK_MOVIES['/'] || []),
+        ])
+      );
+    } else {
+      // Category-specific Hero Banner: dynamically adapts to whichever tab is active after Homepage!
+      const fallbackCat = INITIAL_FALLBACK_MOVIES[currentCategory.path] || [];
+      pushUnique(normalizeMovieCardList([...displayedItems, ...fallbackCat]));
     }
 
-    mbPopular.sort((a, b) => (b.hypeScore || 0) - (a.hypeScore || 0));
-    mlbdPopular.sort((a, b) => (b.hypeScore || 0) - (a.hypeScore || 0));
-    fallbackList.sort((a, b) => (b.hypeScore || 0) - (a.hypeScore || 0));
-
-    const interleavedHero: MovieCardItem[] = [];
-    const maxLen = Math.max(mbPopular.length, mlbdPopular.length);
-    for (let i = 0; i < maxLen; i++) {
-      if (i < mbPopular.length) interleavedHero.push(mbPopular[i]);
-      if (i < mlbdPopular.length) interleavedHero.push(mlbdPopular[i]);
-    }
-    if (interleavedHero.length < 10) {
-      interleavedHero.push(...fallbackList);
-    }
-
-    return interleavedHero.length > 0 ? interleavedHero.slice(0, 12) : displayedItems.slice(0, 12);
-  }, [mbHomeData, displayedItems, brokenImages, currentCategory.path, liveClockNow]);
+    return slides.length > 0 ? slides.slice(0, 10) : displayedItems.slice(0, 10);
+  }, [mbHomeData, displayedItems, brokenImages, currentCategory.path]);
 
   const [heroSlideIdx, setHeroSlideIdx] = useState(0);
   const heroTouchStartXRef = useRef<number | null>(null);
+  const heroMiniStripRef = useRef<HTMLDivElement | null>(null);
 
   // Reset slide index when category changes
   useEffect(() => {
     setHeroSlideIdx(0);
   }, [currentCategory.path]);
 
-  // Auto-advance Hero Background Cover through Hot/Popular Movies one after another every 3.8s
+  // Preload Hero slide images in browser cache so auto-sliding never flashes blank frames
+  useEffect(() => {
+    heroSlides.slice(0, 6).forEach((slide) => {
+      const src = slide.previewImage || slide.poster;
+      if (src) {
+        const img = new Image();
+        img.referrerPolicy = 'no-referrer';
+        img.src = src;
+      }
+    });
+  }, [heroSlides]);
+
+  // Auto-advance Hero Background Cover smoothly every 3.2s on Home AND all Category Tabs
   useEffect(() => {
     if (activeTab !== 'browse' || selectedMovie || submittedSearch || currentPage !== 1) return;
     if (heroSlides.length <= 1) return;
     const timer = window.setInterval(() => {
       setHeroSlideIdx((prev) => (prev + 1) % heroSlides.length);
-    }, 3800);
+    }, 3200);
     return () => window.clearInterval(timer);
-  }, [activeTab, selectedMovie, submittedSearch, currentPage, heroSlides.length]);
+  }, [activeTab, selectedMovie, submittedSearch, currentPage, heroSlides.length, currentCategory.path]);
 
   const safeSlideIdx = heroSlides.length > 0 ? heroSlideIdx % heroSlides.length : 0;
+
+  // Smoothly scroll the mini-cards strip horizontally to keep the active slide visible
+  useEffect(() => {
+    const strip = heroMiniStripRef.current;
+    if (!strip || heroSlides.length <= 1) return;
+    const activeEl = strip.children[safeSlideIdx] as HTMLElement | undefined;
+    if (activeEl) {
+      const targetLeft = Math.max(
+        0,
+        activeEl.offsetLeft - strip.clientWidth / 2 + activeEl.clientWidth / 2
+      );
+      strip.scrollTo({ left: targetLeft, behavior: 'smooth' });
+    }
+  }, [safeSlideIdx, heroSlides.length]);
 
   const spotlightItem = useMemo(() => {
     return (
@@ -1100,19 +1616,14 @@ export default function App() {
   }, [heroSlides, safeSlideIdx, displayedItems]);
 
   const heroMiniCards = useMemo(() => {
-    if (heroSlides.length === 0) return displayedItems.slice(0, 4);
-    const ordered: MovieCardItem[] = [];
-    const count = Math.min(6, heroSlides.length);
-    for (let i = 0; i < count; i++) {
-      ordered.push(heroSlides[(safeSlideIdx + i) % heroSlides.length]);
-    }
-    return ordered;
-  }, [heroSlides, safeSlideIdx, displayedItems]);
+    if (heroSlides.length === 0) return displayedItems.slice(0, 6);
+    return heroSlides.slice(0, 10);
+  }, [heroSlides, displayedItems]);
 
   const top10ThisWeekItems = useMemo(() => {
     const merged: MovieCardItem[] = [];
     const seen = new Set<string>();
-    const combined = normalizeMovieCardList([...TOP_10_THIS_WEEK_ITEMS, ...displayedItems], liveClockNow);
+    const combined = normalizeMovieCardList([...TOP_10_THIS_WEEK_ITEMS, ...displayedItems]);
     for (const item of combined) {
       const tk = item.title.toLowerCase().replace(/[^a-z0-9]/g, '');
       if (!seen.has(item.path) && !seen.has(tk) && item.poster && !brokenImages[item.id]) {
@@ -1123,7 +1634,7 @@ export default function App() {
       }
     }
     return merged.slice(0, 10);
-  }, [displayedItems, brokenImages, liveClockNow]);
+  }, [displayedItems, brokenImages]);
 
   // Last 24 Hours updated movies, series, and anime across all 3 sites
   const last24hItems = useMemo(() => {
@@ -1154,14 +1665,12 @@ export default function App() {
       }
     }
     const mb = recentPool.filter((i) => i.path?.startsWith('/mb/'));
-    const mf = recentPool.filter((i) => i.path?.startsWith('/mf/'));
-    const mlbd = recentPool.filter((i) => !i.path?.startsWith('/mb/') && !i.path?.startsWith('/mf/'));
+    const mlbd = recentPool.filter((i) => !i.path?.startsWith('/mb/'));
     const interleaved: MovieCardItem[] = [];
-    const maxLen = Math.max(mb.length, mlbd.length, mf.length);
+    const maxLen = Math.max(mb.length, mlbd.length);
     for (let i = 0; i < maxLen; i++) {
       if (i < mlbd.length) interleaved.push(mlbd[i]);
       if (i < mb.length) interleaved.push(mb[i]);
-      if (i < mf.length) interleaved.push(mf[i]);
     }
     const baseList = interleaved.length >= 8 ? interleaved : combined.slice(0, 36);
     return baseList;
@@ -1537,15 +2046,31 @@ export default function App() {
                 )}
 
                 {(() => {
-                  const activeQ = (searchQuery.trim() || submittedSearch.trim()).toLowerCase();
+                  const rawActiveQ = searchQuery.trim() || submittedSearch.trim();
+                  const activeQ = rawActiveQ.toLowerCase();
+                  const romanActiveQ = transliterateClientQuery(rawActiveQ);
+                  const activeWords = Array.from(
+                    new Set(
+                      `${activeQ} ${romanActiveQ}`
+                        .split(/\s+/)
+                        .map((w) => w.replace(/[^a-z0-9\u0980-\u09FF]/gi, ''))
+                        .filter((w) => w.length >= 2)
+                    )
+                  );
                   const rawPool = activeQ
                     ? deduplicateMovieCards([
                         ...normalizeMovieCardList(suggestions, liveClockNow),
-                        ...localSearchPool.filter(
-                          (i) =>
-                            i.title.toLowerCase().includes(activeQ) ||
-                            i.language.toLowerCase().includes(activeQ)
-                        ),
+                        ...(submittedSearch.trim() ? normalizeMovieCardList(items, liveClockNow) : []),
+                        ...localSearchPool.filter((i) => {
+                          const hay = `${i.title} ${i.language} ${i.sportGenre || ''}`.toLowerCase();
+                          if (hay.includes(activeQ) || (romanActiveQ && hay.includes(romanActiveQ))) {
+                            return true;
+                          }
+                          return (
+                            activeWords.length > 0 &&
+                            activeWords.some((w) => w.length >= 3 && hay.includes(w))
+                          );
+                        }),
                       ])
                     : deduplicateMovieCards([
                         ...displayedItems.slice(0, 24),
@@ -1752,7 +2277,7 @@ export default function App() {
                     if (heroTouchStartXRef.current !== null && e.changedTouches.length === 1) {
                       const deltaX = e.changedTouches[0].clientX - heroTouchStartXRef.current;
                       heroTouchStartXRef.current = null;
-                      if (Math.abs(deltaX) > 45 && heroSlides.length > 1) {
+                      if (Math.abs(deltaX) > 40 && heroSlides.length > 1) {
                         if (deltaX < 0) {
                           setHeroSlideIdx((prev) => (prev + 1) % heroSlides.length);
                         } else {
@@ -1765,16 +2290,18 @@ export default function App() {
                   }}
                   className="relative aspect-[16/10] sm:aspect-[21/9] w-full rounded-2xl sm:rounded-3xl bg-[#0a0a0a] border border-white/10 cursor-pointer overflow-hidden shadow-2xl group"
                 >
-                  {spotlightItem.poster && !brokenImages[spotlightItem.id] ? (
+                  {(spotlightItem.previewImage || spotlightItem.poster) &&
+                  !brokenImages[spotlightItem.id] ? (
                     <img
-                      key={spotlightItem.id}
-                      src={spotlightItem.poster}
+                      src={spotlightItem.previewImage || spotlightItem.poster}
                       alt={spotlightItem.title}
                       referrerPolicy="no-referrer"
+                      decoding="async"
+                      fetchPriority="high"
                       onError={() =>
                         setBrokenImages((prev) => ({ ...prev, [spotlightItem.id]: true }))
                       }
-                      className="w-full h-full object-cover object-top group-hover:scale-105 transition-transform duration-500"
+                      className="w-full h-full object-cover object-top group-hover:scale-105 transition-all duration-500 ease-out will-change-transform"
                     />
                   ) : (
                     <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-[#1a0b0b] to-[#050505]">
@@ -1782,13 +2309,73 @@ export default function App() {
                     </div>
                   )}
 
+                  {/* Top-left Active Category Badge + Top-right Slide Indicator Dots */}
+                  <div className="absolute top-3 left-3 right-3 flex items-center justify-between pointer-events-none z-10">
+                    <span className="px-2.5 py-1 rounded-lg bg-black/65 backdrop-blur-md border border-white/15 text-[11px] font-bold text-[#00e68a] tracking-wide uppercase">
+                      {currentCategory.path === '/' ? '🔥 Spotlight' : currentCategory.label}
+                    </span>
+                    {heroSlides.length > 1 && (
+                      <div className="flex items-center gap-1.5 px-2 py-1 rounded-full bg-black/50 backdrop-blur-md pointer-events-auto">
+                        {heroSlides.slice(0, 8).map((s, dotIdx) => (
+                          <button
+                            key={s.id + dotIdx}
+                            type="button"
+                            aria-label={`Slide ${dotIdx + 1}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setHeroSlideIdx(dotIdx);
+                            }}
+                            className={`h-1.5 rounded-full transition-all duration-300 cursor-pointer ${
+                              dotIdx === safeSlideIdx
+                                ? 'w-5 bg-[#00e68a]'
+                                : 'w-1.5 bg-white/40 hover:bg-white/70'
+                            }`}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
                   {/* Smooth bottom fade into the compact card strip */}
-                  <div className="absolute inset-x-0 bottom-0 h-1/2 bg-gradient-to-t from-[#050505] via-[#050505]/55 to-transparent pointer-events-none" />
+                  <div className="absolute inset-x-0 bottom-0 h-3/5 bg-gradient-to-t from-[#050505] via-[#050505]/70 to-transparent pointer-events-none" />
+
+                  {/* Live Slide Title & Metadata above the mini-cards strip */}
+                  <div className="absolute inset-x-3 sm:inset-x-5 bottom-9 sm:bottom-11 z-10 pointer-events-none flex items-end justify-between gap-3">
+                    <div className="min-w-0">
+                      <h2 className="text-base sm:text-2xl font-extrabold text-white drop-shadow-[0_2px_10px_rgba(0,0,0,0.9)] truncate">
+                        {spotlightItem.title}
+                      </h2>
+                      <div className="flex items-center gap-2 text-[11px] sm:text-xs text-gray-200 font-semibold mt-0.5 drop-shadow">
+                        {spotlightItem.rating && (
+                          <span className="inline-flex items-center gap-1 text-amber-400 font-bold">
+                            <Star className="w-3.5 h-3.5 fill-current" />
+                            {Number(spotlightItem.rating).toFixed(1)}
+                          </span>
+                        )}
+                        <span>•</span>
+                        <span className="text-[#00e68a]">
+                          {formatShortLanguage(spotlightItem.language)}
+                        </span>
+                        {spotlightItem.quality && (
+                          <>
+                            <span>•</span>
+                            <span className="px-1.5 py-0.5 rounded bg-white/15 text-white text-[10px] font-bold">
+                              {spotlightItem.quality}
+                            </span>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  </div>
                 </div>
 
                 {/* MovieBox-Style Compact Floating Cards Strip Under Cover */}
-                <div className="relative z-20 -mt-8 sm:-mt-10 px-2 flex items-end gap-2 overflow-x-auto no-scrollbar pt-3 pb-1">
+                <div
+                  ref={heroMiniStripRef}
+                  className="relative z-20 -mt-8 sm:-mt-10 px-2 flex items-end gap-2 overflow-x-auto no-scrollbar pt-3 pb-1 scroll-smooth"
+                >
                   {heroMiniCards.map((card, idx) => {
+                    const isCurrentSlide = idx === safeSlideIdx;
                     const yearMatch = card.title.match(/\b(20\d{2}|19\d{2})\b/);
                     const yearStr = yearMatch ? yearMatch[1] : '2026';
                     const isSeriesCard =
@@ -1822,8 +2409,15 @@ export default function App() {
                         key={card.path + card.id + idx}
                         onMouseEnter={() => prefetchMovieDetails(card.path, card.title, activeNodeId)}
                         onTouchStart={() => prefetchMovieDetails(card.path, card.title, activeNodeId)}
-                        onClick={() => setSelectedMovie(card)}
-                        className="w-[196px] sm:w-[220px] shrink-0 rounded-xl bg-[#181a20]/95 backdrop-blur-md border border-white/[0.08] px-2.5 py-2 flex items-center gap-2.5 cursor-pointer shadow-[0_6px_18px_rgba(0,0,0,0.6)] active:scale-[0.98] transition-all"
+                        onClick={() => {
+                          setHeroSlideIdx(idx);
+                          setSelectedMovie(card);
+                        }}
+                        className={`w-[196px] sm:w-[220px] shrink-0 rounded-xl backdrop-blur-md border px-2.5 py-2 flex items-center gap-2.5 cursor-pointer shadow-[0_6px_18px_rgba(0,0,0,0.6)] active:scale-[0.98] transition-all duration-300 ${
+                          isCurrentSlide
+                            ? 'bg-[#1e232c] border-[#00e68a]/80 shadow-[0_0_16px_rgba(0,230,138,0.22)]'
+                            : 'bg-[#181a20]/95 border-white/[0.08] opacity-85 hover:opacity-100'
+                        }`}
                       >
                         {/* Protruding Mini Poster Thumbnail */}
                         <div className="relative -mt-5 w-10 h-14 sm:w-11 sm:h-15 rounded-lg overflow-hidden bg-[#0a0a0a] shrink-0 shadow-md border border-white/15">
@@ -1832,6 +2426,8 @@ export default function App() {
                               src={card.poster}
                               alt={card.title}
                               referrerPolicy="no-referrer"
+                              loading="lazy"
+                              decoding="async"
                               className="w-full h-full object-cover"
                             />
                           ) : (
@@ -2533,11 +3129,28 @@ export default function App() {
             <div className="rounded-3xl bg-[#0a0a0a] border border-white/[0.08] p-5 sm:p-6 space-y-4">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <h2 className="text-lg font-extrabold text-white">
-                    My List & Saved Downloads ({watchlist.length})
-                  </h2>
-                  <p className="text-xs text-gray-400">
-                    আপনার পছন্দের সেভ করা মুভি, অ্যানিমে ও ওয়াচ হিস্ট্রি
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h2 className="text-lg font-extrabold text-white">
+                      My List & Saved Downloads ({watchlist.length})
+                    </h2>
+                    {userSession && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAuthPanelOpen(true);
+                          setActiveTab('me');
+                        }}
+                        className="px-2.5 py-0.5 rounded-full bg-[#16181e] border border-emerald-500/30 text-[11px] font-bold text-emerald-300 flex items-center gap-1 hover:border-emerald-400"
+                      >
+                        <ShieldCheck className="w-3 h-3" />
+                        <span>
+                          {userSession.isGuest ? userSession.username : `@${userSession.username}`}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                  <p className="text-xs text-gray-400 mt-0.5">
+                    শুধুমাত্র আপনার ব্যক্তিগত সেভ করা মুভি, অ্যানিমে ও রিজিউম হিস্ট্রি (অন্য কারোর সাথে মিশবে না)
                   </p>
                 </div>
 
@@ -2709,8 +3322,28 @@ export default function App() {
         {/* VIEW 4: FULL-SCREEN MOVIEBOX STYLE "ME" PAGE */}
         {activeTab === 'me' && (
           <main className="min-h-screen bg-[#0c0d11] text-white px-3.5 sm:px-6 pt-3 pb-10 max-w-2xl mx-auto space-y-3.5 select-none">
-            {/* Top Bar with Scan Icon */}
-            <div className="flex items-center justify-end py-1">
+            {/* Top Bar with Account Pill & Scan Icon */}
+            <div className="flex items-center justify-between py-1">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-full bg-gradient-to-tr from-[#dc2626] to-[#ef4444] flex items-center justify-center text-white font-black text-sm shadow">
+                  {(userSession?.username || 'G').charAt(0).toUpperCase()}
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-sm font-extrabold text-white">
+                      {userSession?.isGuest
+                        ? userSession.username
+                        : `@${userSession?.username || 'User'}`}
+                    </span>
+                    <span className="px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-[10px] font-bold text-emerald-300">
+                      {userSession?.isGuest ? 'Private Guest' : 'Synced Account'}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-gray-400">
+                    আপনার ওয়াচলিস্ট ও রিজিউম টাইম সম্পূর্ণ আলাদা সুরক্ষিত
+                  </p>
+                </div>
+              </div>
               <button
                 type="button"
                 onClick={() => setShowInstallModal(true)}
@@ -2719,6 +3352,156 @@ export default function App() {
               >
                 <ScanLine className="w-6 h-6" />
               </button>
+            </div>
+
+            {/* Personal Account & Cross-Device Private Sync Card */}
+            <div className="rounded-2xl bg-[#16181e] border border-white/[0.06] p-4 space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <ShieldCheck className="w-4 h-4 text-[#00e68a]" />
+                  <span className="text-xs sm:text-sm font-bold text-white">
+                    {userSession?.isGuest
+                      ? 'আলাদা ইউজার অ্যাকাউন্ট (অন্য ডিভাইসেও নিজের ওয়াচলিস্ট ও রিজিউম পেতে)'
+                      : `অ্যাকাউন্ট সক্রিয়: @${userSession?.username}`}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {userSession?.isGuest ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAuthMessage(null);
+                        setAuthPanelOpen((prev) => !prev);
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-[#dc2626] hover:bg-[#b91c1c] text-white text-xs font-bold flex items-center gap-1.5"
+                    >
+                      <UserPlus className="w-3.5 h-3.5" />
+                      <span>{authPanelOpen ? 'বন্ধ করুন' : 'লগইন / অ্যাকাউন্ট খুলুন'}</span>
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setAuthMessage(null);
+                          setAuthPanelOpen((prev) => !prev);
+                        }}
+                        className="px-3 py-1.5 rounded-lg bg-[#22252b] hover:bg-[#2a2e36] text-gray-200 text-xs font-bold flex items-center gap-1"
+                      >
+                        <LogIn className="w-3.5 h-3.5" />
+                        <span>অন্য অ্যাকাউন্ট</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={authBusy}
+                        onClick={handleLogoutToNewGuest}
+                        className="px-3 py-1.5 rounded-lg bg-red-950/60 hover:bg-red-900/70 border border-red-500/30 text-red-200 text-xs font-bold flex items-center gap-1"
+                      >
+                        <LogOut className="w-3.5 h-3.5" />
+                        <span>লগআউট</span>
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              {authMessage && (
+                <div
+                  className={`px-3 py-2 rounded-xl text-xs font-semibold ${
+                    authMessage.type === 'ok'
+                      ? 'bg-emerald-950/60 border border-emerald-500/30 text-emerald-200'
+                      : 'bg-red-950/60 border border-red-500/30 text-red-200'
+                  }`}
+                >
+                  {authMessage.text}
+                </div>
+              )}
+
+              {authPanelOpen && (
+                <form onSubmit={handleAccountAuthSubmit} className="pt-2 border-t border-white/[0.06] space-y-2.5">
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAuthMode('register');
+                        setAuthMessage(null);
+                      }}
+                      className={`flex-1 py-1.5 rounded-lg text-xs font-bold ${
+                        authMode === 'register'
+                          ? 'bg-[#dc2626] text-white'
+                          : 'bg-[#0e1015] text-gray-400'
+                      }`}
+                    >
+                      নতুন অ্যাকাউন্ট খুলুন
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAuthMode('login');
+                        setAuthMessage(null);
+                      }}
+                      className={`flex-1 py-1.5 rounded-lg text-xs font-bold ${
+                        authMode === 'login'
+                          ? 'bg-[#dc2626] text-white'
+                          : 'bg-[#0e1015] text-gray-400'
+                      }`}
+                    >
+                      আগের অ্যাকাউন্টে লগইন
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <input
+                      type="text"
+                      value={authUsername}
+                      onChange={(e) => setAuthUsername(e.target.value)}
+                      placeholder="আপনার নাম / ইউজারনেম"
+                      maxLength={24}
+                      className="px-3 py-2 rounded-xl bg-[#0e1015] border border-white/10 text-xs text-white placeholder:text-gray-500 focus:outline-none focus:border-[#dc2626]"
+                    />
+                    <input
+                      type="password"
+                      value={authPin}
+                      onChange={(e) => setAuthPin(e.target.value)}
+                      placeholder="গোপন পিন (কমপক্ষে ৪ অক্ষর)"
+                      maxLength={24}
+                      className="px-3 py-2 rounded-xl bg-[#0e1015] border border-white/10 text-xs text-white placeholder:text-gray-500 focus:outline-none focus:border-[#dc2626]"
+                    />
+                  </div>
+
+                  {authMode === 'register' && (watchlist.length > 0 || continueWatching.length > 0) && (
+                    <label className="flex items-center gap-2 text-[11px] text-gray-300 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={authCarryGuestData}
+                        onChange={(e) => setAuthCarryGuestData(e.target.checked)}
+                        className="accent-[#dc2626]"
+                      />
+                      <span>এই ব্রাউজারে থাকা বর্তমান গেস্ট ওয়াচলিস্ট নতুন অ্যাকাউন্টে সেভ করুন</span>
+                    </label>
+                  )}
+
+                  <button
+                    type="submit"
+                    disabled={authBusy}
+                    className="w-full py-2 rounded-xl bg-[#dc2626] hover:bg-[#b91c1c] disabled:opacity-60 text-white text-xs font-extrabold flex items-center justify-center gap-1.5"
+                  >
+                    {authBusy ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : authMode === 'register' ? (
+                      <>
+                        <UserPlus className="w-4 h-4" />
+                        <span>ব্যক্তিগত অ্যাকাউন্ট তৈরি করুন</span>
+                      </>
+                    ) : (
+                      <>
+                        <LogIn className="w-4 h-4" />
+                        <span>লগইন করে আমার ওয়াচলিস্ট আনুন</span>
+                      </>
+                    )}
+                  </button>
+                </form>
+              )}
             </div>
 
             {/* Clean Essential Card Group: Watch History + My List + Last 24h Updates + App Install */}
@@ -2962,67 +3745,73 @@ export default function App() {
         </div>
       </nav>
 
-      {/* Full-Screen MovieBox Style Player & Floating Mini-Player View */}
-      <MovieDetailModal
-        movie={selectedMovie}
-        relatedMovies={displayedItems}
-        activeNodeId={activeNodeId}
-        savedProgress={selectedMovieProgress}
-        isMiniPlayer={isMiniPlayer}
-        onToggleMiniPlayer={(mini) => setIsMiniPlayer(mini)}
-        onClose={() => {
-          setIsMiniPlayer(false);
-          setSelectedMovie(null);
-        }}
-        onSelectMovie={(m) => {
-          setIsMiniPlayer(false);
-          setSelectedMovie(m);
-        }}
-        isInWatchlist={isMovieInWatchlist(selectedMovie)}
-        currentFolder={getMovieWatchlistFolder(selectedMovie)}
-        onToggleWatchlist={handleToggleWatchlist}
-        onRecordWatchProgress={handleRecordWatchProgress}
-        onSearchByActor={handleTriggerActorSearch}
-        onOpenReportModal={(prefillTitle) => {
-          setRequestPrefillTitle(prefillTitle);
-          setRequestPrefillType('BROKEN_LINK');
-          setShowRequestModal(true);
-        }}
-      />
+      {/* Lazy-Loaded Modals for Fast Initial Page Load */}
+      <Suspense fallback={null}>
+        {selectedMovie && (
+          <MovieDetailModal
+            movie={selectedMovie}
+            relatedMovies={displayedItems}
+            activeNodeId={activeNodeId}
+            savedProgress={selectedMovieProgress}
+            isMiniPlayer={isMiniPlayer}
+            onToggleMiniPlayer={(mini) => setIsMiniPlayer(mini)}
+            onClose={() => {
+              setIsMiniPlayer(false);
+              setSelectedMovie(null);
+            }}
+            onSelectMovie={(m) => {
+              setIsMiniPlayer(false);
+              setSelectedMovie(m);
+            }}
+            isInWatchlist={isMovieInWatchlist(selectedMovie)}
+            currentFolder={getMovieWatchlistFolder(selectedMovie)}
+            onToggleWatchlist={handleToggleWatchlist}
+            onRecordWatchProgress={handleRecordWatchProgress}
+            onSearchByActor={handleTriggerActorSearch}
+            onOpenReportModal={(prefillTitle) => {
+              setRequestPrefillTitle(prefillTitle);
+              setRequestPrefillType('BROKEN_LINK');
+              setShowRequestModal(true);
+            }}
+          />
+        )}
 
-      {/* Me Option: Watch History + Collapsible 24h Live 3-Site Upload Button */}
-      <MovieRequestModal
-        isOpen={showRequestModal}
-        initialTitle={requestPrefillTitle}
-        initialType={requestPrefillType}
-        activeNodeId={activeNodeId}
-        onSelectNode={(nodeId) => setActiveNodeId(nodeId)}
-        onClose={() => setShowRequestModal(false)}
-        last24hItems={last24hItems}
-        liveClockNow={liveClockNow}
-        isRefreshing24h={loadingCatalog || refreshing24h}
-        onRefresh24h={() => {
-          setLiveClockNow(Date.now());
-          refreshLatest3SiteUploads(true);
-          fetchCatalog(currentCategory.path, 1, '', activeNodeId, true);
-        }}
-        onSelectMovie={(m) => {
-          setIsMiniPlayer(false);
-          setSelectedMovie(m);
-        }}
-        continueWatching={continueWatching}
-        onClearWatchHistory={() => setContinueWatching([])}
-      />
+        {showRequestModal && (
+          <MovieRequestModal
+            isOpen={showRequestModal}
+            initialTitle={requestPrefillTitle}
+            initialType={requestPrefillType}
+            activeNodeId={activeNodeId}
+            onSelectNode={(nodeId) => setActiveNodeId(nodeId)}
+            onClose={() => setShowRequestModal(false)}
+            last24hItems={last24hItems}
+            liveClockNow={liveClockNow}
+            isRefreshing24h={loadingCatalog || refreshing24h}
+            onRefresh24h={() => {
+              setLiveClockNow(Date.now());
+              refreshLatest3SiteUploads(true);
+              fetchCatalog(currentCategory.path, 1, '', activeNodeId, true);
+            }}
+            onSelectMovie={(m) => {
+              setIsMiniPlayer(false);
+              setSelectedMovie(m);
+            }}
+            continueWatching={continueWatching}
+            onClearWatchHistory={() => setContinueWatching([])}
+          />
+        )}
 
-      {/* iPhone PWA Install Guide Modal */}
-      <PWAInstallModal
-        isOpen={showInstallModal}
-        onClose={() => setShowInstallModal(false)}
-        isInstallable={isInstallable}
-        isInstalled={isInstalled}
-        isIOS={isIOS}
-        onTriggerInstall={install}
-      />
+        {showInstallModal && (
+          <PWAInstallModal
+            isOpen={showInstallModal}
+            onClose={() => setShowInstallModal(false)}
+            isInstallable={isInstallable}
+            isInstalled={isInstalled}
+            isIOS={isIOS}
+            onTriggerInstall={install}
+          />
+        )}
+      </Suspense>
     </div>
   );
 }

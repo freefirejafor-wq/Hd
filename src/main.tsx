@@ -1,6 +1,9 @@
 import {createRoot} from 'react-dom/client';
+import {initClientSecurityShield} from './utils/securityShield.ts';
 import App from './App.tsx';
 import './index.css';
+
+initClientSecurityShield();
 
 // Unregister any stale service workers and wipe outdated Workbox precaches so Render deploys update immediately
 if (typeof window !== 'undefined') {

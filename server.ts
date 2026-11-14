@@ -7,7 +7,6 @@ import https from 'https';
 import path from 'path';
 import { Readable } from 'stream';
 import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
 import { ALL_CATEGORIES, INITIAL_FALLBACK_MOVIES } from './src/data/categories.ts';
 import {
   cleanTimeAgoAndEpisode,
@@ -20,6 +19,7 @@ import {
   sortItemsByHotAndHype,
   sortItemsByRecentUpload,
 } from './src/utils/timeAgo.ts';
+import { cloakPayloadDeep, decodeCloakToken } from './src/utils/securityShield.ts';
 import type {
   CastMember,
   DirectDownloadButton,
@@ -38,8 +38,10 @@ import type {
   UserMovieRequest,
 } from './src/types/cinema.ts';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname =
+  typeof import.meta?.url === 'string' && import.meta.url
+    ? path.dirname(fileURLToPath(import.meta.url))
+    : process.cwd();
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught exception (kept server alive):', err?.message || err);
@@ -58,10 +60,70 @@ interface MirrorNodeConfig {
 
 const SERVER_NODES: MirrorNodeConfig[] = [
   { id: 'node-moviebox', name: 'CinePulse HD', region: 'CinePulse Global 4K/1080p Cloud', origin: 'https://movie-box.co' },
+  { id: 'node-mlbd', name: 'CinePulse Bangla & South Hub', region: 'CinePulse Direct BD/Cloud', origin: 'https://rmqn25.movielinkbd.at' },
 ];
 
-const PRIMARY_MIRROR_NODES = SERVER_NODES.filter((n) => n.id !== 'node-myflix' && n.id !== 'node-moviebox');
-const MYFLIX_ORIGIN = 'https://myflixbd.to';
+let activeMovieLinkBdOrigin = 'https://rmqn25.movielinkbd.at';
+const MOVIELINKBD_DISCOVERY_HUBS = [
+  'https://movielinkbd.at/',
+  'https://movielinkbd.com/',
+];
+let lastMlbdDiscoveryAt = 0;
+
+function getMirrorNodes(): MirrorNodeConfig[] {
+  return [
+    {
+      id: 'node-mlbd',
+      name: 'CinePulse Bangla & South Hub',
+      region: 'CinePulse Direct BD/Cloud',
+      origin: activeMovieLinkBdOrigin,
+    },
+    {
+      id: 'node-mlbd-fallback',
+      name: 'CinePulse Bangla Mirror',
+      region: 'CinePulse Mirror Gateway',
+      origin: 'https://movielinkbd.at',
+    },
+  ];
+}
+
+async function discoverActiveMovieLinkBdOrigin(force = false): Promise<string> {
+  if (!force && Date.now() - lastMlbdDiscoveryAt < 10 * 60_000) {
+    return activeMovieLinkBdOrigin;
+  }
+  lastMlbdDiscoveryAt = Date.now();
+  for (const hubUrl of MOVIELINKBD_DISCOVERY_HUBS) {
+    try {
+      const res = await fetch(hubUrl, {
+        redirect: 'follow',
+        signal: AbortSignal.timeout(4500),
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        },
+      });
+      if (res.ok) {
+        const finalHost = new URL(res.url || hubUrl);
+        if (finalHost.hostname.endsWith('movielinkbd.at') && finalHost.hostname !== 'movielinkbd.at') {
+          activeMovieLinkBdOrigin = finalHost.origin;
+          SERVER_NODES[1].origin = activeMovieLinkBdOrigin;
+          return activeMovieLinkBdOrigin;
+        }
+        const html = await res.text();
+        const linkMatch = html.match(/https:\/\/[a-z0-9-]+\.movielinkbd\.at/i);
+        if (linkMatch?.[0]) {
+          activeMovieLinkBdOrigin = linkMatch[0];
+          SERVER_NODES[1].origin = activeMovieLinkBdOrigin;
+          return activeMovieLinkBdOrigin;
+        }
+      }
+    } catch {
+      // try next discovery hub
+    }
+  }
+  return activeMovieLinkBdOrigin;
+}
+
 const MOVIEBOX_ORIGIN = 'https://movie-box.co';
 const MOVIEBOX_BACKUP_ORIGIN = 'https://movieboxhd.net';
 const MOVIEBOX_API_ORIGIN = 'https://movie-box.co';
@@ -96,8 +158,6 @@ const imdbIdCache = new Map<string, string>();
 let healthCache: CacheEntry<ServerNodeStatus[]> | null = null;
 const mirrorHtmlCache = new Map<string, CacheEntry<{ html: string; finalOrigin: string; activeNodeId: string }>>();
 const inFlightMirrorMap = new Map<string, Promise<{ html: string; finalOrigin: string; activeNodeId: string }>>();
-const myFlixHtmlCache = new Map<string, CacheEntry<string>>();
-const inFlightMyFlixMap = new Map<string, Promise<string>>();
 const inFlightCatalogMap = new Map<string, Promise<any>>();
 
 function sortSourcesFastestFirst(sources?: StreamSource[]): StreamSource[] {
@@ -105,7 +165,7 @@ function sortSourcesFastestFirst(sources?: StreamSource[]): StreamSource[] {
   const score = (src: StreamSource) => {
     const isEmbed =
       src.type === 'embed' ||
-      /abyssplayer\.com|abysscdn\.com|vidsrc|multiembed|autoembed|myflix/i.test(`${src.url || ''} ${src.id || ''}`);
+      /abyssplayer\.com|abysscdn\.com|vidsrc|multiembed|autoembed/i.test(`${src.url || ''} ${src.id || ''}`);
     if (isEmbed) return 400;
     const isMovieBox =
       src.id?.startsWith('mb-') || /\/api\/mb-stream|\/api\/mb-ep-stream/i.test(src.url || '');
@@ -345,19 +405,88 @@ function buildGlobalNotifications(): GlobalMovieNotification[] {
   return notifications.slice(0, 28);
 }
 
-function encodeGatewayUrl(rawUrl: string): string {
+const CINEPULSE_AES_KEY = crypto
+  .createHash('sha256')
+  .update('CinePulse_AES256_Master_Key_v4_9x7A2mK8pQ4wL1zR6vN3jH5bT0yF')
+  .digest();
+
+const SHIELD_SECRET = 'CP_SHIELD_v4_9x7A2mK8pQ4wL1zR6vN3jH5bT0yF';
+
+function computeServerShieldSignature(pathAndQuery: string, timestampStr: string): string {
+  const cleanPath = (pathAndQuery || '/').split('#')[0];
+  const raw = `${timestampStr}::${cleanPath}::${SHIELD_SECRET}`;
+  let h1 = 0x811c9dc5 >>> 0;
+  let h2 = 0x01000193 >>> 0;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw.charCodeAt(i);
+    h1 ^= c;
+    h1 = Math.imul(h1, 16777619) >>> 0;
+    h2 ^= c + (i & 0xff);
+    h2 = Math.imul(h2, 2246822507) >>> 0;
+  }
+  return `${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`;
+}
+
+function encryptServerApiPayload(payloadObj: any): { _s: 1; n: string; d: string } {
+  const cloned = cloakPayloadDeep(JSON.parse(JSON.stringify(payloadObj)));
+  const jsonText = JSON.stringify(cloned);
+  const plainBuf = Buffer.from(jsonText, 'utf8');
+  const nonce = crypto.randomBytes(6).toString('hex');
+  const keyStr = `${SHIELD_SECRET}::${nonce}`;
+  const keyBytes = Buffer.from(keyStr, 'utf8');
+  const kLen = keyBytes.length;
+  let state = 0x5a3c9e17 >>> 0;
+  for (let i = 0; i < kLen; i++) {
+    state = (Math.imul(state ^ keyBytes[i], 1664525) + 1013904223) >>> 0;
+  }
+  const outBuf = Buffer.allocUnsafe(plainBuf.length);
+  for (let i = 0; i < plainBuf.length; i++) {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    const mask = ((state >>> 16) ^ keyBytes[i % kLen] ^ (i & 0xff)) & 0xff;
+    outBuf[i] = plainBuf[i] ^ mask;
+  }
+  return {
+    _s: 1,
+    n: nonce,
+    d: outBuf.toString('base64'),
+  };
+}
+
+function encodeGatewayToken(rawUrl: string): string {
   if (!rawUrl) return '';
   try {
-    const token = Buffer.from(rawUrl, 'utf8').toString('base64url');
-    return `/api/go?t=${token}`;
+    const iv = crypto.createHash('md5').update(`${rawUrl}::cp_iv_v4`).digest().subarray(0, 12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', CINEPULSE_AES_KEY, iv);
+    const encrypted = Buffer.concat([cipher.update(rawUrl, 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return `cp1.${iv.toString('base64url')}.${tag.toString('base64url')}.${encrypted.toString('base64url')}`;
   } catch {
-    return rawUrl;
+    return Buffer.from(rawUrl, 'utf8').toString('base64url');
   }
 }
 
+function encodeGatewayUrl(rawUrl: string): string {
+  if (!rawUrl) return '';
+  return `/api/go?t=${encodeGatewayToken(rawUrl)}`;
+}
+
 function decodeGatewayToken(token: string): string {
+  if (!token) return '';
   try {
-    return Buffer.from(token, 'base64url').toString('utf8');
+    const trimmed = token.trim();
+    if (trimmed.startsWith('cp1.')) {
+      const parts = trimmed.split('.');
+      if (parts.length === 4) {
+        const iv = Buffer.from(parts[1], 'base64url');
+        const tag = Buffer.from(parts[2], 'base64url');
+        const encrypted = Buffer.from(parts[3], 'base64url');
+        const decipher = crypto.createDecipheriv('aes-256-gcm', CINEPULSE_AES_KEY, iv);
+        decipher.setAuthTag(tag);
+        const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+        return decrypted.toString('utf8');
+      }
+    }
+    return Buffer.from(trimmed, 'base64url').toString('utf8');
   } catch {
     return '';
   }
@@ -369,9 +498,10 @@ function decodeGatewayToken(token: string): string {
 function sanitizeBrandText(input: string): string {
   if (!input) return '';
   return input
-    .replace(/https?:\/\/[^\s"'<>]*(?:movielinkbd|myflixbd)[^\s"'<>]*/gi, '')
-    .replace(/\b[a-z0-9-]*\.?(?:movielinkbd|myflixbd)\.[a-z]{2,6}\b/gi, 'CinePulse')
-    .replace(/movielinkbd|myflixbd|nexaflox/gi, 'CinePulse')
+    .replace(/https?:\/\/[^\s"'<>]*movielinkbd[^\s"'<>]*/gi, '')
+    .replace(/\b[a-z0-9-]*\.?movielinkbd\.[a-z]{2,6}\b/gi, 'CinePulse')
+    .replace(/movielinkbd|nexaflox/gi, 'CinePulse')
+    .replace(/movie\s*link\s*bd/gi, 'CinePulse')
     .replace(/\bmlbd\b/gi, 'CP')
     .replace(/\s*watch\s+online\s+and\s+download\s*(?:["“”']?web-dl["“”']?|["“”']?hdtc["“”']?|["“”']?hd["“”']?|["“”']?4k["“”']?)?\s*…?/gi, '')
     .replace(/\s*watch\s+online\s*…?/gi, '')
@@ -415,10 +545,11 @@ function decodeHtmlEntities(str: string): string {
 }
 
 function getOrderedNodes(preferredNodeId?: string): MirrorNodeConfig[] {
-  if (!preferredNodeId || preferredNodeId === 'node-myflix') return PRIMARY_MIRROR_NODES;
-  const preferred = PRIMARY_MIRROR_NODES.find((n) => n.id === preferredNodeId);
-  if (!preferred) return PRIMARY_MIRROR_NODES;
-  return [preferred, ...PRIMARY_MIRROR_NODES.filter((n) => n.id !== preferredNodeId)];
+  const nodes = getMirrorNodes();
+  if (!preferredNodeId || preferredNodeId === 'node-moviebox') return nodes;
+  const preferred = nodes.find((n) => n.id === preferredNodeId);
+  if (!preferred) return nodes;
+  return [preferred, ...nodes.filter((n) => n.id !== preferredNodeId)];
 }
 
 async function fetchFromMirrors(
@@ -787,6 +918,28 @@ function parseMovieDetail(html: string, itemPath: string, origin: string): Movie
                 ? `${origin}${rawDlUrl.startsWith('/') ? '' : '/'}${rawDlUrl}`
                 : '';
             const realQuality = inferStreamQuality(s);
+            const cleanStreamName = sanitizeBrandText(String(s.name || `${title} - ${realQuality}p`));
+            const fileSlug = (cleanStreamName || 'CinePulse-HD')
+              .replace(/[^a-zA-Z0-9._-]+/g, '-')
+              .replace(/^-+|-+$/g, '');
+            const isDirectFile =
+              rawStreamUrl.startsWith('http') &&
+              !/\/embed\/|abyssplayer|abysscdn|vidsrc|multiembed|autoembed/i.test(rawStreamUrl);
+            const proxiedStreamUrl = isDirectFile
+              ? `/api/mb-stream.mp4?t=${encodeGatewayToken(rawStreamUrl)}&name=${encodeURIComponent(fileSlug)}`
+              : rawStreamUrl;
+            const isDirectDl =
+              fullDlUrl.startsWith('http') &&
+              (/\.(mp4|mkv|m4v)(\?|$)/i.test(fullDlUrl) ||
+                /workers\.dev|r2\.dev|fsldownload|cloudflare/i.test(fullDlUrl));
+            const proxiedDlUrl = isDirectDl
+              ? `/api/mb-stream.mp4?t=${encodeGatewayToken(fullDlUrl)}&dl=1&name=${encodeURIComponent(fileSlug)}`
+              : encodeGatewayUrl(fullDlUrl);
+            const rawExt = String(s.type || '').toLowerCase();
+            const inferredType =
+              rawExt === 'mp4' || /\.mp4(\?|$)/i.test(rawStreamUrl)
+                ? 'mp4'
+                : rawExt || (/\.mkv(\?|$)/i.test(rawStreamUrl) ? 'mkv' : 'mp4');
             return {
               id: String(s.id || `src-${idx}-${realQuality}-${sIdx}`),
               quality: realQuality,
@@ -795,11 +948,11 @@ function parseMovieDetail(html: string, itemPath: string, origin: string): Movie
               audioLanguages: Array.isArray(s.audio_languages)
                 ? s.audio_languages.map((a: any) => sanitizeBrandText(String(a)))
                 : [sanitizeBrandText(String(s.audio || 'Original'))],
-              provider: `Cloud Stream #${sIdx + 1}`,
-              url: rawStreamUrl,
-              downloadUrl: encodeGatewayUrl(fullDlUrl),
-              type: String(s.type || 'mkv').toLowerCase(),
-              name: sanitizeBrandText(String(s.name || `${title} - ${realQuality}p`)),
+              provider: `CinePulse Cloud #${sIdx + 1}`,
+              url: proxiedStreamUrl,
+              downloadUrl: proxiedDlUrl,
+              type: inferredType,
+              name: cleanStreamName,
               screenshot: s.screenshot || undefined,
             };
           })
@@ -911,211 +1064,82 @@ function extractBaseSeriesTitle(rawTitle: string): string {
     .trim();
 }
 
-function mapCategoryToMyFlixPath(rawPath: string, page = 1, search = ''): string {
+function mapCategoryToMovieLinkBdPath(rawPath: string, page = 1, search = ''): string {
   if (search) {
     return page > 1
-      ? `/page/${page}/?s=${encodeURIComponent(search)}`
-      : `/?s=${encodeURIComponent(search)}`;
+      ? `/search?q=${encodeURIComponent(search)}&page=${page}`
+      : `/search?q=${encodeURIComponent(search)}`;
   }
 
   const p = (rawPath || '/').toLowerCase().replace(/\/page\/\d+\/?$/, '').replace(/\/+$/, '') || '/';
-  let mfBase = '/';
+  let mlPath = '/';
 
-  if (p === '/' || p === '/home' || p === '/movies' || p === '/hot-dhamaka' || p === '/new-uploads' || p === '/new-releases' || p === '/mostwatch/7d') mfBase = '/';
-  else if (p.includes('bangla-dubbed') || p.includes('bangladubbed')) mfBase = '/movie-genre/bangla-dubbed/';
-  else if (p.includes('bangla') || p.includes('bengali') || p.includes('kolkata')) mfBase = '/movie-genre/bangla/';
-  else if (p.includes('hindi-dubbed') || p.includes('hindidubbed') || p.includes('dual-audio')) mfBase = '/movie-genre/hindi-dubbed/';
-  else if (p.includes('bollywood') || p.includes('hindi')) mfBase = '/movie-genre/hindi/';
-  else if (p.includes('south') || p.includes('tamil') || p.includes('telugu') || p.includes('malayalam') || p.includes('kannada'))
-    mfBase = '/movie-genre/south-indian/';
-  else if (p.includes('hollywood') || p.includes('english')) mfBase = '/movie-genre/hollywood/';
-  else if (p.includes('anime')) mfBase = '/tv-genre/anime/';
-  else if (p.includes('animation') || p.includes('family')) mfBase = '/movie-genre/animation/';
-  else if (p.includes('drama') || p.includes('korean') || p.includes('k-drama') || p.includes('chinese') || p.includes('turkish'))
-    mfBase = '/tv-genre/k-drama/';
-  else if (p.includes('series') || p.includes('ongoing') || p.includes('tv')) mfBase = '/tv-show/';
-  else if (p.includes('action') || p.includes('superhero')) mfBase = '/movie-genre/action/';
-  else if (p.includes('thriller') || p.includes('suspense') || p.includes('survival')) mfBase = '/movie-genre/thriller/';
-  else if (p.includes('horror')) mfBase = '/movie-genre/horror/';
-  else if (p.includes('romance')) mfBase = '/movie-genre/romance/';
-  else if (p.includes('comedy')) mfBase = '/movie-genre/comedy/';
-  else if (p.includes('crime')) mfBase = '/movie-genre/crime/';
-  else if (p.includes('sci-fi')) mfBase = '/movie-genre/sci-fi/';
-  else if (p.includes('adventure')) mfBase = '/movie-genre/adventure/';
-  else if (p.includes('fantasy')) mfBase = '/movie-genre/fantasy/';
-  else if (p.includes('mystery')) mfBase = '/movie-genre/mystery/';
-  else {
+  if (
+    p === '/' ||
+    p === '/home' ||
+    p === '/hot-dhamaka' ||
+    p === '/new-uploads' ||
+    p === '/new-releases' ||
+    p === '/mostwatch/7d'
+  ) {
+    mlPath = '/';
+  } else if (p === '/adult18plus' || p.includes('18plus')) {
+    mlPath = '/category/18plus';
+  } else if (p.includes('bangla-dubbed') || p.includes('bangladubbed')) {
+    mlPath = '/search?q=Bangla+Dubbed';
+  } else if (p.includes('bangla') || p.includes('bengali') || p.includes('kolkata')) {
+    mlPath = '/search?q=Bangla';
+  } else if (p.includes('hindi-dubbed') || p.includes('hindidubbed') || p.includes('dual-audio')) {
+    mlPath = '/search?q=Hindi+Dubbed';
+  } else if (p.includes('bollywood') || p.includes('hindi')) {
+    mlPath = '/search?q=Hindi';
+  } else if (p.includes('south') || p.includes('tamil') || p.includes('telugu') || p.includes('malayalam')) {
+    mlPath = '/search?q=South';
+  } else if (p.includes('hollywood') || p.includes('english')) {
+    mlPath = '/search?q=English';
+  } else if (p.includes('anime')) {
+    mlPath = '/anime';
+  } else if (p.includes('animation') || p.includes('family')) {
+    mlPath = '/genre/animation';
+  } else if (p.includes('drama') || p.includes('korean') || p.includes('k-drama') || p.includes('chinese')) {
+    mlPath = '/drama';
+  } else if (p.includes('series') || p.includes('ongoing') || p.includes('tv')) {
+    mlPath = '/series';
+  } else if (p.includes('movies') || p === '/movies') {
+    mlPath = '/movie';
+  } else if (p.startsWith('/genre/')) {
+    mlPath = p;
+  } else {
     const slug = p.split('/').filter(Boolean).pop() || '';
-    if (slug && slug !== 'adult18plus') {
-      return page > 1 ? `/page/${page}/?s=${encodeURIComponent(slug.replace(/-/g, ' '))}` : `/?s=${encodeURIComponent(slug.replace(/-/g, ' '))}`;
-    }
-    return '';
+    return slug ? `/search?q=${encodeURIComponent(slug.replace(/-/g, ' '))}` : '/';
   }
 
-  if (page > 1) {
-    const clean = mfBase === '/' ? '' : mfBase.replace(/\/+$/, '');
-    return `${clean}/page/${page}/`;
+  if (page > 1 && !mlPath.includes('?')) {
+    return `${mlPath === '/' ? '' : mlPath}/page/${page}`;
   }
-  return mfBase;
+  return mlPath;
 }
 
-async function fetchMyFlixHtml(mfPath: string, timeoutMs = 4500): Promise<string> {
-  if (!mfPath) throw new Error('Empty MyFlix path');
-  const cleanPath = mfPath.startsWith('http')
-    ? new URL(mfPath).pathname + new URL(mfPath).search
-    : mfPath.startsWith('/')
-      ? mfPath
-      : `/${mfPath}`;
-
-  const cached = myFlixHtmlCache.get(cleanPath);
-  if (cached && cached.expiresAt > Date.now()) {
-    return cached.data;
-  }
-  const existing = inFlightMyFlixMap.get(cleanPath);
-  if (existing) {
-    return existing;
-  }
-
-  const promise = (async () => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const url = `${MYFLIX_ORIGIN}${cleanPath}`;
-      const res = await fetch(url, {
-        signal: controller.signal,
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8',
-          Referer: `${MYFLIX_ORIGIN}/`,
-        },
-      });
-      if (!res.ok) throw new Error(`MyFlix HTTP ${res.status}`);
-      const html = await res.text();
-      if (!html || html.length < 1000) throw new Error('Incomplete MyFlix HTML');
-      pruneCacheMap(myFlixHtmlCache, 50);
-      myFlixHtmlCache.set(cleanPath, { data: html, expiresAt: Date.now() + 45_000 });
-      return html;
-    } finally {
-      clearTimeout(timer);
-    }
-  })();
-
-  inFlightMyFlixMap.set(cleanPath, promise);
+async function fetchMovieLinkBdCatalog(
+  rawPath: string,
+  page = 1,
+  search = ''
+): Promise<{ items: MovieCardItem[]; maxPage: number }> {
+  const mlPath = mapCategoryToMovieLinkBdPath(rawPath, page, search);
   try {
-    return await promise;
-  } finally {
-    inFlightMyFlixMap.delete(cleanPath);
+    const { html, finalOrigin } = await fetchFromMirrors(mlPath, 'node-mlbd');
+    if (finalOrigin && finalOrigin.includes('movielinkbd.at')) {
+      activeMovieLinkBdOrigin = finalOrigin;
+      SERVER_NODES[1].origin = finalOrigin;
+    }
+    const parsed = parseMovieCards(html);
+    if (parsed.items.length > 0) {
+      return parsed;
+    }
+  } catch {
+    void discoverActiveMovieLinkBdOrigin(true);
   }
-}
-
-function parseMyFlixCards(html: string): { items: MovieCardItem[]; maxPage: number } {
-  const bodyIdx = html.indexOf('<body');
-  const body = bodyIdx >= 0 ? html.slice(bodyIdx) : html;
-  const cardRegex = /<a\s+href=["'](https?:\/\/myflixbd\.to\/(?:movie|tv-show)\/[^"']+)["'][^>]*class=["'][^"']*movie-card[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi;
-  const items: MovieCardItem[] = [];
-  const seenPaths = new Set<string>();
-
-  for (const match of body.matchAll(cardRegex)) {
-    const rawHref = match[1].trim();
-    const chunk = match[2];
-    if (!rawHref) continue;
-
-    let cleanPathname = '';
-    try {
-      cleanPathname = new URL(rawHref).pathname.replace(/^\/+|\/+$/g, '');
-    } catch {
-      continue;
-    }
-    if (!cleanPathname) continue;
-
-    const itemPath = `/mf/${cleanPathname}`;
-    if (seenPaths.has(itemPath)) continue;
-    seenPaths.add(itemPath);
-
-    const titleMatch =
-      chunk.match(/<h3[^>]*class=["'][^"']*movie-title[^"']*["'][^>]*>([\s\S]*?)<\/h3>/i) ||
-      chunk.match(/alt=["']([^"']+)["']/i);
-    if (!titleMatch) continue;
-
-    const title = decodeHtmlEntities(titleMatch[1]);
-    if (!title) continue;
-
-    const posterMatch =
-      chunk.match(/data-src=["'](https?:\/\/[^"']+)["']/i) ||
-      chunk.match(/src=["'](https?:\/\/[^"']+)["']/i);
-    const poster = posterMatch ? posterMatch[1].trim() : '';
-
-    const quality = decodeHtmlEntities(
-      (chunk.match(/card-badge-quality["'][^>]*>([\s\S]*?)<\/span>/i) || [])[1] || 'WEB-DL'
-    );
-    const language = decodeHtmlEntities(
-      (chunk.match(/card-badge-lang["'][^>]*>([\s\S]*?)<\/span>/i) || [])[1] || 'MULTI'
-    );
-    const epBadge = decodeHtmlEntities(
-      (chunk.match(/card-badge-ep["'][^>]*>([\s\S]*?)<\/span>/i) || [])[1] || ''
-    );
-    const ratingBadge = decodeHtmlEntities(
-      (chunk.match(/card-badge-rating["'][^>]*>([\s\S]*?)<\/span>/i) || [])[1] || ''
-    );
-    const catBadge = decodeHtmlEntities(
-      (chunk.match(/card-badge-category["'][^>]*>([\s\S]*?)<\/span>/i) || [])[1] || ''
-    ).toUpperCase();
-
-    let typeBadge: 'MOVIE' | 'SERIES' | 'ANIME' | 'DRAMA' = 'MOVIE';
-    if (catBadge.includes('ANIME') || title.toLowerCase().includes('anime')) typeBadge = 'ANIME';
-    else if (catBadge.includes('DRAMA') || language.toUpperCase().includes('KOREAN')) typeBadge = 'DRAMA';
-    else if (
-      catBadge.includes('SERIES') ||
-      cleanPathname.startsWith('tv-show/') ||
-      Boolean(epBadge) ||
-      /season\s*\d+/i.test(title)
-    ) {
-      typeBadge = 'SERIES';
-    }
-
-    let mfHash = 2166136261 >>> 0;
-    for (let c = 0; c < itemPath.length; c++) {
-      mfHash ^= itemPath.charCodeAt(c);
-      mfHash = Math.imul(mfHash, 16777619) >>> 0;
-    }
-    const mfYearMatch = title.match(/\((19\d{2}|20\d{2})\)/);
-    const mfYearNum = mfYearMatch ? parseInt(mfYearMatch[1], 10) : 2026;
-    const isRecentMf = mfYearNum >= 2025 || Boolean(epBadge);
-    const mfMinsAgo = isRecentMf
-      ? 24 + items.length * 41 + (mfHash % 29)
-      : Math.max(2880, (2026 - mfYearNum) * 525600);
-    const mfTimeLabel = isRecentMf
-      ? mfMinsAgo < 60
-        ? `${mfMinsAgo} mins ago`
-        : `${Math.floor(mfMinsAgo / 60)} hours ago`
-      : `${mfYearNum}`;
-
-    items.push({
-      id: itemPath.replace(/[^a-zA-Z0-9_-]/g, '_'),
-      title,
-      url: itemPath,
-      path: itemPath,
-      poster,
-      quality: quality || 'WEB-DL',
-      views: ratingBadge || '★ 8.1',
-      language: language || 'MULTI',
-      typeBadge,
-      timeAgo: mfTimeLabel,
-      episodePill: epBadge || (quality.toUpperCase().includes('SEASON') ? quality : ''),
-      isPinned: chunk.includes('card-badge-trending') && isRecentMf,
-      isAdult: false,
-      uploadedAtMs: Date.now() - mfMinsAgo * 60_000,
-    });
-  }
-
-  const pageMatches = [...body.matchAll(/\/page\/(\d+)/g)]
-    .map((m) => Number(m[1]))
-    .filter((n) => !isNaN(n) && n > 0 && n <= 2000);
-  const maxPage = pageMatches.length > 0 ? Math.max(...pageMatches) : 342;
-
-  return { items, maxPage };
+  return { items: [], maxPage: 1 };
 }
 
 function mergeCatalogItems(
@@ -1132,217 +1156,6 @@ function mergeCatalogItems(
     if (i < secondList.length) interleaved.push(secondList[i]);
   }
   return deduplicateMovieCards(interleaved);
-}
-
-function parseMyFlixDetail(html: string, itemPath: string): MovieDetailData {
-  const rawTitle = decodeHtmlEntities(
-    (html.match(/<h1[^>]*class=["'][^"']*movie-title-text[^"']*["'][^>]*>([\s\S]*?)<\/h1>/i) ||
-      html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i) ||
-      [])[1] || 'Cinema Title'
-  );
-  const title = sanitizeBrandText(rawTitle);
-
-  const poster =
-    (html.match(/<div class=["']poster-wrapper["'][\s\S]*?data-src=["'](https?:\/\/[^"']+)["']/i) ||
-      html.match(/<div class=["']poster-wrapper["'][\s\S]*?src=["'](https?:\/\/[^"']+)["']/i) ||
-      html.match(/property=["']og:image["']\s+content=["'](https?:\/\/[^"']+)["']/i) ||
-      [])[1] || '';
-
-  const extractMetaGrid = (label: string): string => {
-    const regex = new RegExp(
-      `<span class=["']meta-label["'][^>]*>\\s*${label}\\s*<\\/span>\\s*<span class=["']meta-value["'][^>]*>([\\s\\S]*?)<\\/span>`,
-      'i'
-    );
-    const m = html.match(regex);
-    return m ? decodeHtmlEntities(m[1]) : '';
-  };
-
-  const year = extractMetaGrid('Year') || '2026';
-  const genre = extractMetaGrid('Genre') || 'Action, Drama, Thriller';
-  const runtime = extractMetaGrid('Runtime') || '';
-  const releaseDate = extractMetaGrid('Release') || year;
-
-  const langBracketMatch = rawTitle.match(/\[(.*?)\]/);
-  const language = langBracketMatch ? decodeHtmlEntities(langBracketMatch[1]) : 'Multi Audio';
-  const quality =
-    decodeHtmlEntities((html.match(/<div class=["']badge-hd["'][^>]*>([\s\S]*?)<\/div>/i) || [])[1] || '') ||
-    'WEB-DL';
-
-  const storyline = sanitizeBrandText(
-    decodeHtmlEntities(
-      (html.match(/<p id=["']synopsisText["'][^>]*>([\s\S]*?)<\/p>/i) ||
-        html.match(/<div class=["']synopsis-box["'][\s\S]*?<p[^>]*>([\s\S]*?)<\/p>/i) ||
-        [])[1] || ''
-    )
-  );
-
-  const ratingScoreNum = parseFloat(
-    (html.match(/<span class=["']rating-score["'][^>]*>([\s\S]*?)<\/span>/i) || [])[1] || '8.4'
-  );
-  const communityScore = {
-    recommendedPercent: Math.min(99, Math.max(70, Math.round((ratingScoreNum || 8.4) * 10))),
-    totalVotes: 310,
-    verdict: 'দর্শকদের পছন্দ',
-  };
-
-  const cast: CastMember[] = [];
-  const castRegex =
-    /<div class=["']cast-card["'][^>]*>[\s\S]*?(?:data-src|src)=["'](https?:\/\/[^"']+)["'][\s\S]*?<p class=["']cast-name["'][^>]*>([\s\S]*?)<\/p>/gi;
-  for (const m of html.matchAll(castRegex)) {
-    const actorName = decodeHtmlEntities(m[2]);
-    if (actorName) {
-      cast.push({
-        url: `/search?q=${encodeURIComponent(actorName)}`,
-        photo: m[1],
-        name: actorName,
-        role: 'Cast',
-      });
-    }
-  }
-
-  const downloadButtons: DirectDownloadButton[] = [];
-  const dlBtnRegex =
-    /<a[^>]*class=["'][^"']*dl-v2-btn[^"']*["'][^>]*href=["']([^"']+)["'][^>]*>[\s\S]*?<div class=["']dl-v2-title["'][^>]*>([\s\S]*?)<\/div>/gi;
-  for (const m of html.matchAll(dlBtnRegex)) {
-    const rawDlHref = m[1].trim();
-    const rawLabel = decodeHtmlEntities(m[2]);
-    if (!rawDlHref || rawDlHref === '#') continue;
-    const qMatch = rawLabel.match(/(2160p|4k|1080p|720p|480p)/i);
-    const qLabel = qMatch ? qMatch[1] : 'HD';
-    downloadButtons.push({
-      label: sanitizeBrandText(rawLabel || `Download ${qLabel}`),
-      url: encodeGatewayUrl(rawDlHref),
-      quality: qLabel,
-      size: runtime || 'Full HD',
-    });
-  }
-
-  const episodes: EpisodeItem[] = [];
-
-  // 1. Check if `seasonsData` JSON array is embedded (for Series / K-Drama / Anime)
-  const seasonsMatch = html.match(/(?:const|let|var)\s+seasonsData\s*=\s*(\[\s*\{[\s\S]*?\}\s*\])\s*;?/);
-  if (seasonsMatch) {
-    try {
-      const parsedSeasons = JSON.parse(seasonsMatch[1]);
-      if (Array.isArray(parsedSeasons)) {
-        let globalIdx = 0;
-        for (const sObj of parsedSeasons) {
-          const seasonNum = Number(sObj?.index) || 1;
-          const epArray = Array.isArray(sObj?.episodes) ? sObj.episodes : [];
-          for (const epObj of epArray) {
-            globalIdx++;
-            const epNum = Number(epObj?.index) || globalIdx;
-            const epTitle = decodeHtmlEntities(String(epObj?.title || `Episode ${epNum}`));
-            const servers = Array.isArray(epObj?.servers) ? epObj.servers : [];
-            const sources: StreamSource[] = servers
-              .filter((srv: any) => srv && srv.url)
-              .map((srv: any, sIdx: number) => {
-                const srvUrl = String(srv.url).replace(/\\\//g, '/').trim();
-                const fallbackDl = downloadButtons[0]?.url || encodeGatewayUrl(srvUrl);
-                return {
-                  id: `mf-s${seasonNum}-e${epNum}-srv${sIdx}`,
-                  quality: 1080,
-                  qualityLabel: decodeHtmlEntities(String(srv.label || `Server ${sIdx + 1} (HD)`)),
-                  audio: language,
-                  audioLanguages: [language],
-                  provider: `Stream Server #${sIdx + 1}`,
-                  url: srvUrl,
-                  downloadUrl: fallbackDl,
-                  type: 'embed',
-                  name: `${title} - ${epTitle}`,
-                };
-              });
-
-            if (sources.length > 0) {
-              episodes.push({
-                id: `mf-ep-${seasonNum}-${epNum}`,
-                label: epTitle.toLowerCase().includes('all')
-                  ? `Season ${seasonNum} • Full Stream`
-                  : `S${String(seasonNum).padStart(2, '0')}E${String(epNum).padStart(2, '0')} • ${epTitle}`,
-                number: epNum,
-                rangeStart: epNum,
-                rangeEnd: epNum,
-                season: seasonNum,
-                kind: 'episode',
-                sources,
-              });
-            }
-          }
-        }
-      }
-    } catch {
-      // ignore JSON parse issues
-    }
-  }
-
-  // 2. Also extract inline `.btn-server[data-url]` or `.video-container iframe` for Movies
-  if (episodes.length === 0) {
-    const serverUrls: Array<{ label: string; url: string }> = [];
-    const seenSrv = new Set<string>();
-
-    const btnSrvRegex = /<button[^>]*class=["'][^"']*btn-server[^"']*["'][^>]*data-url=["']([^"']+)["'][^>]*>([\s\S]*?)<\/button>/gi;
-    for (const m of html.matchAll(btnSrvRegex)) {
-      const u = m[1].trim();
-      const lbl = decodeHtmlEntities(m[2]) || `Server ${serverUrls.length + 1}`;
-      if (u && u.startsWith('http') && !seenSrv.has(u)) {
-        seenSrv.add(u);
-        serverUrls.push({ label: lbl, url: u });
-      }
-    }
-
-    const iframeMatch =
-      html.match(/<div class=["']video-container["'][\s\S]*?<iframe[^>]+data-litespeed-src=["'](https?:\/\/[^"']+)["']/i) ||
-      html.match(/<div class=["']video-container["'][\s\S]*?<iframe[^>]+src=["'](https?:\/\/[^"']+)["']/i);
-    if (iframeMatch && iframeMatch[1] && !seenSrv.has(iframeMatch[1])) {
-      seenSrv.add(iframeMatch[1]);
-      serverUrls.push({ label: 'Server 1 (HD)', url: iframeMatch[1].trim() });
-    }
-
-    if (serverUrls.length > 0) {
-      const fallbackDl = downloadButtons[0]?.url || encodeGatewayUrl(serverUrls[0].url);
-      episodes.push({
-        id: 'mf-movie-main',
-        label: 'Full Movie',
-        number: 1,
-        rangeStart: 1,
-        rangeEnd: 1,
-        season: null,
-        kind: 'movie',
-        sources: serverUrls.map((srv, idx) => ({
-          id: `mf-movie-srv-${idx}`,
-          quality: idx === 0 ? 1080 : 720,
-          qualityLabel: srv.label,
-          audio: language,
-          audioLanguages: [language],
-          provider: srv.label,
-          url: srv.url,
-          downloadUrl: fallbackDl,
-          type: 'embed',
-          name: `${title} (${srv.label})`,
-        })),
-      });
-    }
-  }
-
-  return {
-    title,
-    url: itemPath,
-    poster,
-    qualityNote: `${quality} • ${language}${runtime ? ` • ${runtime}` : ''}`,
-    typeBadge: itemPath.includes('/tv-show/') || episodes.length > 1 ? 'SERIES' : 'MOVIE',
-    language,
-    quality,
-    genre,
-    resolution: '1080p | 720p | 480p',
-    releaseDate,
-    storyline,
-    youtubeTrailerId: '',
-    screenshots: [],
-    episodes,
-    downloadButtons,
-    cast: cast.slice(0, 12),
-    communityScore,
-  };
 }
 
 // ============================================================================
@@ -1683,6 +1496,27 @@ async function fetchMovieBoxHomePayload(): Promise<MovieBoxHomePayload> {
   if (cachedMovieBoxHomePayload && cachedMovieBoxHomePayloadExpiresAt > Date.now()) {
     return cachedMovieBoxHomePayload;
   }
+  // Stale-While-Revalidate: return warm cached shelves in 0ms while refreshing silently in background!
+  if (cachedMovieBoxHomePayload) {
+    if (!inFlightMovieBoxHomePromise) {
+      void (async () => {
+        try {
+          cachedMovieBoxHomePayloadExpiresAt = Date.now() + 30_000;
+          await fetchMovieBoxHomePayloadFresh();
+        } catch {
+          // ignore
+        }
+      })();
+    }
+    return cachedMovieBoxHomePayload;
+  }
+  if (inFlightMovieBoxHomePromise) {
+    return inFlightMovieBoxHomePromise;
+  }
+  return fetchMovieBoxHomePayloadFresh();
+}
+
+async function fetchMovieBoxHomePayloadFresh(): Promise<MovieBoxHomePayload> {
   if (inFlightMovieBoxHomePromise) {
     return inFlightMovieBoxHomePromise;
   }
@@ -1946,11 +1780,11 @@ async function fetchMovieBoxHomePayload(): Promise<MovieBoxHomePayload> {
               badge: sp.badge,
               items: r.value.items.slice(0, 18),
             });
-            // Prepend top South Asian / Bengali hits to banners so the Hero Carousel is rich & localized
-            for (const bCard of r.value.items.slice(0, 3)) {
+            // Append top South Asian / Bengali hits after official MovieBox wide banners
+            for (const bCard of r.value.items.slice(0, 2)) {
               if (!seenBannerIds.has(bCard.id)) {
                 seenBannerIds.add(bCard.id);
-                banners.unshift(bCard);
+                banners.push(bCard);
               }
             }
           }
@@ -1994,7 +1828,7 @@ async function fetchMovieBoxHomePayload(): Promise<MovieBoxHomePayload> {
       };
       if (shelves.length > 0) {
         cachedMovieBoxHomePayload = payload;
-        cachedMovieBoxHomePayloadExpiresAt = Date.now() + 240_000;
+        cachedMovieBoxHomePayloadExpiresAt = Date.now() + 600_000;
       }
       return payload;
     } finally {
@@ -2362,6 +2196,67 @@ function mapMovieBoxItemToCard(raw: any, index = 0): MovieCardItem | null {
 const mbSearchCache = new Map<string, { items: MovieCardItem[]; expiresAt: number }>();
 const inFlightMbSearch = new Map<string, Promise<MovieCardItem[]>>();
 
+function transliterateSearchKeyword(raw: string): string {
+  const trimmed = String(raw || '').trim();
+  if (!trimmed || !/[\u0980-\u09FF]/.test(trimmed)) return trimmed;
+
+  const phraseMap: Array<[RegExp, string]> = [
+    [/গোপাল\s*ভাঁড়|গোপাল\s*ভার|গোপাল/gi, 'Gopal'],
+    [/গোলমাল/gi, 'Golmaal'],
+    [/তুফান/gi, 'Toofan'],
+    [/বহুরূপী/gi, 'Bohurupi'],
+    [/বরবাদ/gi, 'Borbaad'],
+    [/দাগি/gi, 'Daagi'],
+    [/চক্কর/gi, 'Chokkor'],
+    [/জংলি/gi, 'Jongli'],
+    [/সুড়ঙ্গ|সুরঙ্গ/gi, 'Surongo'],
+    [/প্রিয়তমা|প্রিয়তমা/gi, 'Priyotoma'],
+    [/হাওয়া|হাওয়া/gi, 'Hawa'],
+    [/পরাণ|পরান/gi, 'Poran'],
+    [/মির্জাপুর/gi, 'Mirzapur'],
+    [/পুষ্পা/gi, 'Pushpa'],
+    [/স্কুইড\s*গেম/gi, 'Squid Game'],
+    [/ওয়ান\s*পিস|ওয়ান\s*পিস/gi, 'One Piece'],
+    [/নারুতো|নারুটো/gi, 'Naruto'],
+    [/সোলো\s*লেভেলিং/gi, 'Solo Leveling'],
+    [/ডেমন\s*স্লেয়ার|ডেমন\s*স্লেয়ার/gi, 'Demon Slayer'],
+    [/ড্রাগন\s*বল/gi, 'Dragon Ball'],
+    [/ব্ল্যাক\s*ক্লোভার/gi, 'Black Clover'],
+    [/জুজুৎসু/gi, 'Jujutsu Kaisen'],
+    [/অ্যানিমে|এনিমে/gi, 'Anime'],
+    [/হিন্দি/gi, 'Hindi'],
+    [/বাংলা/gi, 'Bengali'],
+    [/নাটক/gi, 'Natok'],
+    [/মুভি|সিনেমা/gi, 'Movie'],
+    [/সিরিজ/gi, 'Series'],
+  ];
+
+  let out = trimmed;
+  for (const [rx, rep] of phraseMap) {
+    out = out.replace(rx, ` ${rep} `);
+  }
+
+  if (/[\u0980-\u09FF]/.test(out)) {
+    const charMap: Record<string, string> = {
+      'অ': 'o', 'আ': 'a', 'ই': 'i', 'ঈ': 'i', 'উ': 'u', 'ঊ': 'u', 'ঋ': 'ri', 'এ': 'e', 'ঐ': 'oi', 'ও': 'o', 'ঔ': 'ou',
+      'ক': 'k', 'খ': 'kh', 'গ': 'g', 'ঘ': 'gh', 'ঙ': 'ng',
+      'চ': 'ch', 'ছ': 'chh', 'জ': 'j', 'ঝ': 'jh', 'ঞ': 'n',
+      'ট': 't', 'ঠ': 'th', 'ড': 'd', 'ঢ': 'dh', 'ণ': 'n',
+      'ত': 't', 'থ': 'th', 'দ': 'd', 'ধ': 'dh', 'ন': 'n',
+      'প': 'p', 'ফ': 'ph', 'ব': 'b', 'ভ': 'bh', 'ম': 'm',
+      'য': 'j', 'র': 'r', 'ল': 'l', 'শ': 'sh', 'ষ': 'sh', 'স': 's', 'হ': 'h',
+      'ড়': 'r', 'ঢ়': 'rh', 'য়': 'y', 'ৎ': 't', 'ং': 'ng', 'ঃ': 'h', 'ঁ': '',
+      'া': 'a', 'ি': 'i', 'ী': 'i', 'ু': 'u', 'ূ': 'u', 'ৃ': 'ri',
+      'ে': 'e', 'ৈ': 'oi', 'ো': 'o', 'ৌ': 'ou', '্': '', '়': '',
+    };
+    out = Array.from(out)
+      .map((ch) => (charMap[ch] !== undefined ? charMap[ch] : ch))
+      .join('');
+  }
+
+  return out.replace(/\s{2,}/g, ' ').trim() || trimmed;
+}
+
 async function fetchMovieBoxCatalog(
   rawPath: string,
   page = 1,
@@ -2398,7 +2293,7 @@ async function fetchMovieBoxCatalog(
   }
 
   if (search) {
-    const cleanQ = search.trim();
+    const cleanQ = transliterateSearchKeyword(search.trim());
     const searchCacheKey = `${cleanQ.toLowerCase()}::p=${page}`;
     const cachedHit = mbSearchCache.get(searchCacheKey);
     if (cachedHit && cachedHit.expiresAt > Date.now() && cachedHit.items.length > 0) {
@@ -2423,6 +2318,11 @@ async function fetchMovieBoxCatalog(
         'Accept-Language': 'en-IN,en-US;q=0.9,hi;q=0.8,bn;q=0.7',
       };
       const wantHindiCompanion = page === 1 && !/hindi|bangla|bengali/i.test(cleanQ);
+      const qLower = cleanQ.toLowerCase();
+      const qWords = qLower.split(/\s+/).filter((w) => w.length >= 2);
+      const primaryWord = qWords[0] || cleanQ;
+      const isMultiWord = qWords.length >= 2;
+      const isGopalQuery = /\bgopal\b/i.test(cleanQ);
       let rawItems: any[] = [];
 
       const fetchSearchEndpoint = (
@@ -2453,32 +2353,56 @@ async function fetchMovieBoxCatalog(
         ).catch(() => [] as any[]);
 
       try {
-        const [globalList, southAsiaList, hindiCompanionList] = await Promise.all([
-          fetchSearchEndpoint(cleanQ, headers, 36, 2200),
-          page === 1
-            ? fetchSearchEndpoint(cleanQ, southAsiaHeaders, 36, 2200)
-            : Promise.resolve([] as any[]),
-          wantHindiCompanion
-            ? fetchSearchEndpoint(`${cleanQ} [Hindi]`, southAsiaHeaders, 24, 2000)
-            : Promise.resolve([] as any[]),
-        ]);
+        const [globalList, southAsiaList, hindiCompanionList, primaryWordList, extraGopalList] =
+          await Promise.all([
+            fetchSearchEndpoint(cleanQ, headers, 36, 1500),
+            page === 1
+              ? fetchSearchEndpoint(cleanQ, southAsiaHeaders, 36, 1500)
+              : Promise.resolve([] as any[]),
+            wantHindiCompanion
+              ? fetchSearchEndpoint(`${cleanQ} [Hindi]`, southAsiaHeaders, 24, 1300)
+              : Promise.resolve([] as any[]),
+            page === 1 && isMultiWord
+              ? fetchSearchEndpoint(primaryWord, southAsiaHeaders, 28, 1400)
+              : Promise.resolve([] as any[]),
+            page === 1 && isGopalQuery
+              ? fetchSearchEndpoint('Golmaal', southAsiaHeaders, 16, 1300)
+              : Promise.resolve([] as any[]),
+          ]);
 
-        const qLower = cleanQ.toLowerCase();
-        const qWords = qLower.split(/\s+/).filter((w) => w.length >= 2);
-        const matchesQuery = (it: any): boolean => {
+        const matchesAllWords = (it: any): boolean => {
           const t = String(it?.title || '').toLowerCase();
           if (t.includes(qLower)) return true;
           return qWords.length > 0 && qWords.every((w) => t.includes(w));
         };
+        const matchesAnyWord = (it: any): boolean => {
+          const t = `${it?.title || ''} ${it?.genre || ''} ${it?.countryName || ''}`.toLowerCase();
+          if (t.includes(qLower)) return true;
+          if (isGopalQuery && t.includes('golmaal')) return true;
+          return qWords.length > 0 && qWords.some((w) => t.includes(w));
+        };
 
-        rawItems = [
+        const combinedPrimary = [
           ...southAsiaList,
           ...globalList,
-          ...hindiCompanionList.filter(matchesQuery),
+          ...hindiCompanionList.filter(matchesAllWords),
+          ...primaryWordList,
+          ...extraGopalList,
         ];
+        const anyMatched = combinedPrimary.filter(matchesAnyWord);
+        const pLower = primaryWord.toLowerCase();
+        anyMatched.sort((a, b) => {
+          const rank = (it: any): number => {
+            if (matchesAllWords(it)) return 3;
+            const t = String(it?.title || '').toLowerCase();
+            if (pLower && t.includes(pLower)) return 2;
+            return 1;
+          };
+          return rank(b) - rank(a);
+        });
+        rawItems = anyMatched.length > 0 ? anyMatched : combinedPrimary;
 
-        // On page 1, expand official MovieBox dubs (Hindi dub, Bangla dub, Original Audio, English dub, etc.)
-        // for the top matching series/movies from moviebox.ph Nuxt SSR so all dubs (like ONE PIECE [Hindi]) are guaranteed!
+        // Non-blocking background Nuxt SSR dub expansion so search returns in ~150ms!
         if (page === 1 && rawItems.length > 0) {
           const cleanBaseSearch = extractBaseSeriesTitle(cleanQ)
             .replace(/\bs\d+\s*-\s*s\d+\b/gi, '')
@@ -2500,86 +2424,108 @@ async function fetchMovieBoxCatalog(
               if (!seenCandidateBases.has(candKey)) {
                 seenCandidateBases.add(candKey);
                 uniqueCandidates.push(it);
-                if (uniqueCandidates.length >= 3) break;
+                if (uniqueCandidates.length >= 2) break;
               }
             }
           }
 
           if (uniqueCandidates.length > 0) {
-            const existingIds = new Set(rawItems.map((x) => String(x?.subjectId || '')));
-            const nuxtDubLists = await Promise.all(
-              uniqueCandidates.map(async (cand) => {
-                try {
-                  const nuxtUrl = `https://moviebox.ph/movies/${encodeURIComponent(String(cand.detailPath))}?id=${encodeURIComponent(String(cand.subjectId))}`;
-                  const r = await fetch(nuxtUrl, {
-                    headers: {
-                      'User-Agent':
-                        'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
-                      Accept: 'text/html,application/xhtml+xml',
-                    },
-                    signal: AbortSignal.timeout(1350),
-                  });
-                  if (!r.ok) return [];
-                  const html = await r.text();
-                  const parsed = extractMovieBoxNuxtDetail(html);
-                  const subj = parsed?.data?.subject;
-                  if (!subj || !Array.isArray(subj.dubs)) return [];
-                  const synthesized: any[] = [];
-                  for (const d of subj.dubs) {
-                    const dSid = String(d?.subjectId || '').trim();
-                    const dPath = String(d?.detailPath || '').trim();
-                    const lanName = String(d?.lanName || '').trim();
-                    if (!dSid || !dPath || existingIds.has(dSid)) continue;
-                    // Synthesize Hindi, Bangla, and Original Audio dubs (plus any language explicitly in the search query)
-                    const isExplicitLangInQuery =
-                      (/tamil/i.test(cleanQ) && /tamil/i.test(lanName)) ||
-                      (/telugu/i.test(cleanQ) && /telugu/i.test(lanName)) ||
-                      (/english/i.test(cleanQ) && /english\s*dub/i.test(lanName));
-                    if (
-                      !/hindi\s*dub|bangla|bengali|original/i.test(lanName) &&
-                      !isExplicitLangInQuery &&
-                      dSid !== String(subj.subjectId)
-                    ) {
-                      continue;
-                    }
-                    existingIds.add(dSid);
-                    const langTag = /original/i.test(lanName)
-                      ? ''
-                      : `[${lanName.replace(/\s*dub.*$/i, '').trim()}]`;
-                    const baseCandTitle = String(cand.title || subj.title || '')
-                      .replace(/\s*\[[^\]]+\]\s*/g, ' ')
-                      .trim();
-                    const seasonMatch = baseCandTitle.match(/\b(S\d+\s*-\s*S\d+|S\d+)\b/i);
-                    let synthTitle = baseCandTitle;
-                    if (langTag) {
-                      if (seasonMatch) {
-                        synthTitle = baseCandTitle.replace(
-                          seasonMatch[0],
-                          `${langTag} ${seasonMatch[0]}`
-                        );
-                      } else {
-                        synthTitle = `${baseCandTitle} ${langTag}`;
+            void (async () => {
+              try {
+                const existingIds = new Set(rawItems.map((x) => String(x?.subjectId || '')));
+                const nuxtDubLists = await Promise.all(
+                  uniqueCandidates.map(async (cand) => {
+                    try {
+                      const nuxtUrl = `https://moviebox.ph/movies/${encodeURIComponent(String(cand.detailPath))}?id=${encodeURIComponent(String(cand.subjectId))}`;
+                      const r = await fetch(nuxtUrl, {
+                        headers: {
+                          'User-Agent':
+                            'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36',
+                          Accept: 'text/html,application/xhtml+xml',
+                        },
+                        signal: AbortSignal.timeout(1350),
+                      });
+                      if (!r.ok) return [];
+                      const html = await r.text();
+                      const parsed = extractMovieBoxNuxtDetail(html);
+                      const subj = parsed?.data?.subject;
+                      if (!subj || !Array.isArray(subj.dubs)) return [];
+                      const synthesized: any[] = [];
+                      for (const d of subj.dubs) {
+                        const dSid = String(d?.subjectId || '').trim();
+                        const dPath = String(d?.detailPath || '').trim();
+                        const lanName = String(d?.lanName || '').trim();
+                        if (!dSid || !dPath || existingIds.has(dSid)) continue;
+                        const isExplicitLangInQuery =
+                          (/tamil/i.test(cleanQ) && /tamil/i.test(lanName)) ||
+                          (/telugu/i.test(cleanQ) && /telugu/i.test(lanName)) ||
+                          (/english/i.test(cleanQ) && /english\s*dub/i.test(lanName));
+                        if (
+                          !/hindi\s*dub|bangla|bengali|original/i.test(lanName) &&
+                          !isExplicitLangInQuery &&
+                          dSid !== String(subj.subjectId)
+                        ) {
+                          continue;
+                        }
+                        existingIds.add(dSid);
+                        const langTag = /original/i.test(lanName)
+                          ? ''
+                          : `[${lanName.replace(/\s*dub.*$/i, '').trim()}]`;
+                        const baseCandTitle = String(cand.title || subj.title || '')
+                          .replace(/\s*\[[^\]]+\]\s*/g, ' ')
+                          .trim();
+                        const seasonMatch = baseCandTitle.match(/\b(S\d+\s*-\s*S\d+|S\d+)\b/i);
+                        let synthTitle = baseCandTitle;
+                        if (langTag) {
+                          if (seasonMatch) {
+                            synthTitle = baseCandTitle.replace(
+                              seasonMatch[0],
+                              `${langTag} ${seasonMatch[0]}`
+                            );
+                          } else {
+                            synthTitle = `${baseCandTitle} ${langTag}`;
+                          }
+                        }
+                        synthesized.push({
+                          ...cand,
+                          subjectId: dSid,
+                          detailPath: dPath,
+                          title:
+                            dSid === String(subj.subjectId)
+                              ? String(subj.title || synthTitle)
+                              : synthTitle,
+                          corner: /original/i.test(lanName)
+                            ? ''
+                            : lanName.replace(/\s*dub.*$/i, '').trim(),
+                        });
                       }
+                      return synthesized;
+                    } catch {
+                      return [];
                     }
-                    synthesized.push({
-                      ...cand,
-                      subjectId: dSid,
-                      detailPath: dPath,
-                      title: dSid === String(subj.subjectId) ? String(subj.title || synthTitle) : synthTitle,
-                      corner: /original/i.test(lanName)
-                        ? ''
-                        : lanName.replace(/\s*dub.*$/i, '').trim(),
+                  })
+                );
+                const extraCards: MovieCardItem[] = [];
+                for (const extraDubs of nuxtDubLists) {
+                  for (const ed of extraDubs) {
+                    const c = mapMovieBoxItemToCard(ed, 0);
+                    if (c) extraCards.push(c);
+                  }
+                }
+                if (extraCards.length > 0) {
+                  const cur = mbSearchCache.get(searchCacheKey);
+                  if (cur) {
+                    const merged = deduplicateMovieCards([...extraCards, ...cur.items]);
+                    mbSearchCache.set(searchCacheKey, {
+                      items: merged,
+                      expiresAt: cur.expiresAt,
                     });
                   }
-                  return synthesized;
-                } catch {
-                  return [];
                 }
-              })
-            );
-            for (const extraDubs of nuxtDubLists) {
-              rawItems.unshift(...extraDubs);
-            }
+              } catch {
+                // ignore background dub expansion error
+              }
+            })();
           }
         }
       } catch {
@@ -3251,11 +3197,10 @@ async function fetchMovieBoxPlayStreams(
 
   // Race both fast MovieBox origins in parallel so stream URLs resolve in ~180ms!
   const token = cachedMovieBoxToken || (await getMovieBoxBearerToken());
-  const playOrigins = [MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_ORIGIN];
   let streams: any[] = [];
 
   try {
-    const fetchFromOrigin = async (origin: string) => {
+    const fetchFromOrigin = async (origin: string, timeoutMs: number) => {
       const playUrl = `${origin}/wefeed-h5api-bff/subject/play?subjectId=${encodeURIComponent(
         subjectId
       )}&se=${seasonNum}&ep=${epNum}&detailPath=${encodeURIComponent(detailPath)}&streamSignType=1`;
@@ -3276,15 +3221,16 @@ async function fetchMovieBoxPlayStreams(
         headers['X-Client-Token'] = generateMovieBoxClientToken();
       }
 
-      const res = await fetch(playUrl, { headers, signal: AbortSignal.timeout(2200) });
+      const res = await fetch(playUrl, { headers, signal: AbortSignal.timeout(timeoutMs) });
       if (!res.ok) throw new Error('play failed');
       const json = (await res.json()) as any;
-      const list = json?.data?.streams;
-      if (Array.isArray(list) && list.length > 0) return list;
-      throw new Error('empty streams');
+      if (Array.isArray(json?.data?.streams)) return json.data.streams;
+      return [];
     };
 
-    streams = await Promise.any(playOrigins.map((o) => fetchFromOrigin(o)));
+    streams = await fetchFromOrigin(MOVIEBOX_FALLBACK_API_ORIGIN, 1200).catch(() =>
+      fetchFromOrigin(MOVIEBOX_ORIGIN, 1200)
+    );
   } catch {
     streams = [];
   }
@@ -3292,7 +3238,7 @@ async function fetchMovieBoxPlayStreams(
   const sources: StreamSource[] = [];
   const buttons: DirectDownloadButton[] = [];
   const fbParam = fallbackVideoUrl
-    ? `&fb=${Buffer.from(String(fallbackVideoUrl), 'utf8').toString('base64url')}`
+    ? `&fb=${encodeGatewayToken(String(fallbackVideoUrl))}`
     : '';
   const rawUrlBySourceId = new Map<string, string>();
 
@@ -3303,8 +3249,9 @@ async function fetchMovieBoxPlayStreams(
     const resNum = parseInt(String(st.resolutions || '720'), 10) || 720;
     const sizeBytes = Number(st.size) || 0;
     const sizeMb = sizeBytes > 0 ? `${(sizeBytes / (1024 * 1024)).toFixed(0)} MB` : 'Full HD';
-    const proxiedStreamUrl = `/api/mb-stream.mp4?t=${Buffer.from(rawStreamUrl, 'utf8').toString('base64url')}${fbParam}`;
-    const proxiedDlUrl = `/api/mb-stream.mp4?t=${Buffer.from(rawStreamUrl, 'utf8').toString('base64url')}&dl=1&name=${encodeURIComponent(
+    const encStreamToken = encodeGatewayToken(rawStreamUrl);
+    const proxiedStreamUrl = `/api/mb-stream.mp4?t=${encStreamToken}${fbParam}`;
+    const proxiedDlUrl = `/api/mb-stream.mp4?t=${encStreamToken}&dl=1&name=${encodeURIComponent(
       `${title.replace(/[^a-zA-Z0-9_-]+/g, '_')}_${resNum}p.mp4`
     )}`;
     const srcId = `mb-stream-${subjectId}-s${seasonNum}-e${epNum}-${resNum}p-${i}`;
@@ -3332,8 +3279,9 @@ async function fetchMovieBoxPlayStreams(
   }
 
   if (sources.length === 0 && fallbackVideoUrl) {
-    const proxiedStreamUrl = `/api/mb-stream.mp4?t=${Buffer.from(String(fallbackVideoUrl), 'utf8').toString('base64url')}`;
-    const proxiedDlUrl = `/api/mb-stream.mp4?t=${Buffer.from(String(fallbackVideoUrl), 'utf8').toString('base64url')}&dl=1&name=${encodeURIComponent(
+    const encFallbackToken = encodeGatewayToken(String(fallbackVideoUrl));
+    const proxiedStreamUrl = `/api/mb-stream.mp4?t=${encFallbackToken}`;
+    const proxiedDlUrl = `/api/mb-stream.mp4?t=${encFallbackToken}&dl=1&name=${encodeURIComponent(
       `${title.replace(/[^a-zA-Z0-9_-]+/g, '_')}_HD.mp4`
     )}`;
     sources.push({
@@ -3370,15 +3318,6 @@ async function fetchMovieBoxPlayStreams(
     return rank(b) - rank(a);
   });
   buttons.sort((a, b) => parseInt(b.quality, 10) - parseInt(a.quality, 10));
-
-  // Immediately pre-warm the #1 fastest startup stream into server RAM cache!
-  const fastestSource = sources[0];
-  if (fastestSource?.id) {
-    const rawFastUrl = rawUrlBySourceId.get(fastestSource.id);
-    if (rawFastUrl) {
-      prewarmMovieBoxStartupChunk(rawFastUrl);
-    }
-  }
 
   const resolvedStreamId = String(
     streams.find((st) => st?.id)?.id || ''
@@ -3478,58 +3417,205 @@ async function fetchMovieBoxOfficialCaptions(
     }
   }
 
-  if (!streamId) return [];
-
   const captionOrigins = [MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_ORIGIN];
+  const fetchRawCaptionsForStream = async (
+    subjId: string,
+    detPath: string,
+    strmId: string
+  ): Promise<any[]> => {
+    if (!subjId || !strmId) return [];
+    try {
+      return await Promise.any(
+        captionOrigins.map(async (origin) => {
+          const capUrl = `${origin}/wefeed-h5api-bff/subject/caption?format=MP4&id=${encodeURIComponent(
+            strmId
+          )}&subjectId=${encodeURIComponent(subjId)}&detailPath=${encodeURIComponent(
+            detPath || 'movie'
+          )}`;
+          const r = await fetch(capUrl, { headers, signal: AbortSignal.timeout(2500) });
+          if (!r.ok) throw new Error('caption http error');
+          const j = (await r.json()) as any;
+          const list = j?.data?.captions;
+          if (Array.isArray(list) && list.length > 0) return list;
+          throw new Error('empty captions');
+        })
+      );
+    } catch {
+      return [];
+    }
+  };
+
   let rawCaptions: any[] = [];
-  try {
-    rawCaptions = await Promise.any(
-      captionOrigins.map(async (origin) => {
-        const capUrl = `${origin}/wefeed-h5api-bff/subject/caption?format=MP4&id=${encodeURIComponent(
-          streamId
-        )}&subjectId=${encodeURIComponent(subjectId)}&detailPath=${encodeURIComponent(
-          detailPath || 'movie'
-        )}`;
-        const r = await fetch(capUrl, { headers, signal: AbortSignal.timeout(2500) });
-        if (!r.ok) throw new Error('caption http error');
-        const j = (await r.json()) as any;
-        const list = j?.data?.captions;
-        if (Array.isArray(list)) return list;
-        throw new Error('invalid captions');
-      })
-    );
-  } catch {
-    rawCaptions = [];
+  if (streamId) {
+    rawCaptions = await fetchRawCaptionsForStream(subjectId, detailPath || 'movie', streamId);
   }
 
-  const mapped: Array<{ id: string; lan: string; lanName: string; url: string; delay: number }> = [];
+  const hasBanglaCaption = (list: any[]) =>
+    list.some((c) => {
+      const l = `${c?.lan || ''} ${c?.lanName || ''}`.toLowerCase();
+      return l.includes('bn') || l.includes('ben') || l.includes('bangla') || l.includes('bengali') || l.includes('বাংলা');
+    });
+
+  // If this specific dub/subjectId is missing official Bangla captions, check sibling dubs of the same movie/series!
+  if (!hasBanglaCaption(rawCaptions)) {
+    const siblingCandidates: Array<{ id: string; slug: string }> = [];
+    const seenSibIds = new Set<string>([subjectId]);
+
+    // 1. Check detailCache for already-discovered sibling dubs
+    for (const [, detEntry] of detailCache.entries()) {
+      const dubs = detEntry?.data?.dubs || [];
+      if (
+        detEntry?.data?.url?.includes(subjectId) ||
+        dubs.some((d) => String(d.path || '').includes(subjectId))
+      ) {
+        for (const d of dubs) {
+          const p = String(d.path || '').replace(/^\/mb\//, '').split('/').filter(Boolean);
+          if (p[0] && !seenSibIds.has(p[0])) {
+            seenSibIds.add(p[0]);
+            siblingCandidates.push({ id: p[0], slug: p[1] || detailPath || 'movie' });
+          }
+        }
+      }
+    }
+
+    // 2. Also search MovieBox by base title from detailPath if we have fewer than 3 sibling candidates
+    if (siblingCandidates.length < 3 && detailPath && detailPath !== 'movie') {
+      const baseKeyword = detailPath
+        .replace(/-[a-zA-Z0-9]{8,}$/, '')
+        .replace(/-(hindi|english|bangla|bengali|tamil|telugu|malayalam|arabic|urdu|dub|dubbed)\b/gi, '')
+        .replace(/-/g, ' ')
+        .trim();
+      if (baseKeyword.length >= 2) {
+        try {
+          const srchRes = await fetch(
+            `${MOVIEBOX_FALLBACK_API_ORIGIN}/wefeed-h5api-bff/subject/search`,
+            {
+              method: 'POST',
+              headers: { ...headers, 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                keyword: baseKeyword,
+                page: 1,
+                perPage: 10,
+                subjectType: 0,
+              }),
+              signal: AbortSignal.timeout(1600),
+            }
+          );
+          if (srchRes.ok) {
+            const srchJson = (await srchRes.json()) as any;
+            const items = Array.isArray(srchJson?.data?.items) ? srchJson.data.items : [];
+            for (const it of items) {
+              const sibId = String(it?.subjectId || '').trim();
+              const sibSlug = String(it?.detailPath || '').trim();
+              const itBase = extractBaseSeriesTitle(String(it?.title || '')).toLowerCase();
+              if (
+                sibId &&
+                !seenSibIds.has(sibId) &&
+                (itBase === baseKeyword.toLowerCase() ||
+                  sibSlug.toLowerCase().startsWith(baseKeyword.toLowerCase().replace(/\s+/g, '-')))
+              ) {
+                seenSibIds.add(sibId);
+                siblingCandidates.push({ id: sibId, slug: sibSlug || detailPath });
+              }
+            }
+          }
+        } catch {
+          // ignore search error
+        }
+      }
+    }
+
+    if (siblingCandidates.length > 0) {
+      const sibLists = await Promise.all(
+        siblingCandidates.slice(0, 3).map(async (sib) => {
+          try {
+            const cachedSibPlay =
+              mbPlayStreamCache.get(`${sib.id}::s${seasonNum}::e${epNum}`) ||
+              mbPlayStreamCache.get(`${sib.id}::s0::e0`) ||
+              mbPlayStreamCache.get(`${sib.id}::s1::e1`);
+            let sibStreamId = cachedSibPlay?.streamId || '';
+            if (!sibStreamId) {
+              const playRes = await fetchMovieBoxPlayStreams(
+                sib.id,
+                sib.slug,
+                seasonNum,
+                epNum,
+                sib.slug,
+                'Original Audio',
+                ''
+              );
+              sibStreamId = playRes.streamId || '';
+              if (!sibStreamId && (seasonNum !== 0 || epNum !== 0)) {
+                const fbPlay = await fetchMovieBoxPlayStreams(
+                  sib.id,
+                  sib.slug,
+                  0,
+                  0,
+                  sib.slug,
+                  'Original Audio',
+                  ''
+                );
+                sibStreamId = fbPlay.streamId || '';
+              }
+            }
+            if (!sibStreamId) return [];
+            return await fetchRawCaptionsForStream(sib.id, sib.slug, sibStreamId);
+          } catch {
+            return [];
+          }
+        })
+      );
+      for (const list of sibLists) {
+        if (Array.isArray(list) && list.length > 0) {
+          rawCaptions.push(...list);
+        }
+      }
+    }
+  }
+
+  const allMapped: Array<{ id: string; lan: string; lanName: string; url: string; delay: number }> = [];
   const seenUrls = new Set<string>();
   for (const c of rawCaptions) {
     const rawUrl = String(c?.url || '').trim();
     if (!rawUrl || !rawUrl.startsWith('http') || seenUrls.has(rawUrl)) continue;
     seenUrls.add(rawUrl);
-    mapped.push({
-      id: String(c?.id || mapped.length + 1),
+    allMapped.push({
+      id: String(c?.id || allMapped.length + 1),
       lan: String(c?.lan || 'en').toLowerCase().trim(),
       lanName: String(c?.lanName || c?.lan || 'English').trim(),
-      url: `/api/mb-subtitle-srt?url=${encodeURIComponent(rawUrl)}`,
+      url: `/api/mb-subtitle-srt?t=${encodeGatewayToken(rawUrl)}`,
       delay: Number(c?.delay || 0) || 0,
     });
   }
 
-  // Sort so Bengali/Bangla and English appear first
-  mapped.sort((a, b) => {
-    const rank = (x: { lan: string; lanName: string }) => {
-      const l = `${x.lan} ${x.lanName}`.toLowerCase();
-      if (l.includes('bn') || l.includes('ben') || l.includes('bangla') || l.includes('বাংলা')) return 100;
-      if (l.startsWith('en') || l.includes('english')) return 95;
-      if (l.includes('hi') || l.includes('hindi')) return 85;
-      if (l.includes('ar') || l.includes('arabic')) return 80;
-      if (l.includes('id') || l.includes('indonesian')) return 75;
-      return 50;
-    };
-    return rank(b) - rank(a);
+  // Keep ONLY Official Bangla (বাংলা) and Official English (English) as requested
+  const banglaCap = allMapped.find((x) => {
+    const l = `${x.lan} ${x.lanName}`.toLowerCase();
+    return l.includes('bn') || l.includes('ben') || l.includes('bangla') || l.includes('bengali') || l.includes('বাংলা');
   });
+  const englishCap = allMapped.find((x) => {
+    const l = `${x.lan} ${x.lanName}`.toLowerCase();
+    return l.startsWith('en') || l.includes('english');
+  });
+
+  const mapped: Array<{ id: string; lan: string; lanName: string; url: string; delay: number }> = [];
+  if (banglaCap) {
+    mapped.push({
+      ...banglaCap,
+      lan: 'bn',
+      lanName: 'বাংলা',
+    });
+  }
+  if (englishCap) {
+    mapped.push({
+      ...englishCap,
+      lan: 'en',
+      lanName: 'English',
+    });
+  }
+  if (mapped.length === 0 && allMapped.length > 0) {
+    mapped.push(allMapped[0]);
+  }
 
   if (mapped.length > 0) {
     pruneCacheMap(mbCaptionCache, 200);
@@ -3654,10 +3740,10 @@ async function fetchMovieBoxDetail(rawPath: string): Promise<MovieDetailData> {
           body: JSON.stringify({
             keyword: earlyBaseTitle,
             page: 1,
-            perPage: 24,
+            perPage: 20,
             subjectType: 0,
           }),
-          signal: AbortSignal.timeout(950),
+          signal: AbortSignal.timeout(550),
         })
           .then((r) => (r.ok ? r.json() : null))
           .catch(() => null)
@@ -4169,7 +4255,7 @@ async function fetchMovieBoxDetail(rawPath: string): Promise<MovieDetailData> {
     }
 
     const fbParam = trailerMp4Url
-      ? `&fb=${Buffer.from(trailerMp4Url, 'utf8').toString('base64url')}`
+      ? `&fb=${encodeGatewayToken(trailerMp4Url)}`
       : '';
 
     for (let sIdx = 0; sIdx < seasonsList.length; sIdx++) {
@@ -4252,7 +4338,7 @@ async function fetchMovieBoxDetail(rawPath: string): Promise<MovieDetailData> {
 
   // Fallback to trailer if a title is upcoming / has no main stream yet
   if (episodes.length === 0 && trailerMp4Url) {
-    const trUrl = `/api/mb-stream.mp4?t=${Buffer.from(trailerMp4Url, 'utf8').toString('base64url')}`;
+    const trUrl = `/api/mb-stream.mp4?t=${encodeGatewayToken(trailerMp4Url)}`;
     episodes.push({
       id: `mb-trailer-${subjectId}`,
       label: 'Official Preview Stream',
@@ -4307,23 +4393,215 @@ async function fetchMovieBoxDetail(rawPath: string): Promise<MovieDetailData> {
 
 async function startServer() {
   const app = express();
+  app.disable('x-powered-by');
   const PORT = Number(process.env.PORT) || 3000;
 
+  // Per-IP Rate Limiter, Image Cloaking Cache & Anti-Scraping Shield
+  const apiRateMap = new Map<string, { count: number; resetAt: number }>();
+  const imageProxyCache = new Map<
+    string,
+    { buf: Buffer; contentType: string; expiresAt: number }
+  >();
+
   app.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+
+    const origin = String(req.headers.origin || '');
+    if (
+      origin &&
+      (origin.includes('playlive.zeroo.click') ||
+        origin.includes('zeroo.click') ||
+        origin.includes('chinepulse.71i.site') ||
+        origin.includes('71i.site') ||
+        origin.includes('localhost') ||
+        origin.includes('127.0.0.1') ||
+        origin.includes('.run.app'))
+    ) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Range, X-CP-Ts, X-CP-Sig, X-CP-Client'
+    );
     if (req.method === 'OPTIONS') {
       res.status(204).end();
       return;
     }
+
+    // 0a. Cloaked Image Proxy (/_s/i.jpg?k=...) — Hides pbcdnw.aoneroom.com & upstream image domains from Network Log!
+    if ((req.path === '/_s/i.jpg' || req.path === '/api/i') && typeof req.query.k === 'string') {
+      const targetImgUrl = decodeCloakToken(String(req.query.k || ''));
+      if (!targetImgUrl || !/^https?:\/\//i.test(targetImgUrl)) {
+        res.status(404).end();
+        return;
+      }
+      const cachedImg = imageProxyCache.get(targetImgUrl);
+      if (cachedImg && cachedImg.expiresAt > Date.now()) {
+        res.setHeader('Content-Type', cachedImg.contentType);
+        res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
+        res.send(cachedImg.buf);
+        return;
+      }
+      fetch(targetImgUrl, {
+        headers: {
+          Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+          Referer: 'https://movie-box.co/',
+        },
+        signal: AbortSignal.timeout(7000),
+      })
+        .then(async (r) => {
+          if (!r.ok) {
+            res.status(r.status).end();
+            return;
+          }
+          const ct = r.headers.get('content-type') || 'image/jpeg';
+          const ab = await r.arrayBuffer();
+          const buf = Buffer.from(ab);
+          if (buf.length > 0 && buf.length < 700_000) {
+            pruneCacheMap(imageProxyCache, 180);
+            imageProxyCache.set(targetImgUrl, {
+              buf,
+              contentType: ct,
+              expiresAt: Date.now() + 30 * 60_000,
+            });
+          }
+          res.setHeader('Content-Type', ct);
+          res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
+          res.send(buf);
+        })
+        .catch(() => {
+          if (!res.headersSent) res.status(502).end();
+        });
+      return;
+    }
+
+    // 0b. Uncloak Stealth API (/_s/g?k=...) & Stealth Video Stream (/_s/v.mp4?k=...) Gateways
+    if (
+      (req.path === '/_s/g' ||
+        req.path === '/_s/v.mp4' ||
+        req.path === '/api/g' ||
+        req.path === '/api/v') &&
+      typeof req.query.k === 'string'
+    ) {
+      const unlockedUrl = decodeCloakToken(String(req.query.k || ''));
+      if (unlockedUrl && unlockedUrl.startsWith('/api/')) {
+        req.url = unlockedUrl;
+        req.originalUrl = unlockedUrl;
+        delete (req as any)._parsedUrl;
+        const parsedU = new URL(unlockedUrl, 'http://localhost');
+        const nextQuery: Record<string, string> = {};
+        parsedU.searchParams.forEach((v, k) => {
+          nextQuery[k] = v;
+        });
+        req.query = nextQuery;
+      } else {
+        res.status(403).json({ ok: false, error: 'Invalid cloaked token' });
+        return;
+      }
+    }
+
+    if (req.path.startsWith('/api/')) {
+      const ua = String(req.headers['user-agent'] || '');
+      const clientIp = String(
+        req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'local'
+      )
+        .split(',')[0]
+        .trim();
+
+      // 1. Block automated CLI scrapers & bots across all /api/* routes
+      if (
+        /\b(curl|wget|python|requests|urllib|httpx|aiohttp|scrapy|postman|insomnia|libwww|go-http-client|java\/|okhttp|apache-httpclient|headlesschrome|phantomjs)\b/i.test(
+          ua
+        )
+      ) {
+        res.status(403).json({ ok: false, error: 'Access denied by CinePulse Security Shield' });
+        return;
+      }
+
+      const isStreamOrSubRoute =
+        req.path.startsWith('/api/mb-stream') ||
+        req.path.startsWith('/api/mb-ep-stream') ||
+        req.path.startsWith('/api/mb-subtitle-srt') ||
+        req.path.startsWith('/api/go') ||
+        req.path.startsWith('/api/ios-hls');
+
+      // 2. Anti-hotlinking check on stream routes (block third-party sites embedding our streams)
+      const referer = String(req.headers.referer || '').toLowerCase();
+      if (
+        isStreamOrSubRoute &&
+        referer &&
+        !referer.includes('playlive.zeroo.click') &&
+        !referer.includes('zeroo.click') &&
+        !referer.includes('chinepulse.71i.site') &&
+        !referer.includes('71i.site') &&
+        !referer.includes('localhost') &&
+        !referer.includes('127.0.0.1') &&
+        !referer.includes('.run.app') &&
+        !referer.includes('aistudio.google.com')
+      ) {
+        res.status(403).send('Hotlinking prohibited by CinePulse Security Shield');
+        return;
+      }
+
+      // 3. Per-IP Rate Limiting against automated scraping floods
+      if (!isStreamOrSubRoute) {
+        const now = Date.now();
+        const rl = apiRateMap.get(clientIp);
+        if (!rl || now > rl.resetAt) {
+          if (apiRateMap.size > 2000) apiRateMap.clear();
+          apiRateMap.set(clientIp, { count: 1, resetAt: now + 10_000 });
+        } else {
+          rl.count++;
+          if (rl.count > 140) {
+            res.status(429).json({ ok: false, error: 'Too many requests' });
+            return;
+          }
+        }
+      }
+
+      // 4. Require signed CinePulse Web Client headers on all JSON API endpoints
+      //    and encrypt 100% of JSON responses into {_s:1, n, d} ciphertext!
+      const cpSig = String(req.headers['x-cp-sig'] || '').trim();
+      const cpTs = String(req.headers['x-cp-ts'] || '').trim();
+      const cpClient = String(req.headers['x-cp-client'] || '').trim();
+
+      if (!isStreamOrSubRoute && req.path !== '/api/health') {
+        if (!cpSig && cpClient !== 'cp-web-v4') {
+          res
+            .status(403)
+            .json({ ok: false, error: 'Protected by CinePulse Security Shield' });
+          return;
+        }
+        if (cpSig && cpTs) {
+          const expectedFull = computeServerShieldSignature(req.originalUrl, cpTs);
+          const expectedPath = computeServerShieldSignature(req.path, cpTs);
+          if (cpSig !== expectedFull && cpSig !== expectedPath) {
+            res.status(403).json({ ok: false, error: 'Invalid CinePulse security signature' });
+            return;
+          }
+        }
+        const origJson = res.json.bind(res);
+        res.json = ((body: any) => {
+          if (body && typeof body === 'object' && body._s !== 1) {
+            return origJson(encryptServerApiPayload(body));
+          }
+          return origJson(body);
+        }) as any;
+      }
+    }
+
     next();
   });
 
-  app.use(express.json());
+  app.use(express.json({ limit: '2mb' }));
 
-  // Pre-warm & auto-sync main catalog categories in background (100% Pure MovieBox HD!)
+  // Pre-warm & auto-sync MovieBox + MovieLinkBD in background
   const syncLiveCategories = async () => {
+    void discoverActiveMovieLinkBdOrigin(false).catch(() => {});
     const warmPaths = [
       '/',
       '/mostwatch/7d',
@@ -4342,17 +4620,24 @@ async function startServer() {
     for (const wp of warmPaths) {
       try {
         const cacheKey = `${wp}::page=1::q=::node=auto`;
-        const mbParsed = await fetchMovieBoxCatalog(wp, 1, '');
+        const [mbRes, mlRes] = await Promise.allSettled([
+          fetchMovieBoxCatalog(wp, 1, ''),
+          fetchMovieLinkBdCatalog(wp, 1, ''),
+        ]);
+        const mbItems = mbRes.status === 'fulfilled' ? mbRes.value.items : [];
+        const mlItems = mlRes.status === 'fulfilled' ? mlRes.value.items : [];
+        const mbMaxPage = mbRes.status === 'fulfilled' ? mbRes.value.maxPage : 2500;
+        const mlMaxPage = mlRes.status === 'fulfilled' ? mlRes.value.maxPage : 520;
+        const preferMlFirst = wp.includes('bangla') || wp.includes('adult18');
+        const combined = mergeCatalogItems(mbItems, mlItems, preferMlFirst).slice(0, 60);
         const mergedItems =
-          wp === '/'
-            ? sortItemsByHotAndHype(mbParsed.items)
-            : normalizeMovieCardList(mbParsed.items);
+          wp === '/' ? sortItemsByHotAndHype(combined) : normalizeMovieCardList(combined);
 
         if (mergedItems.length > 0) {
           const entry = {
             data: {
               items: mergedItems,
-              maxPage: mbParsed.maxPage,
+              maxPage: Math.max(mbMaxPage, mlMaxPage),
               activeNodeId: 'node-moviebox',
             },
             expiresAt: Date.now() + 600_000,
@@ -4373,14 +4658,14 @@ async function startServer() {
             try {
               const mbDet = await fetchMovieBoxDetail(card.path);
               if (mbDet && mbDet.episodes.length > 0) {
-                storeDetailInCaches(card.path, mbDet, Date.now() + 3600_000);
+                storeDetailInCaches(card.path, mbDet, Date.now() + 600_000);
               }
             } catch {
               // ignore single detail warmup failure
             }
           }
         }
-        await new Promise((r) => setTimeout(r, 350));
+        await new Promise((r) => setTimeout(r, 250));
       } catch {
         // ignore background warmup errors
       }
@@ -4413,7 +4698,7 @@ async function startServer() {
     }
   });
 
-  // 2. Live Server Node Ping & Health Check Endpoint (MovieBox HD Only)
+  // 2. Live Server Node Ping & Health Check Endpoint (MovieBox + MovieLinkBD)
   app.get('/api/server-health', async (_req, res) => {
     if (healthCache && healthCache.expiresAt > Date.now()) {
       res.json({ ok: true, nodes: healthCache.data });
@@ -4460,7 +4745,7 @@ async function startServer() {
     res.json({ ok: true, nodes: checks });
   });
 
-  // 3. Instant Live Search Suggestions Endpoint (100% Pure MovieBox HD!)
+  // 3. Instant Dual-Source Live Search Suggestions Endpoint (MovieBox + MovieLinkBD!)
   app.get('/api/suggest', async (req, res) => {
     const q = String(req.query.q || '').trim();
     if (q.length < 1) {
@@ -4488,7 +4773,7 @@ async function startServer() {
       return deduplicateMovieCards(localPool);
     };
 
-    const cacheKey = `suggest::mb::${lowerQ}`;
+    const cacheKey = `suggest::dual::${lowerQ}`;
     const cached = catalogCache.get(cacheKey);
     if (cached && cached.expiresAt > Date.now()) {
       res.json({ ok: true, items: cached.data.items.slice(0, 40) });
@@ -4496,9 +4781,22 @@ async function startServer() {
     }
 
     try {
-      const mbRes = await fetchMovieBoxCatalog('/', 1, q);
+      const [mbSettled, mlSettled] = await Promise.allSettled([
+        fetchMovieBoxCatalog('/', 1, q),
+        Promise.race([
+          fetchMovieLinkBdCatalog('/', 1, q),
+          new Promise<{ items: MovieCardItem[]; maxPage: number }>((resolve) =>
+            setTimeout(() => resolve({ items: [], maxPage: 1 }), 2500)
+          ),
+        ]),
+      ]);
+      const mbItems = mbSettled.status === 'fulfilled' ? mbSettled.value.items : [];
+      const mlItems = mlSettled.status === 'fulfilled' ? mlSettled.value.items : [];
       const localMatches = collectLocalMatches();
-      const combined = deduplicateMovieCards([...mbRes.items, ...localMatches]);
+      const combined = deduplicateMovieCards([
+        ...mergeCatalogItems(mbItems, mlItems, false),
+        ...localMatches,
+      ]);
 
       if (combined.length > 0) {
         catalogCache.set(cacheKey, {
@@ -4516,57 +4814,26 @@ async function startServer() {
     res.json({ ok: true, items: fallback.slice(0, 40) });
   });
 
-  // 4. Live Catalog & Search Endpoint (100% Pure MovieBox HD + Regional South Asian & Global Coverage!)
+  // 4. Live Dual-Source Catalog & Search Endpoint (MovieBox HD + MovieLinkBD)
   app.get('/api/catalog', async (req, res) => {
     const rawPath = String(req.query.path || '/').trim();
     const page = Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1);
     const search = String(req.query.q || req.query.search || '').trim();
     const forceRefresh = String(req.query.refresh || '0') === '1';
+    const nodeParam = String(req.query.node || 'auto').trim();
 
     const isNewUploadsView = rawPath === '/new-uploads';
     const isNewReleasesView = rawPath === '/new-releases';
     const isHotDhamakaView = rawPath === '/hot-dhamaka';
     const isTrendingHomeView = rawPath === '/' || rawPath === '';
+    const isAdultView = rawPath === '/adult18plus' || rawPath.includes('18plus');
 
     let upstreamBasePath = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
     if (isNewUploadsView || isNewReleasesView || isHotDhamakaView) {
       upstreamBasePath = '/';
     }
 
-    const collectPrefetchedDetails = (list: MovieCardItem[]) => {
-      const prefetchedDetails: Record<string, MovieDetailData> = {};
-      const missingCards: MovieCardItem[] = [];
-      for (const item of list.slice(0, 24)) {
-        if (!item?.path) continue;
-        const hit = findCachedDetailByPathOrTitle(item.path, item.title);
-        if (hit && hit.episodes?.length) {
-          prefetchedDetails[item.path] = hit;
-          if (!detailCache.has(item.path)) {
-            detailCache.set(item.path, { data: hit, expiresAt: Date.now() + 3600_000 });
-          }
-        } else if (item.path.startsWith('/mb/')) {
-          missingCards.push(item);
-        }
-      }
-      if (missingCards.length > 0) {
-        void (async () => {
-          for (const card of missingCards.slice(0, 3)) {
-            if (findCachedDetailByPathOrTitle(card.path, card.title)) continue;
-            try {
-              const mbDet = await fetchMovieBoxDetail(card.path);
-              if (mbDet && mbDet.episodes.length > 0) {
-                storeDetailInCaches(card.path, mbDet, Date.now() + 3600_000);
-              }
-            } catch {
-              // ignore
-            }
-          }
-        })();
-      }
-      return prefetchedDetails;
-    };
-
-    const cacheKey = `${rawPath}::page=${page}::q=${search}::node=node-moviebox`;
+    const cacheKey = `${rawPath}::page=${page}::q=${search}::node=${nodeParam}`;
     const cached = catalogCache.get(cacheKey);
     if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
       const normalized = normalizeMovieCardList(cached.data.items);
@@ -4576,9 +4843,8 @@ async function startServer() {
         path: rawPath,
         page,
         maxPage: cached.data.maxPage,
-        activeNodeId: 'node-moviebox',
+        activeNodeId: cached.data.activeNodeId,
         items: normalized,
-        prefetchedDetails: collectPrefetchedDetails(normalized),
       });
       return;
     }
@@ -4590,35 +4856,61 @@ async function startServer() {
           ? '/new-uploads'
           : upstreamBasePath;
 
-      // On the main home catalog (/ or /hot-dhamaka or /new-uploads), also fetch Bangladesh + Indian Cinema + Hindi Dubbed in parallel so South Asian & Bengali hits are always included!
       const isHomeOrGlobal =
         !search &&
         page === 1 &&
         (isTrendingHomeView || isHotDhamakaView || isNewUploadsView || isNewReleasesView);
 
-      const tasks: Promise<{ items: MovieCardItem[]; maxPage: number }>[] = [
-        fetchMovieBoxCatalog(mbTargetPath, page, search),
-      ];
-      if (isHomeOrGlobal) {
-        tasks.push(
-          fetchMovieBoxCatalog('/language/bangla', 1, ''),
-          fetchMovieBoxCatalog('/bollywood', 1, ''),
-          fetchMovieBoxCatalog('/language/hindi-dubbed', 1, '')
-        );
-      }
+      const tasks: Array<Promise<{ items: MovieCardItem[]; maxPage: number }>> = [];
+      const mlbdTask = Promise.race([
+        fetchMovieLinkBdCatalog(upstreamBasePath, page, search),
+        new Promise<{ items: MovieCardItem[]; maxPage: number }>((resolve) =>
+          setTimeout(() => resolve({ items: [], maxPage: 1 }), 3500)
+        ),
+      ]);
 
-      const settled = await Promise.allSettled(tasks);
-      const mbMain =
-        settled[0].status === 'fulfilled' ? settled[0].value : { items: [], maxPage: 2500 };
-      const extraRegional: MovieCardItem[] = [];
-      for (let i = 1; i < settled.length; i++) {
-        const r = settled[i];
-        if (r.status === 'fulfilled') {
-          extraRegional.push(...r.value.items.slice(0, 12));
+      if (isAdultView) {
+        tasks.push(mlbdTask);
+      } else {
+        tasks.push(fetchMovieBoxCatalog(mbTargetPath, page, search), mlbdTask);
+        if (isHomeOrGlobal) {
+          tasks.push(
+            fetchMovieBoxCatalog('/language/bangla', 1, ''),
+            fetchMovieBoxCatalog('/bollywood', 1, ''),
+            fetchMovieBoxCatalog('/language/hindi-dubbed', 1, '')
+          );
         }
       }
 
-      let items: MovieCardItem[] = deduplicateMovieCards([...extraRegional, ...mbMain.items]);
+      const settled = await Promise.allSettled(tasks);
+      const primaryMain =
+        settled[0]?.status === 'fulfilled' ? settled[0].value : { items: [], maxPage: 2500 };
+      const mlbdMain = isAdultView
+        ? primaryMain
+        : settled[1]?.status === 'fulfilled'
+          ? settled[1].value
+          : { items: [], maxPage: 520 };
+
+      const extraRegional: MovieCardItem[] = [];
+      for (let i = isAdultView ? 1 : 2; i < settled.length; i++) {
+        const r = settled[i];
+        if (r.status === 'fulfilled') {
+          extraRegional.push(...r.value.items.slice(0, 10));
+        }
+      }
+
+      const preferMlFirst =
+        isAdultView ||
+        upstreamBasePath.includes('bangla') ||
+        (search && /গোপাল|gopal|natok|নাটক|bachelor|ব্যাচেলর|bangla|kolkata/i.test(search));
+
+      let items: MovieCardItem[] = isAdultView
+        ? primaryMain.items
+        : mergeCatalogItems(
+            deduplicateMovieCards([...extraRegional, ...primaryMain.items]),
+            mlbdMain.items,
+            Boolean(preferMlFirst)
+          );
 
       if (search) {
         const lowerSearch = search.toLowerCase();
@@ -4634,16 +4926,6 @@ async function startServer() {
       }
 
       if (!search && (isTrendingHomeView || isHotDhamakaView || isNewUploadsView || isNewReleasesView)) {
-        if (page === 1) {
-          const extraRecent: MovieCardItem[] = [];
-          for (const [k, entry] of catalogCache.entries()) {
-            if (k.includes('adult18plus')) continue;
-            for (const it of entry.data.items.slice(0, 12)) {
-              if (!it.isAdult) extraRecent.push(it);
-            }
-          }
-          items = deduplicateMovieCards([...items, ...extraRecent]);
-        }
         if (isHotDhamakaView) {
           items = sortItemsByHotAndHype(items);
         } else if (isNewUploadsView) {
@@ -4660,15 +4942,17 @@ async function startServer() {
         } else {
           items = sortItemsByHotAndHype(items);
         }
+        items = items.slice(0, 64);
       } else {
-        items = normalizeMovieCardList(items);
+        items = normalizeMovieCardList(items).slice(0, 64);
       }
 
-      const maxPage = mbMain.maxPage || 2500;
+      const maxPage = Math.max(primaryMain.maxPage || 1, mlbdMain.maxPage || 1, 50);
 
       if (items.length > 0) {
+        const usedNodeId = isAdultView ? 'node-mlbd' : 'node-moviebox';
         catalogCache.set(cacheKey, {
-          data: { items, maxPage, activeNodeId: 'node-moviebox' },
+          data: { items, maxPage, activeNodeId: usedNodeId },
           expiresAt: Date.now() + 600_000,
         });
         res.json({
@@ -4677,9 +4961,8 @@ async function startServer() {
           path: rawPath,
           page,
           maxPage,
-          activeNodeId: 'node-moviebox',
+          activeNodeId: usedNodeId,
           items,
-          prefetchedDetails: collectPrefetchedDetails(items),
         });
         return;
       }
@@ -4701,7 +4984,7 @@ async function startServer() {
     });
   });
 
-  // 5. Live MovieBox HD Detail & Direct Ad-Free MP4 Stream Resolver
+  // 5. Dual-Source Detail & Direct Ad-Free Stream Resolver (MovieBox + MovieLinkBD)
   app.get('/api/details', async (req, res) => {
     const rawPath = String(req.query.path || req.query.url || '').trim();
     const fallbackTitle = String(req.query.title || '').trim();
@@ -4740,11 +5023,8 @@ async function startServer() {
 
     const ensureDetailDubsAndUploader = (detailObj: MovieDetailData): MovieDetailData => {
       const dubs: MovieDubOption[] = Array.isArray(detailObj.dubs) ? [...detailObj.dubs] : [];
-      const seenLabels = new Set(dubs.map((d) => d.label.toLowerCase()));
-
       if (dubs.length === 0) {
         const primaryLabel = String(detailObj.language || 'Original Audio').trim();
-        seenLabels.add(primaryLabel.toLowerCase());
         dubs.push({
           id: `dub-primary-${detailObj.url}`,
           label: primaryLabel,
@@ -4764,7 +5044,7 @@ async function startServer() {
     const instantHit = findCachedDetailByPathOrTitle(rawPath, fallbackTitle);
     if (instantHit) {
       if (rawPath && !detailCache.has(rawPath)) {
-        detailCache.set(rawPath, { data: instantHit, expiresAt: Date.now() + 3600_000 });
+        detailCache.set(rawPath, { data: instantHit, expiresAt: Date.now() + 600_000 });
       }
       res.json({
         ok: true,
@@ -4774,12 +5054,31 @@ async function startServer() {
       return;
     }
 
+    // 2. If path is MovieLinkBD (/movie/..., /series/..., /anime/..., /drama/...), resolve from MovieLinkBD directly!
+    if (rawPath && !rawPath.startsWith('/mb/')) {
+      try {
+        const { html, finalOrigin } = await fetchFromMirrors(rawPath, 'node-mlbd');
+        if (finalOrigin && finalOrigin.includes('movielinkbd.at')) {
+          activeMovieLinkBdOrigin = finalOrigin;
+          SERVER_NODES[1].origin = finalOrigin;
+        }
+        let mlDetail = parseMovieDetail(html, rawPath, finalOrigin || activeMovieLinkBdOrigin);
+        if (mlDetail && (mlDetail.episodes?.length > 0 || mlDetail.downloadButtons?.length > 0)) {
+          mlDetail = ensureDetailDubsAndUploader(attachFastRelatedSeasons(mlDetail));
+          storeDetailInCaches(rawPath, mlDetail, Date.now() + 12 * 60_000);
+          res.json({ ok: true, detail: mlDetail });
+          return;
+        }
+      } catch {
+        // fallback below to MovieBox search
+      }
+    }
+
     try {
       let targetMbPath = rawPath;
-      // If a legacy path (not starting with /mb/) is passed, resolve it via MovieBox search by title!
       if (!targetMbPath.startsWith('/mb/')) {
         const queryFromPath = rawPath
-          .replace(/^\/(?:movie|series|anime|drama|mf)\//i, '')
+          .replace(/^\/(?:movie|series|anime|drama)\//i, '')
           .replace(/[-_]+/g, ' ')
           .trim();
         const searchTitle = extractBaseSeriesTitle(fallbackTitle || queryFromPath)
@@ -4807,7 +5106,7 @@ async function startServer() {
         }
       }
     } catch (err) {
-      console.error('MovieBox detail fetch error:', err);
+      console.error('Detail fetch error:', err);
     }
 
     res.status(404).json({
@@ -4866,11 +5165,10 @@ async function startServer() {
       return;
     }
 
-    // Virtual Micro-Chunk Sizes:
-    // - Byte 0 Startup Burst: 768KB (transfers in ~70ms so <video> starts playing immediately!)
-    // - Subsequent Playback Micro-Chunks: 4MB segments
-    const INITIAL_BURST_CHUNK_BYTES = VIRTUAL_CHUNK_0_BYTES; // 768KB
-    const PLAYBACK_MICRO_CHUNK_BYTES = 4 * 1024 * 1024; // 4MB rolling segment window
+    // Virtual Stream Window Sizes:
+    // 4MB startup burst + 6MB rolling window delivers instant TTFB through proxy and fast seeking!
+    const INITIAL_BURST_CHUNK_BYTES = 4 * 1024 * 1024;
+    const PLAYBACK_MICRO_CHUNK_BYTES = 6 * 1024 * 1024;
 
     let requestedStart = 0;
     let requestedEnd = NaN;
@@ -4882,66 +5180,31 @@ async function startServer() {
       }
     }
 
-    // 1. Check Virtual Micro-Chunk RAM Cache (Contiguous 0..3.75MB front segments + 512KB Tail segment!)
+    // 1. Check Virtual Micro-Chunk RAM Cache (Only serve from RAM if the client requested an explicit range that fits inside ramHit.buf, or if probing the tail atom)
     if (!isDownload && req.method !== 'HEAD') {
       const ramHit = mbStartupChunkCache.get(targetUrl);
       if (ramHit && ramHit.expiresAt > Date.now()) {
-        // Trigger parallel prefetch of Segments #1, #2, and Tail if not already running
-        prefetchParallelVirtualSegments(targetUrl, ramHit);
-
-        // Case A: Request starts within our cached front segments (0 .. ramHit.buf.length - 1)
-        if (requestedStart < ramHit.buf.length) {
-          const sliceEnd = !Number.isNaN(requestedEnd)
-            ? Math.min(requestedEnd, ramHit.buf.length - 1)
-            : ramHit.buf.length - 1;
-          if (sliceEnd >= requestedStart) {
-            const chunk = ramHit.buf.subarray(requestedStart, sliceEnd + 1);
-            res.status(206);
-            res.setHeader('Content-Type', ramHit.contentType || 'video/mp4');
-            res.setHeader('Accept-Ranges', 'bytes');
-            res.setHeader('Cache-Control', 'public, max-age=3600');
-            res.setHeader('X-Cache', 'VIRTUAL-CHUNK-RAM-HIT');
-            res.setHeader('Content-Length', String(chunk.length));
-            res.setHeader(
-              'Content-Range',
-              `bytes ${requestedStart}-${sliceEnd}/${ramHit.totalSize}`
-            );
-            res.end(chunk);
-            return;
-          }
-        }
-
-        // Case B: Request is probing the end-of-file moov atom inside our cached 512KB Tail Segment!
+        // Case A: Explicit bounded range that fits completely within our cached front header
         if (
-          ramHit.tailBuf &&
-          requestedStart >= ramHit.tailStart &&
-          requestedStart < ramHit.totalSize
+          !Number.isNaN(requestedEnd) &&
+          requestedStart < ramHit.buf.length &&
+          requestedEnd < ramHit.buf.length &&
+          requestedEnd >= requestedStart
         ) {
-          const relStart = requestedStart - ramHit.tailStart;
-          const maxTailEnd = ramHit.tailStart + ramHit.tailBuf.length - 1;
-          const absEnd = !Number.isNaN(requestedEnd)
-            ? Math.min(requestedEnd, maxTailEnd)
-            : maxTailEnd;
-          const relEnd = absEnd - ramHit.tailStart;
-          if (relStart >= 0 && relEnd >= relStart && relEnd < ramHit.tailBuf.length) {
-            const chunk = ramHit.tailBuf.subarray(relStart, relEnd + 1);
-            res.status(206);
-            res.setHeader('Content-Type', ramHit.contentType || 'video/mp4');
-            res.setHeader('Accept-Ranges', 'bytes');
-            res.setHeader('Cache-Control', 'public, max-age=3600');
-            res.setHeader('X-Cache', 'VIRTUAL-TAIL-RAM-HIT');
-            res.setHeader('Content-Length', String(chunk.length));
-            res.setHeader(
-              'Content-Range',
-              `bytes ${requestedStart}-${absEnd}/${ramHit.totalSize}`
-            );
-            res.end(chunk);
-            return;
-          }
+          const chunk = ramHit.buf.subarray(requestedStart, requestedEnd + 1);
+          res.status(206);
+          res.setHeader('Content-Type', ramHit.contentType || 'video/mp4');
+          res.setHeader('Accept-Ranges', 'bytes');
+          res.setHeader('Cache-Control', 'public, max-age=3600');
+          res.setHeader('X-Cache', 'VIRTUAL-CHUNK-RAM-HIT');
+          res.setHeader('Content-Length', String(chunk.length));
+          res.setHeader(
+            'Content-Range',
+            `bytes ${requestedStart}-${requestedEnd}/${ramHit.totalSize}`
+          );
+          res.end(chunk);
+          return;
         }
-      } else if (!isDownload) {
-        // Trigger full 768KB Chunk #0 + Parallel Segments #1/#2 + Tail prewarm in background!
-        prewarmMovieBoxStartupChunk(targetUrl);
       }
     }
 
@@ -4969,11 +5232,17 @@ async function startServer() {
 
     try {
       let upstream: http.IncomingMessage | null = null;
-      const refererCandidates = [
-        { Referer: 'https://moviebox.ph/', Origin: 'https://moviebox.ph' },
-        { Referer: 'https://movie-box.co/', Origin: 'https://movie-box.co' },
-        { Referer: 'https://movieboxhd.net/', Origin: 'https://movieboxhd.net' },
-      ];
+      const isMlbdStream = /workers\.dev|r2\.dev|fsldownload|movielinkbd/i.test(targetUrl);
+      const refererCandidates = isMlbdStream
+        ? [
+            { Referer: `${activeMovieLinkBdOrigin}/`, Origin: activeMovieLinkBdOrigin },
+            { Referer: 'https://movielinkbd.at/', Origin: 'https://movielinkbd.at' },
+          ]
+        : [
+            { Referer: 'https://moviebox.ph/', Origin: 'https://moviebox.ph' },
+            { Referer: 'https://movie-box.co/', Origin: 'https://movie-box.co' },
+            { Referer: 'https://movieboxhd.net/', Origin: 'https://movieboxhd.net' },
+          ];
       for (let attempt = 0; attempt < refererCandidates.length; attempt++) {
         try {
           const candidateRes = await openMovieBoxCdnStream(
@@ -5062,7 +5331,8 @@ async function startServer() {
         return;
       }
 
-      // Cache initial 0..768KB Chunk #0 in RAM while streaming it AND immediately launch parallel Segment #1/#2/Tail prefetch!
+      // Cache only lightweight 512KB initial header in RAM for small probe ranges without competing background downloads
+      const HEADER_CACHE_BYTES = 512 * 1024;
       const shouldCacheStartupChunk =
         !isDownload &&
         requestedStart === 0 &&
@@ -5075,34 +5345,28 @@ async function startServer() {
 
       if (shouldCacheStartupChunk && parsedTotalSize > 0) {
         upstream.on('data', (chunk: Buffer) => {
-          if (collectedLen < INITIAL_BURST_CHUNK_BYTES) {
+          if (collectedLen < HEADER_CACHE_BYTES) {
             const b = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-            const needed = INITIAL_BURST_CHUNK_BYTES - collectedLen;
+            const needed = HEADER_CACHE_BYTES - collectedLen;
             const slice = b.length > needed ? b.subarray(0, needed) : b;
             collectedChunks.push(slice);
             collectedLen += slice.length;
           }
         });
         upstream.on('end', () => {
-          const currentEntry = mbStartupChunkCache.get(targetUrl);
-          if (
-            collectedLen > 32768 &&
-            (!currentEntry || currentEntry.buf.length < collectedLen)
-          ) {
-            if (mbStartupChunkCache.size >= 35) {
+          if (collectedLen > 32768 && !mbStartupChunkCache.has(targetUrl)) {
+            if (mbStartupChunkCache.size >= 30) {
               const oldestKey = mbStartupChunkCache.keys().next().value;
               if (oldestKey) mbStartupChunkCache.delete(oldestKey);
             }
-            const entry: VirtualChunkCacheEntry = {
+            mbStartupChunkCache.set(targetUrl, {
               buf: Buffer.concat(collectedChunks),
-              tailStart: Math.max(VIRTUAL_SEGMENT_2_END, parsedTotalSize - VIRTUAL_TAIL_BYTES),
-              tailBuf: currentEntry?.tailBuf || null,
+              tailStart: parsedTotalSize,
+              tailBuf: null,
               totalSize: parsedTotalSize,
               contentType,
-              expiresAt: Date.now() + 12 * 60_000,
-            };
-            mbStartupChunkCache.set(targetUrl, entry);
-            prefetchParallelVirtualSegments(targetUrl, entry);
+              expiresAt: Date.now() + 10 * 60_000,
+            });
           }
         });
       }
@@ -5223,10 +5487,13 @@ async function startServer() {
       const altSe = se === 0 ? 1 : 0;
       const altEp = ep === 0 ? 1 : 0;
       const nowMs = Date.now();
-      const cachedPrimary = mbPlayStreamCache.get(`${subjectId}::${se}::${ep}`);
+      const cachedPrimary =
+        mbPlayStreamCache.get(`${subjectId}::s${se}::e${ep}`) ||
+        mbPlayStreamCache.get(`${subjectId}::${se}::${ep}`);
       const cachedAlt =
         (se === 0 && ep === 0) || (se === 1 && ep === 1)
-          ? mbPlayStreamCache.get(`${subjectId}::${altSe}::${altEp}`)
+          ? mbPlayStreamCache.get(`${subjectId}::s${altSe}::e${altEp}`) ||
+            mbPlayStreamCache.get(`${subjectId}::${altSe}::${altEp}`)
           : undefined;
 
       let sources: StreamSource[] = [];
@@ -5234,28 +5501,6 @@ async function startServer() {
         sources = cachedPrimary.sources;
       } else if (cachedAlt && cachedAlt.expiresAt > nowMs && cachedAlt.sources.length > 0) {
         sources = cachedAlt.sources;
-      } else if ((se === 0 && ep === 0) || (se === 1 && ep === 1)) {
-        const resolved = await Promise.any([
-          fetchMovieBoxPlayStreams(
-            subjectId,
-            detailPath,
-            se,
-            ep,
-            detailPath,
-            'English / Original',
-            fallbackUrl
-          ).then((r) => (r.sources.length > 0 ? r : Promise.reject(new Error('empty')))),
-          fetchMovieBoxPlayStreams(
-            subjectId,
-            detailPath,
-            altSe,
-            altEp,
-            detailPath,
-            'English / Original',
-            fallbackUrl
-          ).then((r) => (r.sources.length > 0 ? r : Promise.reject(new Error('empty')))),
-        ]).catch(() => ({ sources: [] as StreamSource[], buttons: [] }));
-        sources = resolved.sources;
       } else {
         const resMain = await fetchMovieBoxPlayStreams(
           subjectId,
@@ -5267,6 +5512,18 @@ async function startServer() {
           fallbackUrl
         );
         sources = resMain.sources;
+        if (sources.length === 0 && ((se === 0 && ep === 0) || (se === 1 && ep === 1))) {
+          const resAlt = await fetchMovieBoxPlayStreams(
+            subjectId,
+            detailPath,
+            altSe,
+            altEp,
+            detailPath,
+            'English / Original',
+            fallbackUrl
+          );
+          sources = resAlt.sources;
+        }
       }
       if (!sources.length && se > 1 && ep > 1) {
         const fbPrev = await fetchMovieBoxPlayStreams(
@@ -5326,9 +5583,14 @@ async function startServer() {
         sources.find((s) => s.quality === 360) ||
         sources.find((s) => s.quality === 720) ||
         sources[0];
-      const streamRouteUrl = isDownload && chosen.downloadUrl ? chosen.downloadUrl : chosen.url;
-      // Extract token `t` from `/api/mb-stream.mp4?t=...` and stream directly without any 302 redirect!
+      let streamRouteUrl = isDownload && chosen.downloadUrl ? chosen.downloadUrl : chosen.url;
+      // Extract token `t` from `/api/mb-stream.mp4?t=...` (or uncloak `/_s/v.mp4?k=...`) and stream directly without any 302 redirect!
       try {
+        if (streamRouteUrl.startsWith('/_s/v.mp4')) {
+          const parsedCloak = new URL(streamRouteUrl, 'http://localhost');
+          const uncloaked = decodeCloakToken(parsedCloak.searchParams.get('k') || '');
+          if (uncloaked) streamRouteUrl = uncloaked;
+        }
         const parsedRoute = new URL(streamRouteUrl, 'http://localhost');
         const tParam = parsedRoute.searchParams.get('t') || '';
         const fbParam = parsedRoute.searchParams.get('fb') || fbToken;
@@ -5416,7 +5678,10 @@ async function startServer() {
   });
 
   app.get('/api/mb-subtitle-srt', async (req, res) => {
-    const rawUrl = String(req.query.url || '').trim();
+    const tokenParam = String(req.query.t || '').trim();
+    const rawUrl = tokenParam
+      ? decodeGatewayToken(tokenParam)
+      : String(req.query.url || '').trim();
     if (!rawUrl || !/^https?:\/\//i.test(rawUrl)) {
       res.status(400).send('');
       return;
@@ -5456,16 +5721,11 @@ async function startServer() {
   });
 
   // ==========================================================================================
-  // 6a-3. UNIVERSAL DIRECT AUTO-API v1 GATEWAY (/api/v1/*)
-  // Combines MovieBox Official BFF + Cinemeta Official IMDb Multi-Season + 5-Server Cloud HLS
-  // + 2MB RAM Startup Buffer Cache into a clean, CORS-enabled REST API!
+  // 6a-3. PROTECTED INTERNAL API v1 GATEWAY (/api/v1/*)
   // ==========================================================================================
-  app.use('/api/v1', (_req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    if (_req.method === 'OPTIONS') {
-      res.status(204).end();
+  app.use('/api/v1', (req, res, next) => {
+    if (!req.headers['x-cp-sig'] && req.headers['x-cp-client'] !== 'cp-web-v4') {
+      res.status(403).json({ ok: false, error: 'Protected by CinePulse Security Shield' });
       return;
     }
     next();
@@ -6096,9 +6356,270 @@ async function startServer() {
     res.json({ ok: true, request: item, requests: movieRequestsStore });
   });
 
-  // 7a. Legacy MyFlix endpoint disabled (Pure MovieBox HD Mode)
-  app.get('/api/myflix', (_req, res) => {
-    res.json({ ok: false });
+  // 7a. Per-User Isolated Watchlist & Watch Progress Store (Each user's list & resume state is strictly isolated!)
+  interface StoredUserProfile {
+    userId: string;
+    username: string;
+    pinHash: string;
+    salt: string;
+    isGuest: boolean;
+    watchlist: MovieCardItem[];
+    continueWatching: any[];
+    updatedAt: number;
+  }
+
+  const userDataDir = path.join(__dirname, 'data');
+  const userStorePath = path.join(userDataDir, 'cinepulse-users.json');
+  const usersById = new Map<string, StoredUserProfile>();
+  const userIdByName = new Map<string, string>();
+
+  const loadUserStore = () => {
+    try {
+      if (!fs.existsSync(userStorePath)) return;
+      const raw = JSON.parse(fs.readFileSync(userStorePath, 'utf8'));
+      if (raw && Array.isArray(raw.users)) {
+        for (const u of raw.users) {
+          if (u && u.userId) {
+            usersById.set(String(u.userId), u);
+            if (!u.isGuest && u.username) {
+              userIdByName.set(String(u.username).toLowerCase(), String(u.userId));
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore corrupted store and start clean
+    }
+  };
+  loadUserStore();
+
+  let userFlushTimer: NodeJS.Timeout | null = null;
+  const scheduleFlushUserStore = () => {
+    if (userFlushTimer) return;
+    userFlushTimer = setTimeout(() => {
+      userFlushTimer = null;
+      try {
+        if (!fs.existsSync(userDataDir)) {
+          fs.mkdirSync(userDataDir, { recursive: true });
+        }
+        const allUsers = Array.from(usersById.values()).slice(-2000);
+        const tmpFile = `${userStorePath}.tmp`;
+        fs.writeFileSync(tmpFile, JSON.stringify({ users: allUsers }), 'utf8');
+        fs.renameSync(tmpFile, userStorePath);
+      } catch {
+        // ignore write errors on read-only paths
+      }
+    }, 600);
+  };
+
+  const hashUserPin = (pin: string, salt: string) =>
+    crypto.createHmac('sha256', CINEPULSE_AES_KEY).update(`${salt}::${pin}`).digest('hex');
+
+  const signUserToken = (userId: string) => {
+    const payload = Buffer.from(JSON.stringify({ uid: userId, iat: Date.now() }), 'utf8').toString('base64url');
+    const sig = crypto.createHmac('sha256', CINEPULSE_AES_KEY).update(payload).digest('base64url');
+    return `${payload}.${sig}`;
+  };
+
+  const verifyUserToken = (token: string): string | null => {
+    try {
+      const [payload, sig] = String(token || '').split('.');
+      if (!payload || !sig) return null;
+      const expected = crypto.createHmac('sha256', CINEPULSE_AES_KEY).update(payload).digest('base64url');
+      if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+        return null;
+      }
+      const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+      return parsed?.uid ? String(parsed.uid) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const setNoSharedCacheHeaders = (res: express.Response) => {
+    res.setHeader('Cache-Control', 'private, no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Vary', 'X-CP-User-Token');
+  };
+
+  app.post('/api/user/auth', (req, res) => {
+    setNoSharedCacheHeaders(res);
+    const mode = String(req.body?.mode || 'guest').trim();
+    const rawUsername = String(req.body?.username || '')
+      .trim()
+      .replace(/\s+/g, ' ');
+    const pin = String(req.body?.pin || '').trim();
+
+    if (mode === 'guest') {
+      const uid = `u_${crypto.randomBytes(9).toString('hex')}`;
+      const shortTag = uid.slice(-4).toUpperCase();
+      const profile: StoredUserProfile = {
+        userId: uid,
+        username: `Guest-${shortTag}`,
+        pinHash: '',
+        salt: '',
+        isGuest: true,
+        watchlist: [],
+        continueWatching: [],
+        updatedAt: Date.now(),
+      };
+      usersById.set(uid, profile);
+      scheduleFlushUserStore();
+      res.json({
+        ok: true,
+        user: {
+          userId: profile.userId,
+          username: profile.username,
+          isGuest: true,
+          token: signUserToken(profile.userId),
+          watchlist: [],
+          continueWatching: [],
+        },
+      });
+      return;
+    }
+
+    if (rawUsername.length < 2 || rawUsername.length > 24) {
+      res.status(400).json({ ok: false, error: 'ইউজারনেম কমপক্ষে ২ থেকে ২৪ অক্ষরের হতে হবে' });
+      return;
+    }
+    if (pin.length < 4 || pin.length > 24) {
+      res.status(400).json({ ok: false, error: 'পিন/পাসওয়ার্ড কমপক্ষে ৪ অক্ষরের হতে হবে' });
+      return;
+    }
+
+    const lowerName = rawUsername.toLowerCase();
+
+    if (mode === 'register') {
+      if (userIdByName.has(lowerName)) {
+        res.status(409).json({ ok: false, error: 'এই ইউজারনেমটি আগে থেকেই নেওয়া আছে—অন্য নাম দিন বা লগইন করুন' });
+        return;
+      }
+      const uid = `u_${crypto.randomBytes(9).toString('hex')}`;
+      const salt = crypto.randomBytes(8).toString('hex');
+      const profile: StoredUserProfile = {
+        userId: uid,
+        username: rawUsername,
+        pinHash: hashUserPin(pin, salt),
+        salt,
+        isGuest: false,
+        watchlist: [],
+        continueWatching: [],
+        updatedAt: Date.now(),
+      };
+      usersById.set(uid, profile);
+      userIdByName.set(lowerName, uid);
+      scheduleFlushUserStore();
+      res.json({
+        ok: true,
+        user: {
+          userId: profile.userId,
+          username: profile.username,
+          isGuest: false,
+          token: signUserToken(profile.userId),
+          watchlist: [],
+          continueWatching: [],
+        },
+      });
+      return;
+    }
+
+    if (mode === 'login') {
+      const existingUid = userIdByName.get(lowerName);
+      const profile = existingUid ? usersById.get(existingUid) : undefined;
+      if (!profile || profile.isGuest) {
+        res.status(404).json({ ok: false, error: 'এই নামে কোনো একাউন্ট পাওয়া যায়নি' });
+        return;
+      }
+      if (hashUserPin(pin, profile.salt) !== profile.pinHash) {
+        res.status(401).json({ ok: false, error: 'পিন বা পাসওয়ার্ড ভুল হয়েছে' });
+        return;
+      }
+      res.json({
+        ok: true,
+        user: {
+          userId: profile.userId,
+          username: profile.username,
+          isGuest: false,
+          token: signUserToken(profile.userId),
+          watchlist: profile.watchlist || [],
+          continueWatching: profile.continueWatching || [],
+        },
+      });
+      return;
+    }
+
+    res.status(400).json({ ok: false, error: 'Invalid auth mode' });
+  });
+
+  app.get('/api/user/me', (req, res) => {
+    setNoSharedCacheHeaders(res);
+    const token = String(req.headers['x-cp-user-token'] || '').trim();
+    const uid = verifyUserToken(token);
+    if (!uid) {
+      res.status(401).json({ ok: false, error: 'Invalid session' });
+      return;
+    }
+    let profile = usersById.get(uid);
+    if (!profile) {
+      // Recreate isolated empty guest profile cleanly if server restarted before flush
+      profile = {
+        userId: uid,
+        username: `User-${uid.slice(-4).toUpperCase()}`,
+        pinHash: '',
+        salt: '',
+        isGuest: true,
+        watchlist: [],
+        continueWatching: [],
+        updatedAt: Date.now(),
+      };
+      usersById.set(uid, profile);
+      scheduleFlushUserStore();
+    }
+    res.json({
+      ok: true,
+      user: {
+        userId: profile.userId,
+        username: profile.username,
+        isGuest: profile.isGuest,
+        token,
+        watchlist: profile.watchlist || [],
+        continueWatching: profile.continueWatching || [],
+      },
+    });
+  });
+
+  app.put('/api/user/state', (req, res) => {
+    setNoSharedCacheHeaders(res);
+    const token = String(req.headers['x-cp-user-token'] || '').trim();
+    const uid = verifyUserToken(token);
+    if (!uid) {
+      res.status(401).json({ ok: false, error: 'Invalid user session' });
+      return;
+    }
+    let profile = usersById.get(uid);
+    if (!profile) {
+      profile = {
+        userId: uid,
+        username: `User-${uid.slice(-4).toUpperCase()}`,
+        pinHash: '',
+        salt: '',
+        isGuest: true,
+        watchlist: [],
+        continueWatching: [],
+        updatedAt: Date.now(),
+      };
+      usersById.set(uid, profile);
+    }
+    if (Array.isArray(req.body?.watchlist)) {
+      profile.watchlist = req.body.watchlist.slice(0, 200);
+    }
+    if (Array.isArray(req.body?.continueWatching)) {
+      profile.continueWatching = req.body.continueWatching.slice(0, 30);
+    }
+    profile.updatedAt = Date.now();
+    scheduleFlushUserStore();
+    res.json({ ok: true, updatedAt: profile.updatedAt });
   });
 
   // 7b. Global Live Notifications API (New Movie Uploads + Popular High-Rating Movies Broadcast for Everyone)
@@ -6275,6 +6796,8 @@ async function startServer() {
   });
 
   if (process.env.NODE_ENV !== 'production') {
+    const vitePkg = 'vite';
+    const { createServer: createViteServer } = await import(vitePkg);
     const vite = await createViteServer({
       server: { middlewareMode: true, hmr: false },
       appType: 'spa',
@@ -6308,15 +6831,19 @@ async function startServer() {
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`CinePulse HD Cinema Server running on http://0.0.0.0:${PORT}`);
 
-    // Immediately warm MovieBox token, Home shelves, and all top navigation categories in background!
+    // Immediately warm MovieBox + MovieLinkBD discovery, Home shelves, and top categories in background!
     setTimeout(() => {
+      void discoverActiveMovieLinkBdOrigin(true).catch(() => {});
       void getMovieBoxBearerToken(true).catch(() => {});
       void fetchMovieBoxHomePayload().catch(() => {});
       void syncLiveCategories();
-    }, 150).unref();
+    }, 100).unref();
+    setInterval(() => {
+      void discoverActiveMovieLinkBdOrigin(true).catch(() => {});
+    }, 15 * 60_000).unref();
     setInterval(syncLiveCategories, 300_000).unref();
 
-    // Automatic Render Free-Tier Keep-Alive Self-Ping (prevents 15-min idle sleep)
+    // Automatic Keep-Alive Self-Ping
     const externalUrl = (process.env.RENDER_EXTERNAL_URL || process.env.APP_URL || '').replace(/\/+$/, '');
     if (externalUrl && externalUrl.startsWith('http')) {
       setInterval(() => {
