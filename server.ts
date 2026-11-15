@@ -4450,6 +4450,10 @@ async function startServer() {
         'Access-Control-Allow-Headers',
         'Content-Type, Accept, Range, X-API-Key, Authorization, X-Trial-Manage-Token, X-Trial-Admin'
       );
+      res.setHeader(
+        'Access-Control-Expose-Headers',
+        'Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Trial-Plan, X-RateLimit-Limit, X-RateLimit-Remaining, X-Trial-Expires-At'
+      );
     } else {
       if (
         origin &&
@@ -4562,8 +4566,25 @@ async function startServer() {
         .split(',')[0]
         .trim();
 
-      // 1. Block automated CLI scrapers & bots across all /api/* routes
+      const isStreamOrSubRoute =
+        req.path.startsWith('/api/mb-stream') ||
+        req.path.startsWith('/api/mb-ep-stream') ||
+        req.path.startsWith('/api/mb-subtitle-srt') ||
+        req.path.startsWith('/api/go') ||
+        req.path.startsWith('/api/ios-hls');
+
+      // 1. Validate trial stream token (?tk=) first so authorized Android APKs (OkHttp/ExoPlayer) & third-party websites work smoothly
+      const referer = String(req.headers.referer || '').toLowerCase();
+      const trialStreamTk = typeof req.query.tk === 'string' ? String(req.query.tk).trim() : '';
+      const hasValidTrialTk = Boolean(trialStreamTk && isActiveTrialStreamToken(trialStreamTk));
+      if (isStreamOrSubRoute && trialStreamTk && !hasValidTrialTk) {
+        res.status(403).send('Trial stream key expired, paused, or invalid');
+        return;
+      }
+
+      // 2. Block automated CLI scrapers & bots across protected /api/* routes (exempting ?tk= authenticated client APK/web streams)
       if (
+        !(isStreamOrSubRoute && hasValidTrialTk) &&
         /\b(curl|wget|python|requests|urllib|httpx|aiohttp|scrapy|postman|insomnia|libwww|go-http-client|java\/|okhttp|apache-httpclient|headlesschrome|phantomjs)\b/i.test(
           ua
         )
@@ -4572,21 +4593,7 @@ async function startServer() {
         return;
       }
 
-      const isStreamOrSubRoute =
-        req.path.startsWith('/api/mb-stream') ||
-        req.path.startsWith('/api/mb-ep-stream') ||
-        req.path.startsWith('/api/mb-subtitle-srt') ||
-        req.path.startsWith('/api/go') ||
-        req.path.startsWith('/api/ios-hls');
-
-      // 2. Anti-hotlinking check on stream routes (allow third-party client sites ONLY with a valid active ?tk= trial key)
-      const referer = String(req.headers.referer || '').toLowerCase();
-      const trialStreamTk = typeof req.query.tk === 'string' ? String(req.query.tk).trim() : '';
-      const hasValidTrialTk = Boolean(trialStreamTk && isActiveTrialStreamToken(trialStreamTk));
-      if (isStreamOrSubRoute && trialStreamTk && !hasValidTrialTk) {
-        res.status(403).send('Trial stream key expired, paused, or invalid');
-        return;
-      }
+      // 3. Anti-hotlinking check on non-trial stream routes
       if (
         isStreamOrSubRoute &&
         !hasValidTrialTk &&
@@ -5363,7 +5370,9 @@ async function startServer() {
       if (!upstream || (upstream.statusCode !== 200 && upstream.statusCode !== 206)) {
         try {
           const undiciHeaders: Record<string, string> = {
-            'User-Agent': chromeUa,
+            'User-Agent': isMlbdStream ? chromeUa : 'okhttp/4.12.0',
+            Referer: isMlbdStream ? `${activeMovieLinkBdOrigin}/` : 'https://moviebox.ph/',
+            Origin: isMlbdStream ? activeMovieLinkBdOrigin : 'https://moviebox.ph',
             Accept: '*/*',
           };
           if (forwardHeaders.Range) undiciHeaders.Range = forwardHeaders.Range;
@@ -7303,6 +7312,10 @@ async function startServer() {
         }&title=${encodeURIComponent(detail.title)}`,
         detail: {
           ...detail,
+          downloadButtons: (detail.downloadButtons || []).map((b) => ({
+            ...b,
+            url: toTrialUrl(b.url),
+          })),
           episodes: (detail.episodes || []).map((ep) => ({
             ...ep,
             sources: (ep.sources || []).map((s) => ({
