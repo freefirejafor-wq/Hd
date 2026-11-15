@@ -6760,7 +6760,7 @@ async function startServer() {
     next();
   });
 
-  // Create a new live Trial API Key
+  // Create a new live Trial API Key (Owner Only — Telegram Bot or /owner Panel or X-Trial-Admin)
   app.post('/api/trial/keys', (req, res) => {
     capturePublicOriginForBot(req);
     const base = getPublicOrigin(req);
@@ -6770,21 +6770,11 @@ async function startServer() {
     const isAdmin = isTrialOwnerRequest(req);
 
     if (!isAdmin) {
-      const now = Date.now();
-      const rl = trialCreateIpRate.get(clientIp);
-      if (!rl || now > rl.resetAt) {
-        if (trialCreateIpRate.size > 1000) trialCreateIpRate.clear();
-        trialCreateIpRate.set(clientIp, { count: 1, resetAt: now + 24 * 60 * 60_000 });
-      } else {
-        rl.count++;
-        if (rl.count > 10) {
-          sendPrettyDemoJson(res, 429, {
-            ok: false,
-            error: 'Daily self-serve trial key limit reached for this IP. Reuse an existing key or contact admin.',
-          });
-          return;
-        }
-      }
+      sendPrettyDemoJson(res, 403, {
+        ok: false,
+        error: 'Client API key generation is restricted to Owner (/owner panel or Telegram Bot).',
+      });
+      return;
     }
 
     const rawName = String(req.body?.clientName || 'Client Trial').trim().slice(0, 48) || 'Client Trial';
@@ -6793,14 +6783,6 @@ async function startServer() {
     const plan: StoredTrialKey['plan'] = validPlans.includes(rawPlan as StoredTrialKey['plan'])
       ? (rawPlan as StoredTrialKey['plan'])
       : '24H';
-
-    if ((plan === '7D' || plan === '30D' || plan === 'UNLIMITED') && !isAdmin) {
-      sendPrettyDemoJson(res, 403, {
-        ok: false,
-        error: `${plan} commercial/extended key requires Owner Admin Key (set TRIAL_ADMIN_KEY env var & pass X-Trial-Admin).`,
-      });
-      return;
-    }
 
     let durationHours = 24;
     let maxRequests = 250;
@@ -7585,10 +7567,9 @@ async function startServer() {
     }
   });
 
-  // Interactive Direct Trial API Key Portal (/trial)
+  // Client API Tester & Integration Portal (/trial — Client-Only View, Mobile Responsive)
   app.get('/trial', (req, res) => {
     capturePublicOriginForBot(req);
-    const base = getPublicOrigin(req);
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
     res.send(`<!DOCTYPE html>
@@ -7596,128 +7577,90 @@ async function startServer() {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>CinePulse MovieBox API — Direct Trial Key System</title>
+  <title>MovieBox Direct API — Client Tester & Docs</title>
   <style>
     :root { color-scheme: dark; --bg:#08090c; --card:#111217; --sub:#181920; --border:#27272a; --accent:#e50914; --green:#22c55e; --blue:#38bdf8; --text:#f4f4f5; --muted:#a1a1aa; }
     * { box-sizing: border-box; }
-    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text); padding:24px 16px 60px; }
-    .wrap { max-width:1080px; margin:0 auto; }
-    .topbar { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:12px; margin-bottom:20px; }
-    .brand { display:flex; align-items:center; gap:10px; font-size:21px; font-weight:800; letter-spacing:-0.02em; }
-    .dot { width:10px; height:10px; border-radius:999px; background:var(--green); box-shadow:0 0 10px var(--green); }
-    .nav-links { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-    .pill-link { font-size:12px; padding:6px 12px; border-radius:7px; background:var(--sub); border:1px solid var(--border); color:var(--text); text-decoration:none; font-weight:600; }
-    .layout { display:grid; grid-template-columns: 360px 1fr; gap:16px; align-items:start; }
-    @media (max-width: 880px) { .layout { grid-template-columns: 1fr; } }
-    .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; margin-bottom:16px; }
-    h2 { margin:0 0 12px; font-size:15px; font-weight:700; display:flex; align-items:center; justify-content:space-between; }
-    label { display:block; font-size:12px; color:var(--muted); margin-bottom:5px; margin-top:10px; }
-    input, select { width:100%; background:#09090b; border:1px solid var(--border); color:var(--text); padding:9px 11px; border-radius:8px; font-size:13px; }
-    button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:9px 14px; font-weight:600; font-size:13px; cursor:pointer; }
+    html, body { margin:0; padding:0; width:100%; max-width:100%; overflow-x:hidden; background:var(--bg); color:var(--text); font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; }
+    body { padding:16px 12px 56px; }
+    .wrap { width:100%; max-width:1060px; margin:0 auto; }
+    .topbar { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; margin-bottom:16px; }
+    .brand { display:flex; align-items:center; gap:9px; font-size:18px; font-weight:800; letter-spacing:-0.02em; line-height:1.25; }
+    .dot { flex-shrink:0; width:10px; height:10px; border-radius:999px; background:var(--green); box-shadow:0 0 10px var(--green); }
+    .badge-top { font-size:11px; font-weight:700; padding:5px 10px; border-radius:7px; background:var(--sub); border:1px solid var(--border); color:var(--muted); }
+    .layout { display:grid; grid-template-columns: minmax(0, 340px) minmax(0, 1fr); gap:14px; align-items:start; }
+    .layout > * { min-width:0; }
+    @media (max-width: 880px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+    .card { width:100%; min-width:0; max-width:100%; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px; margin-bottom:14px; }
+    h2 { margin:0 0 10px; font-size:15px; font-weight:700; display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+    label { display:block; font-size:12px; color:var(--muted); margin-bottom:5px; margin-top:8px; }
+    input, select { width:100%; min-width:0; max-width:100%; background:#09090b; border:1px solid var(--border); color:var(--text); padding:9px 11px; border-radius:8px; font-size:13px; }
+    button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:9px 13px; font-weight:600; font-size:13px; cursor:pointer; white-space:nowrap; }
     button.sec { background:#27272a; color:var(--text); }
-    button.sm { padding:6px 10px; font-size:12px; }
+    button.sm { padding:7px 10px; font-size:12px; }
     button:hover { opacity:0.92; }
-    .full { width:100%; margin-top:12px; padding:10px; }
-    .key-box { background:#050507; border:1px solid #2e2e36; border-radius:10px; padding:12px; margin-top:10px; }
-    .key-val { font-family:monospace; font-size:13px; color:var(--blue); word-break:break-all; font-weight:700; }
+    .key-box { width:100%; min-width:0; background:#050507; border:1px solid #2e2e36; border-radius:10px; padding:11px; margin-top:10px; }
+    .key-val { font-family:monospace; font-size:12px; color:var(--blue); word-break:break-all; font-weight:700; }
     .bar-bg { width:100%; height:7px; background:#27272a; border-radius:999px; overflow:hidden; margin:8px 0 6px; }
     .bar-fill { height:100%; background:linear-gradient(90deg, var(--green), var(--blue)); width:100%; transition:width .25s ease; }
-    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
-    .saved-item { background:var(--sub); border:1px solid var(--border); border-radius:9px; padding:10px; margin-top:8px; font-size:12px; }
-    .saved-item.active { border-color:var(--blue); }
-    .ep-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:10px; margin-top:10px; }
-    .ep-box { background:var(--sub); border:1px solid var(--border); border-radius:9px; padding:10px; display:flex; flex-direction:column; gap:7px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; min-width:0; }
+    .ep-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:10px; margin-top:10px; }
+    @media (max-width: 560px) { .ep-grid { grid-template-columns: minmax(0, 1fr); } }
+    .ep-box { min-width:0; background:var(--sub); border:1px solid var(--border); border-radius:9px; padding:10px; display:flex; flex-direction:column; gap:7px; }
     .tabs { display:flex; gap:6px; margin-bottom:8px; flex-wrap:wrap; }
-    .tab { background:var(--sub); color:var(--muted); border:1px solid var(--border); padding:5px 10px; border-radius:6px; font-size:12px; cursor:pointer; }
+    .tab { background:var(--sub); color:var(--muted); border:1px solid var(--border); padding:5px 9px; border-radius:6px; font-size:12px; cursor:pointer; }
     .tab.on { background:var(--accent); color:#fff; border-color:var(--accent); }
-    pre { margin:0; background:#050507; border:1px solid var(--border); border-radius:10px; padding:13px; overflow:auto; max-height:460px; font-size:12px; line-height:1.5; color:#e4e4e7; }
-    .status-pill { font-size:11px; font-weight:700; padding:2px 8px; border-radius:5px; background:rgba(34,197,94,.14); color:var(--green); }
+    pre { margin:0; width:100%; max-width:100%; min-width:0; background:#050507; border:1px solid var(--border); border-radius:10px; padding:12px; overflow:auto; max-height:420px; font-size:11.5px; line-height:1.5; color:#e4e4e7; white-space:pre-wrap; word-break:break-word; }
+    .status-pill { font-size:11px; font-weight:700; padding:3px 8px; border-radius:5px; background:rgba(34,197,94,.14); color:var(--green); }
     .status-pill.bad { background:rgba(239,68,68,.15); color:#f87171; }
+    .hint { font-size:12px; color:var(--muted); line-height:1.45; margin-top:6px; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="topbar">
-      <div class="brand"><span class="dot"></span> MovieBox Direct Trial API System</div>
-      <div class="nav-links">
-        <a class="pill-link" style="background:rgba(229,9,20,0.2);border-color:#e50914;color:#fff;" href="/owner">👑 Owner Control Panel (বাংলা)</a>
-        <a class="pill-link" href="/demo-api">Free Public Demo</a>
-        <a class="pill-link" href="/">Open Web App</a>
-      </div>
-    </div>
-
-    <div id="devOriginBanner" class="card" style="display:none;border-color:#f59e0b;background:rgba(245,158,11,0.08);margin-bottom:16px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
-        <div style="font-size:13px;line-height:1.5;">
-          <strong style="color:#fbbf24;">Client Share Notice:</strong>
-          You are on private Dev URL (<code>ais-dev-...</code>). External clients cannot access <code>ais-dev-...</code> without your Google login.
-          Click <strong>Share / Publish</strong> in AI Studio first, then send the <strong>Public Share URL (<code>ais-pre-...</code>)</strong> below!
-        </div>
-        <label style="display:flex;align-items:center;gap:8px;margin:0;color:#fff;cursor:pointer;white-space:nowrap;">
-          <input id="useShareOriginChk" type="checkbox" checked style="width:auto;" onchange="updateSnippet()" />
-          Use Public Share URL (ais-pre-...) in Client Copy
-        </label>
-      </div>
+      <div class="brand"><span class="dot"></span> MovieBox Direct API — Client Portal</div>
+      <div class="badge-top">Website &amp; Android APK Ready</div>
     </div>
 
     <div class="layout">
       <div>
         <div class="card">
-          <h2>1. Generate Client API Key</h2>
-          <label>Client / Project Name</label>
-          <input id="clientName" placeholder="e.g. Rahim OTT App" value="Client Trial Demo" />
-          <label>Plan (Duration &amp; Request Quota)</label>
-          <select id="planSelect">
-            <option value="2H">2 Hours Trial (60 Requests)</option>
-            <option value="24H" selected>24 Hours Trial (250 Requests)</option>
-            <option value="72H">3 Days Trial (600 Requests)</option>
-            <option value="7D">7 Days (5,000 Requests — Owner Key)</option>
-            <option value="30D">30 Days / 1 Month (100,000 Requests — Owner Key)</option>
-            <option value="UNLIMITED">Unlimited Access (10 Years / No Limit — Owner Key)</option>
-          </select>
-          <label>Owner Admin Key (Required only for 7D / 30D / Unlimited &amp; Client Manager)</label>
-          <input id="adminKeyInput" type="password" placeholder="Enter TRIAL_ADMIN_KEY to unlock 30D & Unlimited" />
-          <button class="full" onclick="createTrialKey()">Generate Live API Key</button>
-          <div id="createMsg" style="font-size:12px;color:var(--muted);margin-top:8px;"></div>
-        </div>
-
-        <div class="card">
-          <h2>2. Active Client Key <span id="keyStatusBadge" class="status-pill">NONE</span></h2>
-          <div class="row">
-            <input id="activeKeyInput" placeholder="Paste cp_tr1_... key" style="flex:1;font-family:monospace;font-size:12px;" />
-            <button class="sec sm" onclick="loadKeyStatus()">Verify</button>
+          <h2>1. Your API Key <span id="keyStatusBadge" class="status-pill">ENTER KEY</span></h2>
+          <label>Paste your API Key (cp_tr1_...)</label>
+          <div class="row" style="flex-wrap:nowrap;">
+            <input id="activeKeyInput" placeholder="Paste cp_tr1_... key here" style="flex:1;min-width:0;font-family:monospace;font-size:12px;" />
+            <button class="sm" onclick="loadKeyStatus()">Verify</button>
           </div>
+          <div id="keyErrorMsg" class="hint" style="color:#f87171;display:none;"></div>
           <div class="key-box" id="activeKeyCard" style="display:none;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:6px;margin-bottom:6px;">
+              <strong id="clientLabel" style="font-size:13px;color:#fff;">Client</strong>
+              <span id="planLabel" style="font-size:11px;color:var(--blue);font-weight:700;"></span>
+            </div>
             <div class="key-val" id="activeKeyText"></div>
             <div class="bar-bg"><div class="bar-fill" id="quotaBar"></div></div>
-            <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);">
+            <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);gap:8px;flex-wrap:wrap;">
               <span id="quotaText">0 / 0 left</span>
               <span id="expiryText">-</span>
             </div>
             <div class="row" style="margin-top:10px;">
-              <button class="sm" onclick="copyClientInvite(this)">Copy Client Message</button>
-              <button class="sec sm" onclick="copyText(currentKey, this)">Copy Key</button>
-              <button class="sec sm" id="togglePauseBtn" onclick="togglePauseCurrentKey()">Pause</button>
-              <button class="sec sm" onclick="extendCurrentKey30Days()">+30D</button>
+              <button class="sec sm" onclick="copyText(currentKey, this)">Copy API Key</button>
+              <button class="sec sm" onclick="copyText(ORIGIN + '/api/trial', this)">Copy Base URL</button>
             </div>
           </div>
-
-          <div class="row" style="margin-top:12px;">
-            <button class="sec sm" style="width:100%;" onclick="loadAllAdminKeys()">Load All Server Clients (Owner)</button>
-          </div>
-          <div id="savedListWrap" style="margin-top:14px;display:none;">
-            <div style="font-size:12px;color:var(--muted);font-weight:600;">Client Keys:</div>
-            <div id="savedKeysList"></div>
+          <div class="hint">
+            Pass your key in header <code>X-API-Key</code> or query <code>?apiKey=YOUR_KEY</code>. Need a new key or renewal? Contact your provider.
           </div>
         </div>
       </div>
 
       <div>
         <div class="card">
-          <h2>3. Live Trial API Tester <span style="font-size:12px;color:var(--muted);font-weight:400;">Auth: X-API-Key or ?apiKey=</span></h2>
+          <h2>2. Live API &amp; Video Tester <span style="font-size:11.5px;color:var(--muted);font-weight:400;">Auth: X-API-Key or ?apiKey=</span></h2>
           <div class="ep-grid">
             <div class="ep-box">
-              <strong style="font-size:13px;">Home + Banners</strong>
+              <strong style="font-size:13px;">Home &amp; Categories</strong>
               <span style="font-size:11px;color:var(--muted);">GET /api/trial/home</span>
               <div class="row">
                 <button class="sm" style="flex:1" onclick="callTrial('/api/trial/home')">Home</button>
@@ -7725,7 +7668,7 @@ async function startServer() {
               </div>
             </div>
             <div class="ep-box">
-              <strong style="font-size:13px;">MovieBox Search</strong>
+              <strong style="font-size:13px;">Search Movies / Series</strong>
               <input id="searchQ" value="Squid Game" />
               <button class="sm" onclick="callTrial('/api/trial/search?q=' + encodeURIComponent(val('searchQ') || 'Squid Game'))">Test Search</button>
             </div>
@@ -7747,7 +7690,7 @@ async function startServer() {
               <button class="sm" onclick="callTrial('/api/trial/catalog?path=' + encodeURIComponent(val('catSel')) + '&page=1')">Test Catalog</button>
             </div>
             <div class="ep-box">
-              <strong style="font-size:13px;">Details &amp; Streams</strong>
+              <strong style="font-size:13px;">Details &amp; Live Video</strong>
               <input id="titleInput" value="Squid Game" />
               <div class="row">
                 <button class="sm" style="flex:1" onclick="callTrial('/api/trial/details?title=' + encodeURIComponent(val('titleInput') || 'Squid Game'))">Details</button>
@@ -7766,48 +7709,35 @@ async function startServer() {
               <button class="sec sm" onclick="closePreviewPlayer()">Close</button>
             </div>
           </div>
-          <video id="previewVideo" controls playsinline style="width:100%;max-height:380px;background:#000;border-radius:10px;"></video>
+          <video id="previewVideo" controls playsinline style="width:100%;max-height:360px;background:#000;border-radius:10px;"></video>
         </div>
 
         <div class="card">
-          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
-            <div class="tabs">
-              <button class="tab on" onclick="setSnippetTab('widget', this)">Website HTML Widget</button>
-              <button class="tab" onclick="setSnippetTab('iframe', this)">Iframe Player</button>
-              <button class="tab" onclick="setSnippetTab('curl', this)">cURL</button>
-              <button class="tab" onclick="setSnippetTab('js', this)">JavaScript</button>
-              <button class="tab" onclick="setSnippetTab('py', this)">Python</button>
-            </div>
-            <div id="respMeta" style="font-size:12px;color:var(--muted);">Ready</div>
+          <h2>3. Integration Code &amp; Response <span id="respMeta" style="font-size:12px;color:var(--muted);font-weight:500;">Ready</span></h2>
+          <div class="tabs">
+            <button class="tab on" onclick="setSnippetTab('widget', this)">Website HTML Widget</button>
+            <button class="tab" onclick="setSnippetTab('android', this)">Android APK (Kotlin)</button>
+            <button class="tab" onclick="setSnippetTab('iframe', this)">Iframe Player</button>
+            <button class="tab" onclick="setSnippetTab('js', this)">JavaScript</button>
+            <button class="tab" onclick="setSnippetTab('curl', this)">cURL</button>
           </div>
-          <div class="row" style="margin-bottom:10px;align-items:flex-start;">
-            <pre class="key-box" id="snippetBox" style="margin:0;flex:1;max-height:180px;font-family:monospace;font-size:11.5px;color:var(--blue);white-space:pre-wrap;word-break:break-word;">Generate or select a Trial Key to copy website integration code</pre>
+          <div style="margin-bottom:10px;">
+            <pre class="key-box" id="snippetBox" style="margin:0 0 8px;max-height:190px;font-family:monospace;color:var(--blue);">Paste your API Key above to generate ready Website &amp; Android APK integration code.</pre>
             <button class="sec sm" onclick="copyText(document.getElementById('snippetBox').textContent, this)">Copy Code</button>
           </div>
-          <pre id="respOut">Generate a Trial API Key on the left, then click any endpoint to test live MovieBox responses.</pre>
+          <pre id="respOut">Paste your API Key in step 1 and click Verify, then click any test button above (Home, Catalog 18+, Search, Details, or Play Video).</pre>
         </div>
       </div>
     </div>
   </div>
   <script>
     const ORIGIN = window.location.origin;
-    const STORAGE_KEY = 'cp_trial_keys_v1';
+    const STORAGE_KEY = 'cp_client_active_key_v1';
     let currentKey = '';
-    let currentManageToken = '';
-    let currentTrialData = null;
     let lastEndpoint = '/api/trial/home';
     let snippetMode = 'widget';
 
     function val(id) { return document.getElementById(id).value.trim(); }
-    function getSaved() {
-      try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; }
-    }
-    function saveKeyLocal(item) {
-      const list = getSaved().filter(x => x.key !== item.key);
-      list.unshift(item);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(list.slice(0, 15)));
-      renderSavedList();
-    }
     function copyText(txt, btn) {
       if (!txt) return;
       navigator.clipboard.writeText(txt).then(() => {
@@ -7822,24 +7752,14 @@ async function startServer() {
       btn.classList.add('on');
       updateSnippet();
     }
-    function getClientOrigin() {
-      const chk = document.getElementById('useShareOriginChk');
-      if (ORIGIN.indexOf('://ais-dev-') !== -1 && chk && chk.checked) {
-        return ORIGIN.replace('://ais-dev-', '://ais-pre-');
-      }
-      return ORIGIN;
-    }
-    if (ORIGIN.indexOf('://ais-dev-') !== -1) {
-      document.getElementById('devOriginBanner').style.display = 'block';
-    }
     function updateSnippet() {
-      const k = currentKey || 'YOUR_TRIAL_API_KEY';
-      const SHARE_BASE = getClientOrigin();
+      const k = currentKey || 'YOUR_API_KEY';
+      const SHARE_BASE = ORIGIN.indexOf('://ais-dev-') !== -1 ? ORIGIN.replace('://ais-dev-', '://ais-pre-') : ORIGIN;
       const url = SHARE_BASE + lastEndpoint;
       const box = document.getElementById('snippetBox');
       if (snippetMode === 'widget') {
         box.textContent = [
-          '<!-- 100% Direct API + Native Video Player (Zero Iframe) -->',
+          '<!-- Direct MovieBox API + HTML5 MP4 Player -->',
           '<div id="cp-moviebox-widget" style="background:#0b0c10;color:#fff;padding:16px;border-radius:12px;font-family:sans-serif">',
           '  <div style="display:flex;gap:8px;margin-bottom:12px">',
           '    <input id="cp-q" placeholder="Search Movie / Series..." style="flex:1;padding:10px;border-radius:8px;border:1px solid #333;background:#14161d;color:#fff" />',
@@ -7879,20 +7799,32 @@ async function startServer() {
           'cpLoadMovies();',
           '</' + 'script>',
         ].join('\\n');
+      } else if (snippetMode === 'android') {
+        box.textContent = [
+          '// Android OkHttp + ExoPlayer Example (Kotlin)',
+          'val client = OkHttpClient()',
+          'val req = Request.Builder()',
+          '  .url("' + SHARE_BASE + '/api/trial/stream?title=Squid+Game&se=1&ep=1")',
+          '  .addHeader("X-API-Key", "' + k + '")',
+          '  .build()',
+          '// Parse JSON -> sources[0].url -> pass directly to ExoPlayer:',
+          '// val mediaItem = MediaItem.fromUri(streamUrl)',
+          '// exoPlayer.setMediaItem(mediaItem); exoPlayer.prepare(); exoPlayer.play()',
+        ].join('\\n');
       } else if (snippetMode === 'iframe') {
         const title = encodeURIComponent(val('titleInput') || 'Squid Game');
         box.textContent = '<iframe src="' + SHARE_BASE + '/trial-embed?apiKey=' + k + '&title=' + title + '&se=1&ep=1" width="100%" height="460" allowfullscreen frameborder="0"></iframe>';
       } else if (snippetMode === 'curl') {
         box.textContent = 'curl -H "X-API-Key: ' + k + '" "' + url + '"';
-      } else if (snippetMode === 'js') {
-        box.textContent = 'fetch("' + url + '", { headers: { "X-API-Key": "' + k + '" } }).then(r => r.json()).then(console.log);';
       } else {
-        box.textContent = 'import requests; print(requests.get("' + url + '", headers={"X-API-Key": "' + k + '"}).json())';
+        box.textContent = 'fetch("' + url + '", { headers: { "X-API-Key": "' + k + '" } }).then(r => r.json()).then(console.log);';
       }
     }
     function renderActiveCard(t) {
-      currentTrialData = t;
+      document.getElementById('keyErrorMsg').style.display = 'none';
       document.getElementById('activeKeyCard').style.display = 'block';
+      document.getElementById('clientLabel').textContent = t.clientName || 'Client';
+      document.getElementById('planLabel').textContent = t.plan || '';
       document.getElementById('activeKeyText').textContent = t.key;
       const isUnlim = Boolean(t.unlimited || t.maxRequests < 0);
       const pct = isUnlim ? 100 : (t.maxRequests > 0 ? Math.round((t.remainingRequests / t.maxRequests) * 100) : 0);
@@ -7908,147 +7840,36 @@ async function startServer() {
       const badge = document.getElementById('keyStatusBadge');
       badge.textContent = t.status;
       badge.className = 'status-pill' + (t.status === 'ACTIVE' ? '' : ' bad');
-      document.getElementById('togglePauseBtn').textContent = t.active ? 'Pause' : 'Resume';
       updateSnippet();
-    }
-    function renderSavedList() {
-      const list = getSaved();
-      const wrap = document.getElementById('savedListWrap');
-      const box = document.getElementById('savedKeysList');
-      if (!list.length) { wrap.style.display = 'none'; return; }
-      wrap.style.display = 'block';
-      box.innerHTML = '';
-      list.forEach(item => {
-        const card = document.createElement('div');
-        card.className = 'saved-item' + (item.key === currentKey ? ' active' : '');
-        const top = document.createElement('div');
-        top.style.cssText = 'display:flex;justify-content:space-between;gap:6px;font-weight:700;align-items:center;';
-        const title = document.createElement('span');
-        title.textContent = (item.clientName || 'Client') + ' (' + (item.plan || '24H') + ')';
-        const btn = document.createElement('button');
-        btn.className = 'sec sm';
-        btn.textContent = 'Use';
-        btn.onclick = () => selectSavedKey(item.key, item.manageToken || '');
-        top.appendChild(title);
-        top.appendChild(btn);
-        const kDiv = document.createElement('div');
-        kDiv.style.cssText = 'font-family:monospace;color:var(--blue);margin-top:4px;word-break:break-all;';
-        kDiv.textContent = item.key;
-        card.appendChild(top);
-        card.appendChild(kDiv);
-        box.appendChild(card);
-      });
-    }
-    async function selectSavedKey(k, mt) {
-      currentKey = k;
-      currentManageToken = mt || '';
-      document.getElementById('activeKeyInput').value = k;
-      renderSavedList();
-      await loadKeyStatus();
-    }
-    async function createTrialKey() {
-      const msg = document.getElementById('createMsg');
-      msg.textContent = 'Generating live API key...';
-      try {
-        const hdrs = { 'Content-Type': 'application/json' };
-        const adm = val('adminKeyInput');
-        if (adm) hdrs['X-Trial-Admin'] = adm;
-        const res = await fetch(ORIGIN + '/api/trial/keys', {
-          method: 'POST',
-          headers: hdrs,
-          body: JSON.stringify({
-            clientName: val('clientName') || 'Client Trial',
-            plan: val('planSelect') || '24H',
-          }),
-        });
-        const data = await res.json();
-        if (!data.ok || !data.trial) {
-          msg.textContent = data.error || 'Failed to generate key';
-          return;
-        }
-        currentKey = data.trial.key;
-        currentManageToken = data.trial.manageToken || '';
-        document.getElementById('activeKeyInput').value = currentKey;
-        saveKeyLocal({
-          key: data.trial.key,
-          manageToken: currentManageToken,
-          clientName: data.trial.clientName,
-          plan: data.trial.plan,
-        });
-        renderActiveCard(data.trial);
-        msg.textContent = 'Key created & active! Ready to share or test.';
-        document.getElementById('respOut').textContent = JSON.stringify(data, null, 2);
-      } catch (e) {
-        msg.textContent = String(e);
-      }
     }
     async function loadKeyStatus() {
       const k = val('activeKeyInput') || currentKey;
-      if (!k) return;
+      const errEl = document.getElementById('keyErrorMsg');
+      if (!k) {
+        errEl.textContent = 'Please paste your API Key first.';
+        errEl.style.display = 'block';
+        return;
+      }
       currentKey = k;
-      const saved = getSaved().find(x => x.key === k);
-      if (saved && saved.manageToken) currentManageToken = saved.manageToken;
-      const res = await fetch(ORIGIN + '/api/trial/me?apiKey=' + encodeURIComponent(k));
-      const data = await res.json();
-      if (data.ok && data.trial) {
-        renderActiveCard(data.trial);
-      } else {
-        document.getElementById('keyStatusBadge').textContent = 'INVALID';
-        document.getElementById('keyStatusBadge').className = 'status-pill bad';
-        document.getElementById('respOut').textContent = JSON.stringify(data, null, 2);
+      try { localStorage.setItem(STORAGE_KEY, k); } catch {}
+      try {
+        const res = await fetch(ORIGIN + '/api/trial/me?apiKey=' + encodeURIComponent(k));
+        const data = await res.json();
+        if (data.ok && data.trial) {
+          renderActiveCard(data.trial);
+          document.getElementById('respOut').textContent = JSON.stringify(data, null, 2);
+        } else {
+          document.getElementById('keyStatusBadge').textContent = 'INVALID / BLOCKED';
+          document.getElementById('keyStatusBadge').className = 'status-pill bad';
+          document.getElementById('activeKeyCard').style.display = 'none';
+          errEl.textContent = data.error || 'Invalid, paused, or expired API Key.';
+          errEl.style.display = 'block';
+          document.getElementById('respOut').textContent = JSON.stringify(data, null, 2);
+        }
+      } catch (e) {
+        errEl.textContent = String(e);
+        errEl.style.display = 'block';
       }
-    }
-    async function togglePauseCurrentKey() {
-      const adm = val('adminKeyInput');
-      if (!currentKey || (!currentManageToken && !adm) || !currentTrialData) {
-        document.getElementById('createMsg').textContent = 'Enter Owner Admin Key or use a browser-created key to pause/resume.';
-        return;
-      }
-      const hdrs = { 'Content-Type': 'application/json' };
-      if (currentManageToken) hdrs['X-Trial-Manage-Token'] = currentManageToken;
-      if (adm) hdrs['X-Trial-Admin'] = adm;
-      const res = await fetch(ORIGIN + '/api/trial/keys/' + encodeURIComponent(currentKey), {
-        method: 'PATCH',
-        headers: hdrs,
-        body: JSON.stringify({ active: !currentTrialData.active }),
-      });
-      const data = await res.json();
-      if (data.ok && data.trial) renderActiveCard(data.trial);
-    }
-    async function extendCurrentKey30Days() {
-      const adm = val('adminKeyInput');
-      if (!currentKey || !adm) {
-        document.getElementById('createMsg').textContent = 'Enter Owner Admin Key above to add +30 Days.';
-        return;
-      }
-      const res = await fetch(ORIGIN + '/api/trial/keys/' + encodeURIComponent(currentKey), {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', 'X-Trial-Admin': adm },
-        body: JSON.stringify({ addHours: 720, unlimited: true }),
-      });
-      const data = await res.json();
-      if (data.ok && data.trial) {
-        renderActiveCard(data.trial);
-        document.getElementById('createMsg').textContent = 'Extended +30 Days (Unlimited requests)!';
-      } else {
-        document.getElementById('createMsg').textContent = data.error || 'Failed to extend key';
-      }
-    }
-    async function loadAllAdminKeys() {
-      const adm = val('adminKeyInput');
-      if (!adm) {
-        document.getElementById('createMsg').textContent = 'Enter Owner Admin Key above to view all clients.';
-        return;
-      }
-      const res = await fetch(ORIGIN + '/api/trial/admin/keys', { headers: { 'X-Trial-Admin': adm } });
-      const data = await res.json();
-      if (!data.ok || !Array.isArray(data.keys)) {
-        document.getElementById('createMsg').textContent = data.error || 'Invalid Admin Key';
-        return;
-      }
-      data.keys.forEach(t => saveKeyLocal({ key: t.key, manageToken: '', clientName: t.clientName, plan: t.plan }));
-      document.getElementById('createMsg').textContent = 'Loaded ' + data.keys.length + ' client keys from server.';
-      document.getElementById('respOut').textContent = JSON.stringify(data, null, 2);
     }
     function showPreviewPlayer(parsed, autoPlay) {
       const mp4s = (parsed.sources || []).filter(function(s) { return s.type === 'mp4' && s.url; });
@@ -8085,10 +7906,15 @@ async function startServer() {
       document.getElementById('previewPlayerBox').style.display = 'none';
     }
     async function callTrial(path, autoPlay) {
-      if (!currentKey) {
-        await createTrialKey();
-        if (!currentKey) return;
+      const k = val('activeKeyInput') || currentKey;
+      if (!k) {
+        const errEl = document.getElementById('keyErrorMsg');
+        errEl.textContent = 'Please paste your API Key in Box 1 first, then click any test button.';
+        errEl.style.display = 'block';
+        document.getElementById('activeKeyInput').focus();
+        return;
       }
+      currentKey = k;
       lastEndpoint = path;
       updateSnippet();
       const fullUrl = ORIGIN + path;
@@ -8112,32 +7938,20 @@ async function startServer() {
         document.getElementById('respOut').textContent = String(e);
       }
     }
-    function copyClientInvite(btn) {
-      if (!currentKey || !currentTrialData) return;
-      const SHARE_BASE = getClientOrigin();
-      const quotaLabel = (currentTrialData.unlimited || currentTrialData.maxRequests < 0)
-        ? 'UNLIMITED'
-        : (currentTrialData.maxRequests + ' Requests');
-      const msg = [
-        'MovieBox Direct API Credentials (' + currentTrialData.clientName + ' - ' + currentTrialData.plan + '):',
-        '',
-        'Base URL: ' + SHARE_BASE + '/api/trial',
-        'API Key: ' + currentKey,
-        'Quota: ' + quotaLabel + ' | Expires: ' + currentTrialData.expiresAt,
-        'Live Tester Portal: ' + SHARE_BASE + '/trial',
-        '',
-        'Sample Endpoints (pass header X-API-Key or ?apiKey=):',
-        '- Home: ' + SHARE_BASE + '/api/trial/home?apiKey=' + currentKey,
-        '- Search: ' + SHARE_BASE + '/api/trial/search?q=Squid+Game&apiKey=' + currentKey,
-        '- Details: ' + SHARE_BASE + '/api/trial/details?title=Squid+Game&apiKey=' + currentKey,
-        '- Stream: ' + SHARE_BASE + '/api/trial/stream?title=Squid+Game&se=1&ep=1&apiKey=' + currentKey,
-      ].join('\\n');
-      copyText(msg, btn);
-    }
-    renderSavedList();
-    const first = getSaved()[0];
-    if (first) selectSavedKey(first.key, first.manageToken);
-    else updateSnippet();
+    (function initClientPortal() {
+      const params = new URLSearchParams(window.location.search);
+      const qKey = (params.get('apiKey') || params.get('key') || '').trim();
+      let savedKey = '';
+      try { savedKey = localStorage.getItem(STORAGE_KEY) || ''; } catch {}
+      const initKey = qKey || savedKey;
+      if (initKey) {
+        currentKey = initKey;
+        document.getElementById('activeKeyInput').value = initKey;
+        loadKeyStatus();
+      } else {
+        updateSnippet();
+      }
+    })();
   </script>
 </body>
 </html>`);
