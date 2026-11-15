@@ -3646,6 +3646,20 @@ export default function App() {
                 </div>
                 <ChevronRight className="w-4 h-4 text-gray-400" />
               </button>
+
+              {/* Row: Client Trial API Portal */}
+              <a
+                href="/trial"
+                className="w-full px-4 py-4 border-t border-white/[0.04] hover:bg-white/[0.03] flex items-center justify-between transition-colors"
+              >
+                <div className="flex items-center gap-3">
+                  <ShieldCheck className="w-5 h-5 text-[#00e68a]" />
+                  <span className="text-[15px] font-medium text-gray-100">
+                    Client Trial API Portal
+                  </span>
+                </div>
+                <ChevronRight className="w-4 h-4 text-gray-400" />
+              </a>
             </div>
           </main>
         )}

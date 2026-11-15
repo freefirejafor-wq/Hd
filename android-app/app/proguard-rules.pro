@@ -1,0 +1,2 @@
+-keep class com.cinepulse.app.** { *; }
+-dontwarn androidx.media3.**

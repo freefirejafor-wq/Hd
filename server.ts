@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { spawn, type ChildProcess } from 'child_process';
 import crypto from 'crypto';
 import express from 'express';
@@ -211,10 +212,12 @@ function storeDetailInCaches(itemPath: string, det: MovieDetailData, expiresAt: 
   }
   if (det.title && det.episodes?.length) {
     pruneCacheMap(detailTitleCache, 240);
+    const isMbSource = Boolean(itemPath.startsWith('/mb/') || det.url?.startsWith('/mb/'));
+    const scopePrefix = isMbSource ? 'mb::' : 'ml::';
     const canon = getCanonicalTitleKey(det.title);
-    if (canon) detailTitleCache.set(canon, { data: det, expiresAt: safeExpiresAt });
+    if (canon) detailTitleCache.set(`${scopePrefix}${canon}`, { data: det, expiresAt: safeExpiresAt });
     const base = extractBaseSeriesTitle(det.title).toLowerCase();
-    if (base) detailTitleCache.set(base, { data: det, expiresAt: safeExpiresAt });
+    if (base) detailTitleCache.set(`${scopePrefix}${base}`, { data: det, expiresAt: safeExpiresAt });
   }
 }
 
@@ -225,19 +228,36 @@ function findCachedDetailByPathOrTitle(itemPath: string, rawTitle = ''): MovieDe
     if (hit && hit.expiresAt > now && hit.data?.episodes?.length) {
       return hit.data;
     }
-    // Never fall back to stripped base title cache for distinct /mb/<subjectId>/ paths,
-    // because different language dubs (e.g. Original vs Hindi dub) have distinct subjectIds!
+    // Never fall back to stripped title cache for distinct paths across MovieBox or MovieLinkBD,
+    // so distinct seasons/dubs (e.g. MovieBox Bachelor Point vs MovieLinkBD S05 Ep 129-134) never collide!
     if (itemPath.startsWith('/mb/')) {
       return null;
     }
+    if (rawTitle) {
+      const canon = getCanonicalTitleKey(rawTitle);
+      const byMlCanon = canon ? detailTitleCache.get(`ml::${canon}`) : undefined;
+      if (
+        byMlCanon &&
+        byMlCanon.expiresAt > now &&
+        byMlCanon.data?.episodes?.length &&
+        !byMlCanon.data.url?.startsWith('/mb/')
+      ) {
+        return byMlCanon.data;
+      }
+    }
+    return null;
   }
   if (rawTitle) {
     const canon = getCanonicalTitleKey(rawTitle);
-    const byCanon = canon ? detailTitleCache.get(canon) : undefined;
-    if (byCanon && byCanon.expiresAt > now && byCanon.data?.episodes?.length) return byCanon.data;
+    for (const pfx of ['mb::', 'ml::', '']) {
+      const byCanon = canon ? detailTitleCache.get(`${pfx}${canon}`) : undefined;
+      if (byCanon && byCanon.expiresAt > now && byCanon.data?.episodes?.length) return byCanon.data;
+    }
     const base = extractBaseSeriesTitle(rawTitle).toLowerCase();
-    const byBase = base ? detailTitleCache.get(base) : undefined;
-    if (byBase && byBase.expiresAt > now && byBase.data?.episodes?.length) return byBase.data;
+    for (const pfx of ['mb::', 'ml::', '']) {
+      const byBase = base ? detailTitleCache.get(`${pfx}${base}`) : undefined;
+      if (byBase && byBase.expiresAt > now && byBase.data?.episodes?.length) return byBase.data;
+    }
   }
   return null;
 }
@@ -1998,9 +2018,13 @@ function mapCategoryToMovieBoxFilter(rawPath: string, page = 1): Record<string, 
   } else if (p.includes('malaysian')) {
     payload.channelId = 1;
     payload.country = 'Malaysia';
-  } else if (p.includes('adult18plus')) {
+  } else if (p.includes('adult18plus') || p.includes('18plus') || p === '/genre/adult') {
     payload.channelId = 1;
-    payload.genre = 'Romance';
+    payload.genre = 'Adult';
+    payload.sort = 'Hottest';
+  } else if (p === '/genre/erotic') {
+    payload.channelId = 1;
+    payload.genre = 'Erotic';
     payload.sort = 'Hottest';
   } else if (p.includes('action') || p.includes('superhero')) {
     payload.channelId = 1;
@@ -2722,11 +2746,11 @@ async function fetchMovieBoxCatalog(
     secondaryPromises.unshift(fetchQuickKeyword('[Punjabi]', 2200), fetchQuickKeyword('Punjabi', 2200));
   } else if (normalizedRawPath.includes('bangla-dubbed') || normalizedRawPath.includes('best-bangla-dubbed')) {
     secondaryPromises.unshift(fetchQuickKeyword('[Bengali]', 2200), fetchQuickKeyword('Bangla Dubbed', 2200));
-  } else if (normalizedRawPath.includes('adult18plus')) {
+  } else if (normalizedRawPath.includes('adult18plus') || normalizedRawPath.includes('18plus') || normalizedRawPath === '/genre/adult' || normalizedRawPath === '/genre/erotic') {
     secondaryPromises.unshift(
-      fetchQuickKeyword('American Kamasutra', 2200),
-      fetchQuickKeyword('365 Days', 2200),
-      fetchQuickKeyword('Fifty Shades', 2200)
+      fetchFastFilter({ page, perPage: 28, channelId: 1, genre: 'Erotic', sort: 'Hottest' }, 2000),
+      fetchFastFilter({ page, perPage: 28, channelId: 2, genre: 'Adult', sort: 'Hottest' }, 2000),
+      fetchFastFilter({ page, perPage: 28, channelId: 1, genre: 'Adult', sort: 'Latest' }, 2000)
     );
   } else if (filterPayload.channelId === 1 && (normalizedRawPath === '/' || normalizedRawPath === '/mostwatch/7d')) {
     secondaryPromises.push(
@@ -4403,28 +4427,48 @@ async function startServer() {
     { buf: Buffer; contentType: string; expiresAt: number }
   >();
 
+  let isActiveTrialStreamToken = (_token: string): boolean => false;
+
   app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    if (req.path !== '/trial-embed') {
+      res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    }
+
+    const trialTkEarly = typeof req.query.tk === 'string' ? String(req.query.tk).trim() : '';
+    const isPublicApiOrTrialStream =
+      req.path.startsWith('/api/demo') ||
+      req.path.startsWith('/api/trial') ||
+      ((req.path.startsWith('/api/mb-stream') || req.path.startsWith('/api/mb-subtitle-srt')) &&
+        Boolean(trialTkEarly && isActiveTrialStreamToken(trialTkEarly)));
 
     const origin = String(req.headers.origin || '');
-    if (
-      origin &&
-      (origin.includes('playlive.zeroo.click') ||
-        origin.includes('zeroo.click') ||
-        origin.includes('chinepulse.71i.site') ||
-        origin.includes('71i.site') ||
-        origin.includes('localhost') ||
-        origin.includes('127.0.0.1') ||
-        origin.includes('.run.app'))
-    ) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
+    if (isPublicApiOrTrialStream) {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Content-Type, Accept, Range, X-API-Key, Authorization, X-Trial-Manage-Token, X-Trial-Admin'
+      );
+    } else {
+      if (
+        origin &&
+        (origin.includes('playlive.zeroo.click') ||
+          origin.includes('zeroo.click') ||
+          origin.includes('chinepulse.71i.site') ||
+          origin.includes('71i.site') ||
+          origin.includes('localhost') ||
+          origin.includes('127.0.0.1') ||
+          origin.includes('.run.app'))
+      ) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+      }
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader(
+        'Access-Control-Allow-Headers',
+        'Content-Type, Range, X-CP-Ts, X-CP-Sig, X-CP-Client'
+      );
     }
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader(
-      'Access-Control-Allow-Headers',
-      'Content-Type, Range, X-CP-Ts, X-CP-Sig, X-CP-Client'
-    );
     if (req.method === 'OPTIONS') {
       res.status(204).end();
       return;
@@ -4504,7 +4548,13 @@ async function startServer() {
       }
     }
 
-    if (req.path.startsWith('/api/')) {
+    if (
+      req.path.startsWith('/api/') &&
+      req.path !== '/api/download-apk' &&
+      !req.path.startsWith('/api/demo') &&
+      !req.path.startsWith('/api/trial') &&
+      !req.path.startsWith('/api/owner')
+    ) {
       const ua = String(req.headers['user-agent'] || '');
       const clientIp = String(
         req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'local'
@@ -4529,10 +4579,17 @@ async function startServer() {
         req.path.startsWith('/api/go') ||
         req.path.startsWith('/api/ios-hls');
 
-      // 2. Anti-hotlinking check on stream routes (block third-party sites embedding our streams)
+      // 2. Anti-hotlinking check on stream routes (allow third-party client sites ONLY with a valid active ?tk= trial key)
       const referer = String(req.headers.referer || '').toLowerCase();
+      const trialStreamTk = typeof req.query.tk === 'string' ? String(req.query.tk).trim() : '';
+      const hasValidTrialTk = Boolean(trialStreamTk && isActiveTrialStreamToken(trialStreamTk));
+      if (isStreamOrSubRoute && trialStreamTk && !hasValidTrialTk) {
+        res.status(403).send('Trial stream key expired, paused, or invalid');
+        return;
+      }
       if (
         isStreamOrSubRoute &&
+        !hasValidTrialTk &&
         referer &&
         !referer.includes('playlive.zeroo.click') &&
         !referer.includes('zeroo.click') &&
@@ -5097,10 +5154,7 @@ async function startServer() {
         let mbDetail = await fetchMovieBoxDetail(targetMbPath);
         if (mbDetail) {
           mbDetail = ensureDetailDubsAndUploader(attachFastRelatedSeasons(mbDetail));
-          storeDetailInCaches(rawPath || targetMbPath, mbDetail, Date.now() + 12 * 60_000);
-          if (targetMbPath !== rawPath) {
-            storeDetailInCaches(targetMbPath, mbDetail, Date.now() + 12 * 60_000);
-          }
+          storeDetailInCaches(targetMbPath, mbDetail, Date.now() + 12 * 60_000);
           res.json({ ok: true, detail: mbDetail });
           return;
         }
@@ -5166,9 +5220,9 @@ async function startServer() {
     }
 
     // Virtual Stream Window Sizes:
-    // 4MB startup burst + 6MB rolling window delivers instant TTFB through proxy and fast seeking!
-    const INITIAL_BURST_CHUNK_BYTES = 4 * 1024 * 1024;
-    const PLAYBACK_MICRO_CHUNK_BYTES = 6 * 1024 * 1024;
+    // 1MB startup burst + 3MB rolling window delivers sub-second TTFB on mobile networks & proxies!
+    const INITIAL_BURST_CHUNK_BYTES = 1024 * 1024;
+    const PLAYBACK_MICRO_CHUNK_BYTES = 3 * 1024 * 1024;
 
     let requestedStart = 0;
     let requestedEnd = NaN;
@@ -5180,11 +5234,10 @@ async function startServer() {
       }
     }
 
-    // 1. Check Virtual Micro-Chunk RAM Cache (Only serve from RAM if the client requested an explicit range that fits inside ramHit.buf, or if probing the tail atom)
+    // 1. Check Virtual Micro-Chunk RAM Cache
     if (!isDownload && req.method !== 'HEAD') {
       const ramHit = mbStartupChunkCache.get(targetUrl);
-      if (ramHit && ramHit.expiresAt > Date.now()) {
-        // Case A: Explicit bounded range that fits completely within our cached front header
+      if (ramHit && ramHit.expiresAt > Date.now() && ramHit.buf.length > 32768) {
         if (
           !Number.isNaN(requestedEnd) &&
           requestedStart < ramHit.buf.length &&
@@ -5205,13 +5258,29 @@ async function startServer() {
           res.end(chunk);
           return;
         }
+        if (requestedStart === 0 && Number.isNaN(requestedEnd) && ramHit.buf.length >= 262144) {
+          const chunk = ramHit.buf;
+          res.status(206);
+          res.setHeader('Content-Type', ramHit.contentType || 'video/mp4');
+          res.setHeader('Accept-Ranges', 'bytes');
+          res.setHeader('Cache-Control', 'public, max-age=3600');
+          res.setHeader('X-Cache', 'VIRTUAL-CHUNK-RAM-HIT');
+          res.setHeader('Content-Length', String(chunk.length));
+          res.setHeader(
+            'Content-Range',
+            `bytes 0-${chunk.length - 1}/${ramHit.totalSize}`
+          );
+          res.end(chunk);
+          return;
+        }
       }
     }
 
+    const chromeUa =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+    const isMlbdStream = /workers\.dev|r2\.dev|fsldownload|movielinkbd|pixeldrain/i.test(targetUrl);
     const forwardHeaders: Record<string, string> = {
-      'User-Agent': 'okhttp/4.12.0',
-      Referer: 'https://moviebox.ph/',
-      Origin: 'https://moviebox.ph',
+      'User-Agent': isMlbdStream ? chromeUa : 'okhttp/4.12.0',
       Accept: '*/*',
     };
 
@@ -5232,11 +5301,11 @@ async function startServer() {
 
     try {
       let upstream: http.IncomingMessage | null = null;
-      const isMlbdStream = /workers\.dev|r2\.dev|fsldownload|movielinkbd/i.test(targetUrl);
-      const refererCandidates = isMlbdStream
+      const refererCandidates: Record<string, string>[] = isMlbdStream
         ? [
-            { Referer: `${activeMovieLinkBdOrigin}/`, Origin: activeMovieLinkBdOrigin },
-            { Referer: 'https://movielinkbd.at/', Origin: 'https://movielinkbd.at' },
+            { 'User-Agent': chromeUa },
+            { 'User-Agent': 'okhttp/4.12.0' },
+            { 'User-Agent': chromeUa, Referer: `${activeMovieLinkBdOrigin}/` },
           ]
         : [
             { Referer: 'https://moviebox.ph/', Origin: 'https://moviebox.ph' },
@@ -5249,7 +5318,7 @@ async function startServer() {
             targetUrl,
             req.method === 'HEAD' ? 'HEAD' : 'GET',
             { ...forwardHeaders, ...refererCandidates[attempt] },
-            5000
+            8000
           );
           if (candidateRes.statusCode === 200 || candidateRes.statusCode === 206) {
             upstream = candidateRes;
@@ -5270,7 +5339,7 @@ async function startServer() {
         try {
           const fbHeaders: Record<string, string> = {
             'User-Agent': forwardHeaders['User-Agent'],
-            Referer: 'https://moviebox.ph/',
+            Referer: isMlbdStream ? `${activeMovieLinkBdOrigin}/` : 'https://moviebox.ph/',
             Accept: '*/*',
           };
           if (forwardHeaders.Range) fbHeaders.Range = forwardHeaders.Range;
@@ -5278,7 +5347,7 @@ async function startServer() {
             fallbackUrl,
             req.method === 'HEAD' ? 'HEAD' : 'GET',
             fbHeaders,
-            5000
+            8000
           );
           if (fbRes.statusCode === 200 || fbRes.statusCode === 206) {
             upstream = fbRes;
@@ -5288,6 +5357,68 @@ async function startServer() {
         } catch {
           // ignore fallback error
         }
+      }
+
+      // If Node https.request received 403/5xx from a Cloudflare Worker/CDN, fall back to undici HTTP/2 fetch!
+      if (!upstream || (upstream.statusCode !== 200 && upstream.statusCode !== 206)) {
+        try {
+          const undiciHeaders: Record<string, string> = {
+            'User-Agent': chromeUa,
+            Accept: '*/*',
+          };
+          if (forwardHeaders.Range) undiciHeaders.Range = forwardHeaders.Range;
+          const fRes = await fetch(targetUrl, {
+            method: req.method === 'HEAD' ? 'HEAD' : 'GET',
+            headers: undiciHeaders,
+            signal: AbortSignal.timeout(8000),
+          });
+          if (fRes.status === 200 || fRes.status === 206) {
+            let ct = String(fRes.headers.get('content-type') || 'video/mp4')
+              .split(';')[0]
+              .trim();
+            if (!ct || ct === 'application/octet-stream' || ct === 'binary/octet-stream') {
+              ct = /\.mkv(\?|$)/i.test(targetUrl) ? 'video/x-matroska' : 'video/mp4';
+            }
+            const cr = String(fRes.headers.get('content-range') || '');
+            const cl = fRes.headers.get('content-length');
+            res.status(fRes.status);
+            res.setHeader('Content-Type', ct);
+            res.setHeader('Accept-Ranges', String(fRes.headers.get('accept-ranges') || 'bytes'));
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            res.setHeader('X-Cache', 'VIRTUAL-CHUNK-FETCH');
+            if (cl) res.setHeader('Content-Length', cl);
+            if (cr) res.setHeader('Content-Range', cr);
+            if (isDownload) {
+              res.setHeader(
+                'Content-Disposition',
+                `attachment; filename="${rawFilename.endsWith('.mp4') ? rawFilename : `${rawFilename}.mp4`}"`
+              );
+            }
+            if (req.method === 'HEAD' || !fRes.body) {
+              res.end();
+              return;
+            }
+            const { Readable } = await import('stream');
+            const nodeStream = Readable.fromWeb(fRes.body as any);
+            res.on('close', () => {
+              if (!res.writableEnded) nodeStream.destroy();
+            });
+            nodeStream.pipe(res);
+            return;
+          }
+        } catch {
+          // ignore fetch fallback error
+        }
+      }
+
+      if (
+        isMlbdStream &&
+        (!upstream || upstream.statusCode === 403 || upstream.statusCode === 429) &&
+        targetUrl.startsWith('http')
+      ) {
+        res.setHeader('Referrer-Policy', 'no-referrer');
+        res.redirect(302, targetUrl);
+        return;
       }
 
       if (!upstream || (upstream.statusCode !== 200 && upstream.statusCode !== 206)) {
@@ -5303,7 +5434,16 @@ async function startServer() {
         }
       });
 
-      const contentType = String(upstream.headers['content-type'] || 'video/mp4');
+      let contentType = String(upstream.headers['content-type'] || 'video/mp4')
+        .split(';')[0]
+        .trim();
+      if (
+        !contentType ||
+        contentType === 'application/octet-stream' ||
+        contentType === 'binary/octet-stream'
+      ) {
+        contentType = /\.mkv(\?|$)/i.test(targetUrl) ? 'video/x-matroska' : 'video/mp4';
+      }
       const contentRange = String(upstream.headers['content-range'] || '');
       const contentLength = upstream.headers['content-length'];
 
@@ -5924,6 +6064,3744 @@ async function startServer() {
     } catch (err: any) {
       res.status(500).json({ ok: false, error: err?.message || 'Stream resolution failed' });
     }
+  });
+
+  // ==========================================================================================
+  // 6a-4. PUBLIC MOVIEBOX DEMO API (/api/demo/*) & INTERACTIVE API EXPLORER (/demo-api)
+  // ==========================================================================================
+  const demoApiRateMap = new Map<string, { count: number; resetAt: number }>();
+
+  const getPublicOrigin = (req: express.Request) => {
+    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https')
+      .split(',')[0]
+      .trim();
+    const host = String(req.headers['x-forwarded-host'] || req.get('host') || 'localhost:3000')
+      .split(',')[0]
+      .trim();
+    return `${proto}://${host}`;
+  };
+
+  const sendPrettyDemoJson = (res: express.Response, status: number, payload: unknown) => {
+    res.status(status);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=30');
+    res.send(JSON.stringify(payload, null, 2));
+  };
+
+  app.use('/api/demo', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    if (req.method !== 'GET') {
+      sendPrettyDemoJson(res, 405, { ok: false, error: 'Demo API is read-only (GET only).' });
+      return;
+    }
+    const clientIp = String(
+      req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'local'
+    )
+      .split(',')[0]
+      .trim();
+    const now = Date.now();
+    const rl = demoApiRateMap.get(clientIp);
+    if (!rl || now > rl.resetAt) {
+      if (demoApiRateMap.size > 2000) demoApiRateMap.clear();
+      demoApiRateMap.set(clientIp, { count: 1, resetAt: now + 60_000 });
+    } else {
+      rl.count++;
+      if (rl.count > 45) {
+        sendPrettyDemoJson(res, 429, {
+          ok: false,
+          error: 'Demo rate limit exceeded (max 45 requests/minute per IP).',
+        });
+        return;
+      }
+    }
+    next();
+  });
+
+  app.get(['/api/demo', '/api/demo/status'], (req, res) => {
+    const base = getPublicOrigin(req);
+    sendPrettyDemoJson(res, 200, {
+      ok: true,
+      mode: 'PUBLIC_DEMO_API',
+      service: 'CinePulse MovieBox Demo API v1',
+      rateLimit: '45 requests / minute per IP (GET read-only)',
+      interactiveExplorer: `${base}/demo-api`,
+      endpoints: {
+        status: `${base}/api/demo/status`,
+        home: `${base}/api/demo/home`,
+        catalog: `${base}/api/demo/catalog?category=/bollywood&page=1`,
+        search: `${base}/api/demo/search?q=Squid+Game`,
+        details: `${base}/api/demo/details?title=Squid+Game`,
+        stream: `${base}/api/demo/stream?title=Squid+Game&se=1&ep=1`,
+      },
+      categories: [
+        '/',
+        '/bollywood',
+        '/hollywood',
+        '/bangla',
+        '/korean',
+        '/anime',
+        '/hindi-dubbed',
+        '/web-series',
+      ],
+      notes: [
+        'Demo responses are unencrypted pretty JSON with CORS enabled for quick browser, Postman, and cURL testing.',
+        'List outputs are capped at 12 items per request and pagination is capped at page 3 in Demo mode.',
+      ],
+    });
+  });
+
+  app.get('/api/demo/home', async (req, res) => {
+    const base = getPublicOrigin(req);
+    try {
+      const [homePayload, mainCat] = await Promise.all([
+        fetchMovieBoxHomePayload(),
+        fetchMovieBoxCatalog('/', 1, ''),
+      ]);
+      const trending = normalizeMovieCardList(mainCat.items)
+        .slice(0, 12)
+        .map((item) => ({
+          ...item,
+          demoDetailsUrl: `${base}/api/demo/details?path=${encodeURIComponent(item.path)}`,
+        }));
+      const sections = (homePayload.sections || []).slice(0, 4).map((sec) => ({
+        title: sec.title,
+        items: (sec.items || []).slice(0, 8).map((item) => ({
+          ...item,
+          demoDetailsUrl: `${base}/api/demo/details?path=${encodeURIComponent(item.path)}`,
+        })),
+      }));
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        mode: 'DEMO',
+        totalSections: sections.length,
+        sections,
+        trending,
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Failed to load demo home' });
+    }
+  });
+
+  app.get('/api/demo/catalog', async (req, res) => {
+    const base = getPublicOrigin(req);
+    const category = String(req.query.category || req.query.path || '/').trim() || '/';
+    const page = Math.min(3, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
+    const limit = Math.min(12, Math.max(1, parseInt(String(req.query.limit || '12'), 10) || 12));
+    const search = String(req.query.q || req.query.search || '').trim();
+    try {
+      const result = await fetchMovieBoxCatalog(category, page, search);
+      const items = normalizeMovieCardList(result.items)
+        .slice(0, limit)
+        .map((item) => ({
+          ...item,
+          demoDetailsUrl: `${base}/api/demo/details?path=${encodeURIComponent(item.path)}`,
+        }));
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        mode: 'DEMO',
+        category,
+        page,
+        demoMaxPage: 3,
+        count: items.length,
+        items,
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Demo catalog query failed' });
+    }
+  });
+
+  app.get('/api/demo/search', async (req, res) => {
+    const base = getPublicOrigin(req);
+    const query = String(req.query.q || req.query.keyword || req.query.search || 'Squid Game').trim();
+    const page = Math.min(3, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
+    try {
+      const result = await fetchMovieBoxCatalog('/', page, query);
+      const items = normalizeMovieCardList(result.items)
+        .slice(0, 12)
+        .map((item) => ({
+          ...item,
+          demoDetailsUrl: `${base}/api/demo/details?path=${encodeURIComponent(item.path)}`,
+        }));
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        mode: 'DEMO',
+        query,
+        page,
+        count: items.length,
+        items,
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Demo search failed' });
+    }
+  });
+
+  app.get('/api/demo/details', async (req, res) => {
+    const base = getPublicOrigin(req);
+    const rawPath = String(req.query.path || req.query.url || '').trim();
+    const subjectId = String(req.query.id || req.query.subjectId || '').trim();
+    const slug = String(req.query.slug || req.query.detailPath || 'movie').trim();
+    const titleQuery = String(req.query.title || '').trim();
+
+    let targetPath = rawPath;
+    if (!targetPath && subjectId) {
+      targetPath = `/mb/${subjectId}/${slug}`;
+    }
+
+    try {
+      if (!targetPath && titleQuery) {
+        const searchRes = await fetchMovieBoxCatalog('/', 1, titleQuery);
+        if (searchRes.items.length > 0) {
+          targetPath = searchRes.items[0].path;
+        }
+      }
+      if (!targetPath || !targetPath.startsWith('/mb/')) {
+        sendPrettyDemoJson(res, 400, {
+          ok: false,
+          error: 'Provide ?title=<movie_name>, ?path=/mb/<subjectId>/<slug>, or ?id=<subjectId>',
+          example: `${base}/api/demo/details?title=Squid+Game`,
+        });
+        return;
+      }
+
+      const detail =
+        findCachedDetailByPathOrTitle(targetPath, titleQuery) || (await fetchMovieBoxDetail(targetPath));
+      storeDetailInCaches(targetPath, detail, Date.now() + 12 * 60_000);
+
+      const parts = targetPath.replace(/^\/mb\//, '').split('/');
+      const resolvedId = parts[0] || subjectId;
+      const resolvedSlug = parts[1] || slug;
+      const seasons = Array.from(
+        new Set((detail.episodes || []).map((e) => e.season).filter((s): s is number => s !== null && s > 0))
+      ).sort((a, b) => a - b);
+      const demoEpisodes = (detail.episodes || []).slice(0, 24).map((ep) => ({
+        ...ep,
+        demoStreamUrl: `${base}/api/demo/stream?subjectId=${encodeURIComponent(
+          resolvedId
+        )}&detailPath=${encodeURIComponent(resolvedSlug)}&se=${ep.season ?? 0}&ep=${
+          ep.number ?? 0
+        }&title=${encodeURIComponent(detail.title)}`,
+      }));
+
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        mode: 'DEMO',
+        subjectId: resolvedId,
+        detailPath: resolvedSlug,
+        totalSeasons: seasons.length || (detail.typeBadge === 'SERIES' ? 1 : 0),
+        seasons,
+        totalEpisodes: detail.episodes?.length || 0,
+        demoStreamUrl: `${base}/api/demo/stream?subjectId=${encodeURIComponent(
+          resolvedId
+        )}&detailPath=${encodeURIComponent(resolvedSlug)}&se=${seasons[0] || 0}&ep=${
+          demoEpisodes[0]?.number ?? 0
+        }&title=${encodeURIComponent(detail.title)}`,
+        detail: {
+          ...detail,
+          episodes: demoEpisodes,
+        },
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Demo details failed' });
+    }
+  });
+
+  app.get('/api/demo/stream', async (req, res) => {
+    const base = getPublicOrigin(req);
+    let subjectId = String(req.query.subjectId || req.query.id || '').trim();
+    let detailPath = String(req.query.detailPath || req.query.slug || 'movie').trim();
+    const se = Math.max(0, parseInt(String(req.query.se || req.query.season || '0'), 10) || 0);
+    const ep = Math.max(0, parseInt(String(req.query.ep || req.query.episode || '0'), 10) || 0);
+    let title = String(req.query.title || detailPath).trim();
+    const lang = String(req.query.lang || 'Original Audio').trim();
+
+    try {
+      if (!subjectId && title && title !== 'movie') {
+        const searchRes = await fetchMovieBoxCatalog('/', 1, title);
+        const firstPath = searchRes.items[0]?.path || '';
+        if (firstPath.startsWith('/mb/')) {
+          const segs = firstPath.replace(/^\/mb\//, '').split('/');
+          subjectId = segs[0] || '';
+          detailPath = segs[1] || detailPath;
+          title = searchRes.items[0]?.title || title;
+        }
+      }
+
+      if (!subjectId) {
+        sendPrettyDemoJson(res, 400, {
+          ok: false,
+          error: 'Provide ?subjectId=<id>&detailPath=<slug> or ?title=<name>',
+          example: `${base}/api/demo/stream?title=Squid+Game&se=1&ep=1`,
+        });
+        return;
+      }
+
+      const [initialPlayRes, imdbId] = await Promise.all([
+        fetchMovieBoxPlayStreams(subjectId, detailPath, se, ep, title, lang, ''),
+        Promise.race([
+          resolveImdbIdForTitle(title, '', se > 0),
+          new Promise<string>((r) => setTimeout(() => r(''), 650)),
+        ]),
+      ]);
+      let playRes = initialPlayRes;
+      if (playRes.sources.length === 0 && se > 1) {
+        const fbSe1 = await fetchMovieBoxPlayStreams(subjectId, detailPath, 1, ep, title, lang, '');
+        if (fbSe1.sources.length > 0) playRes = fbSe1;
+      }
+      const embedBackups = buildEmbedBackupSources(imdbId, se, ep, title, lang);
+      const toAbsolute = (u: string) => (u.startsWith('/') ? `${base}${u}` : u);
+
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        mode: 'DEMO',
+        subjectId,
+        detailPath,
+        title,
+        season: se,
+        episode: ep,
+        imdbId: imdbId || null,
+        directMp4Count: playRes.sources.length,
+        cloudHlsCount: embedBackups.length,
+        sources: [...playRes.sources, ...embedBackups].slice(0, 8).map((s) => ({
+          id: s.id,
+          quality: s.quality,
+          qualityLabel: s.qualityLabel,
+          audio: s.audio,
+          provider: s.provider,
+          type: s.type,
+          url: toAbsolute(s.url),
+          downloadUrl: s.downloadUrl ? toAbsolute(s.downloadUrl) : undefined,
+        })),
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Demo stream lookup failed' });
+    }
+  });
+
+  app.get('/demo-api', (req, res) => {
+    const base = getPublicOrigin(req);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CinePulse MovieBox Demo API Explorer</title>
+  <style>
+    :root { color-scheme: dark; --bg:#09090b; --card:#121318; --border:#27272a; --accent:#e50914; --text:#f4f4f5; --muted:#a1a1aa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); padding: 24px 16px 48px; }
+    .wrap { max-width: 1020px; margin: 0 auto; }
+    .head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 20px; }
+    .brand { display: flex; align-items: center; gap: 10px; font-size: 20px; font-weight: 800; letter-spacing: -0.02em; }
+    .dot { width: 10px; height: 10px; border-radius: 999px; background: #22c55e; box-shadow: 0 0 10px #22c55e; }
+    .badge { font-size: 12px; padding: 4px 10px; border-radius: 6px; background: #1f1f23; border: 1px solid var(--border); color: var(--muted); }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+    .base-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    code.url { background: #000; border: 1px solid var(--border); padding: 8px 12px; border-radius: 8px; font-size: 13px; color: #38bdf8; word-break: break-all; flex: 1; }
+    button { background: var(--accent); color: #fff; border: 0; border-radius: 8px; padding: 9px 14px; font-weight: 600; font-size: 13px; cursor: pointer; }
+    button.sec { background: #27272a; color: #f4f4f5; }
+    button:hover { opacity: 0.92; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-top: 12px; }
+    .ep { background: #18181b; border: 1px solid var(--border); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .ep-title { font-size: 13px; font-weight: 700; display: flex; justify-content: space-between; align-items: center; }
+    .method { font-size: 11px; color: #4ade80; font-family: monospace; background: rgba(74,222,128,.12); padding: 2px 6px; border-radius: 4px; }
+    input, select { width: 100%; background: #09090b; border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 7px; font-size: 13px; }
+    .meta { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+    pre { margin: 0; background: #050507; border: 1px solid var(--border); border-radius: 10px; padding: 14px; overflow: auto; max-height: 520px; font-size: 12px; line-height: 1.5; color: #e4e4e7; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="head">
+      <div class="brand"><span class="dot"></span> CinePulse MovieBox Demo API</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <span class="badge">Live Read-Only Demo • 45 req/min • CORS Enabled</span>
+        <a href="/trial" style="background:#e50914;color:#fff;text-decoration:none;font-size:12px;font-weight:700;padding:5px 11px;border-radius:6px;">Get Trial API Key &rarr;</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="font-size:13px;color:var(--muted);margin-bottom:8px;">Base Demo API URL (Share with client for Browser / Postman / cURL / Fetch):</div>
+      <div class="base-row">
+        <code class="url" id="baseUrl">${base}/api/demo</code>
+        <button class="sec" onclick="copyText('${base}/api/demo', this)">Copy Base URL</button>
+        <button onclick="runEndpoint('/api/demo/status')">Test Status</button>
+      </div>
+
+      <div class="grid">
+        <div class="ep">
+          <div class="ep-title"><span>Home Feed</span><span class="method">GET</span></div>
+          <div style="font-size:12px;color:var(--muted);">/api/demo/home</div>
+          <button onclick="runEndpoint('/api/demo/home')">Try Live</button>
+        </div>
+
+        <div class="ep">
+          <div class="ep-title"><span>Search Catalog</span><span class="method">GET</span></div>
+          <input id="qInput" value="Squid Game" placeholder="Movie or series name..." />
+          <button onclick="runEndpoint('/api/demo/search?q=' + encodeURIComponent(document.getElementById('qInput').value || 'Squid Game'))">Search Live</button>
+        </div>
+
+        <div class="ep">
+          <div class="ep-title"><span>Category Feed</span><span class="method">GET</span></div>
+          <select id="catInput">
+            <option value="/bollywood">Bollywood</option>
+            <option value="/hollywood">Hollywood</option>
+            <option value="/bangla">Bangla</option>
+            <option value="/korean">Korean</option>
+            <option value="/anime">Anime</option>
+            <option value="/hindi-dubbed">Hindi Dubbed</option>
+          </select>
+          <button onclick="runEndpoint('/api/demo/catalog?category=' + encodeURIComponent(document.getElementById('catInput').value) + '&page=1')">Fetch Category</button>
+        </div>
+
+        <div class="ep">
+          <div class="ep-title"><span>Details &amp; Streams</span><span class="method">GET</span></div>
+          <input id="detailTitle" value="Squid Game" placeholder="Title for details/stream..." />
+          <div style="display:flex;gap:6px;">
+            <button style="flex:1" onclick="runEndpoint('/api/demo/details?title=' + encodeURIComponent(document.getElementById('detailTitle').value || 'Squid Game'))">Details</button>
+            <button class="sec" style="flex:1" onclick="runEndpoint('/api/demo/stream?title=' + encodeURIComponent(document.getElementById('detailTitle').value || 'Squid Game') + '&se=1&ep=1')">Stream</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="meta">
+        <div>Endpoint: <code id="activeUrl" style="color:#38bdf8;">${base}/api/demo/status</code></div>
+        <div id="statusBadge">Ready</div>
+      </div>
+      <div class="base-row" style="margin-bottom:10px;">
+        <code class="url" id="curlCmd">curl "${base}/api/demo/status"</code>
+        <button class="sec" onclick="copyText(document.getElementById('curlCmd').textContent, this)">Copy cURL</button>
+        <button class="sec" onclick="window.open(document.getElementById('activeUrl').textContent, '_blank')">Open Raw JSON</button>
+      </div>
+      <pre id="output">Loading live demo response...</pre>
+    </div>
+  </div>
+  <script>
+    function copyText(txt, btn) {
+      navigator.clipboard.writeText(txt).then(() => {
+        const prev = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => btn.textContent = prev, 1400);
+      });
+    }
+    async function runEndpoint(path) {
+      const fullUrl = window.location.origin + path;
+      document.getElementById('activeUrl').textContent = fullUrl;
+      document.getElementById('curlCmd').textContent = 'curl "' + fullUrl + '"';
+      document.getElementById('statusBadge').textContent = 'Fetching...';
+      document.getElementById('output').textContent = 'Fetching ' + fullUrl + ' ...';
+      const t0 = performance.now();
+      try {
+        const res = await fetch(fullUrl);
+        const ms = Math.round(performance.now() - t0);
+        const text = await res.text();
+        document.getElementById('statusBadge').textContent = 'HTTP ' + res.status + ' • ' + ms + ' ms';
+        try {
+          document.getElementById('output').textContent = JSON.stringify(JSON.parse(text), null, 2);
+        } catch {
+          document.getElementById('output').textContent = text;
+        }
+      } catch (err) {
+        document.getElementById('statusBadge').textContent = 'Error';
+        document.getElementById('output').textContent = String(err);
+      }
+    }
+    runEndpoint('/api/demo/status');
+  </script>
+</body>
+</html>`);
+  });
+
+  // ==========================================================================================
+  // 6a-5. DIRECT MOVIEBOX API TRIAL SYSTEM (/api/trial/* & /trial DEVELOPER PORTAL)
+  // ==========================================================================================
+  interface StoredTrialKey {
+    key: string;
+    clientName: string;
+    plan: '2H' | '24H' | '72H' | '7D' | '30D' | 'UNLIMITED' | 'CUSTOM';
+    createdAt: number;
+    expiresAt: number;
+    maxRequests: number;
+    unlimited?: boolean;
+    usedRequests: number;
+    lastUsedAt: number | null;
+    active: boolean;
+    revoked?: boolean;
+    createdIp: string;
+  }
+
+  const trialDataDir = path.join(__dirname, 'data');
+  const trialStorePath = path.join(trialDataDir, 'cinepulse-trial-keys.json');
+  const trialKeysMap = new Map<string, StoredTrialKey>();
+  const trialCreateIpRate = new Map<string, { count: number; resetAt: number }>();
+
+  const flushTrialStoreSync = () => {
+    try {
+      if (!fs.existsSync(trialDataDir)) {
+        fs.mkdirSync(trialDataDir, { recursive: true });
+      }
+      const keys = Array.from(trialKeysMap.values()).slice(-1000);
+      const tmpFile = `${trialStorePath}.tmp`;
+      fs.writeFileSync(tmpFile, JSON.stringify({ keys }, null, 2), 'utf8');
+      fs.renameSync(tmpFile, trialStorePath);
+    } catch {
+      // ignore write failure on read-only fs
+    }
+  };
+
+  let trialFlushTimer: NodeJS.Timeout | null = null;
+  const scheduleFlushTrialStore = () => {
+    if (trialFlushTimer) return;
+    trialFlushTimer = setTimeout(() => {
+      trialFlushTimer = null;
+      flushTrialStoreSync();
+    }, 400);
+  };
+
+  const signTrialKeyPayload = (payloadB64: string) =>
+    crypto
+      .createHmac('sha256', CINEPULSE_AES_KEY)
+      .update(`trial-key::${payloadB64}`)
+      .digest('base64url')
+      .slice(0, 22);
+
+  const issueSignedTrialKey = (meta: {
+    clientName: string;
+    plan: StoredTrialKey['plan'];
+    createdAt: number;
+    expiresAt: number;
+    maxRequests: number;
+    unlimited?: boolean;
+  }): string => {
+    const payload: Record<string, any> = {
+      n: meta.clientName.slice(0, 32),
+      p: meta.plan,
+      c: meta.createdAt,
+      e: meta.expiresAt,
+      m: meta.maxRequests,
+      r: crypto.randomBytes(5).toString('hex'),
+    };
+    if (meta.unlimited) payload.u = 1;
+    const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+    const sig = signTrialKeyPayload(payloadB64);
+    return `cp_tr1_${payloadB64}.${sig}`;
+  };
+
+  const resolveOrRecoverTrialKey = (rawKey: string): StoredTrialKey | undefined => {
+    if (!rawKey) return undefined;
+    const existing = trialKeysMap.get(rawKey);
+    if (existing) {
+      return existing.revoked ? undefined : existing;
+    }
+    if (!rawKey.startsWith('cp_tr1_')) return undefined;
+    const body = rawKey.slice(7);
+    const dotIdx = body.lastIndexOf('.');
+    if (dotIdx <= 0) return undefined;
+    const payloadB64 = body.slice(0, dotIdx);
+    const sig = body.slice(dotIdx + 1);
+    const expected = signTrialKeyPayload(payloadB64);
+    if (sig.length !== expected.length) return undefined;
+    try {
+      if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return undefined;
+      const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as any;
+      if (!parsed || typeof parsed.e !== 'number' || typeof parsed.m !== 'number') return undefined;
+      const validPlans = ['2H', '24H', '72H', '7D', '30D', 'UNLIMITED', 'CUSTOM'];
+      const plan: StoredTrialKey['plan'] = validPlans.includes(parsed.p) ? parsed.p : '24H';
+      const recovered: StoredTrialKey = {
+        key: rawKey,
+        clientName: String(parsed.n || 'Client Trial'),
+        plan,
+        createdAt: Number(parsed.c) || Date.now(),
+        expiresAt: parsed.e,
+        maxRequests: parsed.m,
+        unlimited: Boolean(parsed.u === 1 || parsed.m < 0 || plan === 'UNLIMITED'),
+        usedRequests: 0,
+        lastUsedAt: null,
+        active: true,
+        createdIp: 'synced',
+      };
+      trialKeysMap.set(rawKey, recovered);
+      flushTrialStoreSync();
+      return recovered;
+    } catch {
+      return undefined;
+    }
+  };
+
+  isActiveTrialStreamToken = (token: string) => {
+    const rec = resolveOrRecoverTrialKey(token);
+    if (!rec || !rec.active || Date.now() >= rec.expiresAt) return false;
+    const isUnlimited = Boolean(rec.unlimited || rec.maxRequests < 0);
+    return isUnlimited || rec.usedRequests <= rec.maxRequests;
+  };
+
+  let notifyTelegramTrialAlert: (rec: StoredTrialKey, reason: 'EXPIRED' | 'QUOTA_EXHAUSTED') => void = () => {};
+  let capturePublicOriginForBot: (req: express.Request) => void = () => {};
+  let startTelegramBotPoller: () => void = () => {};
+
+  const loadTrialKeysStore = () => {
+    try {
+      if (!fs.existsSync(trialStorePath)) return;
+      const raw = JSON.parse(fs.readFileSync(trialStorePath, 'utf8'));
+      if (raw && Array.isArray(raw.keys)) {
+        for (const item of raw.keys) {
+          if (item && typeof item.key === 'string') {
+            trialKeysMap.set(item.key, item);
+          }
+        }
+      }
+    } catch {
+      // ignore corrupted trial store
+    }
+  };
+  loadTrialKeysStore();
+
+  let isTrialOwnerRequest = (req: express.Request): boolean => {
+    const adminEnv = String(process.env.TRIAL_ADMIN_KEY || '').trim();
+    const adminHdr = String(req.headers['x-trial-admin'] || req.query.adminKey || '').trim();
+    return Boolean(adminEnv && adminHdr && adminHdr === adminEnv);
+  };
+
+  const signTrialManageToken = (apiKey: string) =>
+    crypto.createHmac('sha256', CINEPULSE_AES_KEY).update(`trial-manage::${apiKey}`).digest('hex').slice(0, 32);
+
+  const verifyTrialManageOrAdmin = (req: express.Request, apiKey: string): boolean => {
+    if (isTrialOwnerRequest(req)) return true;
+    const manageHdr = String(req.headers['x-trial-manage-token'] || req.query.manageToken || '').trim();
+    if (!manageHdr) return false;
+    const expected = signTrialManageToken(apiKey);
+    return manageHdr.length === expected.length && crypto.timingSafeEqual(Buffer.from(manageHdr), Buffer.from(expected));
+  };
+
+  const extractTrialApiKey = (req: express.Request): string => {
+    const hdrKey = String(req.headers['x-api-key'] || '').trim();
+    if (hdrKey) return hdrKey;
+    const auth = String(req.headers.authorization || '').trim();
+    if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
+    const qKey = String(req.query.apiKey || req.query.key || '').trim();
+    return qKey;
+  };
+
+  const buildTrialSummary = (rec: StoredTrialKey, includeManageToken = false, base = '') => {
+    const now = Date.now();
+    const isUnlimited = Boolean(rec.unlimited || rec.maxRequests < 0);
+    const remainingRequests = isUnlimited ? -1 : Math.max(0, rec.maxRequests - rec.usedRequests);
+    const msLeft = Math.max(0, rec.expiresAt - now);
+    const expired = now >= rec.expiresAt;
+    const status = !rec.active
+      ? 'PAUSED'
+      : expired
+        ? 'EXPIRED'
+        : !isUnlimited && remainingRequests <= 0
+          ? 'QUOTA_EXHAUSTED'
+          : 'ACTIVE';
+    return {
+      key: rec.key,
+      keyMasked: `${rec.key.slice(0, 13)}...${rec.key.slice(-4)}`,
+      clientName: rec.clientName,
+      plan: rec.plan,
+      unlimited: isUnlimited,
+      status,
+      active: rec.active,
+      usedRequests: rec.usedRequests,
+      remainingRequests,
+      maxRequests: rec.maxRequests,
+      createdAt: new Date(rec.createdAt).toISOString(),
+      expiresAt: new Date(rec.expiresAt).toISOString(),
+      expiresInMinutes: Math.ceil(msLeft / 60_000),
+      lastUsedAt: rec.lastUsedAt ? new Date(rec.lastUsedAt).toISOString() : null,
+      ...(includeManageToken ? { manageToken: signTrialManageToken(rec.key) } : {}),
+      ...(base
+        ? {
+            endpoints: {
+              me: `${base}/api/trial/me?apiKey=${rec.key}`,
+              categories: `${base}/api/trial/categories?apiKey=${rec.key}`,
+              home: `${base}/api/trial/home?apiKey=${rec.key}`,
+              suggest: `${base}/api/trial/suggest?q=Squid&apiKey=${rec.key}`,
+              search: `${base}/api/trial/search?q=Squid+Game&apiKey=${rec.key}`,
+              catalog: `${base}/api/trial/catalog?path=/bollywood&page=1&apiKey=${rec.key}`,
+              details: `${base}/api/trial/details?title=Squid+Game&apiKey=${rec.key}`,
+              stream: `${base}/api/trial/stream?title=Squid+Game&se=1&ep=1&apiKey=${rec.key}`,
+            },
+          }
+        : {}),
+    };
+  };
+
+  app.use('/api/trial', express.json({ limit: '64kb' }), (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type, Accept, X-API-Key, Authorization, X-Trial-Manage-Token, X-Trial-Admin'
+    );
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
+  // Create a new live Trial API Key
+  app.post('/api/trial/keys', (req, res) => {
+    capturePublicOriginForBot(req);
+    const base = getPublicOrigin(req);
+    const clientIp = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'local')
+      .split(',')[0]
+      .trim();
+    const isAdmin = isTrialOwnerRequest(req);
+
+    if (!isAdmin) {
+      const now = Date.now();
+      const rl = trialCreateIpRate.get(clientIp);
+      if (!rl || now > rl.resetAt) {
+        if (trialCreateIpRate.size > 1000) trialCreateIpRate.clear();
+        trialCreateIpRate.set(clientIp, { count: 1, resetAt: now + 24 * 60 * 60_000 });
+      } else {
+        rl.count++;
+        if (rl.count > 10) {
+          sendPrettyDemoJson(res, 429, {
+            ok: false,
+            error: 'Daily self-serve trial key limit reached for this IP. Reuse an existing key or contact admin.',
+          });
+          return;
+        }
+      }
+    }
+
+    const rawName = String(req.body?.clientName || 'Client Trial').trim().slice(0, 48) || 'Client Trial';
+    const rawPlan = String(req.body?.plan || '24H').toUpperCase();
+    const validPlans: StoredTrialKey['plan'][] = ['2H', '24H', '72H', '7D', '30D', 'UNLIMITED', 'CUSTOM'];
+    const plan: StoredTrialKey['plan'] = validPlans.includes(rawPlan as StoredTrialKey['plan'])
+      ? (rawPlan as StoredTrialKey['plan'])
+      : '24H';
+
+    if ((plan === '7D' || plan === '30D' || plan === 'UNLIMITED') && !isAdmin) {
+      sendPrettyDemoJson(res, 403, {
+        ok: false,
+        error: `${plan} commercial/extended key requires Owner Admin Key (set TRIAL_ADMIN_KEY env var & pass X-Trial-Admin).`,
+      });
+      return;
+    }
+
+    let durationHours = 24;
+    let maxRequests = 250;
+    let unlimited = false;
+    if (plan === '2H') {
+      durationHours = 2;
+      maxRequests = 60;
+    } else if (plan === '72H') {
+      durationHours = 72;
+      maxRequests = 600;
+    } else if (plan === '7D') {
+      durationHours = 24 * 7;
+      maxRequests = 5000;
+    } else if (plan === '30D') {
+      durationHours = 24 * 30;
+      maxRequests = req.body?.unlimited ? -1 : 100000;
+      unlimited = Boolean(req.body?.unlimited);
+    } else if (plan === 'UNLIMITED') {
+      durationHours = 24 * 3650; // 10 Years
+      maxRequests = -1;
+      unlimited = true;
+    } else if (plan === 'CUSTOM') {
+      const reqHours = Number(req.body?.durationHours) || 24;
+      const reqQuota = Number(req.body?.maxRequests);
+      durationHours = isAdmin ? Math.min(87600, Math.max(1, reqHours)) : Math.min(168, Math.max(1, reqHours));
+      if (isAdmin && (req.body?.unlimited || reqQuota < 0)) {
+        maxRequests = -1;
+        unlimited = true;
+      } else {
+        const cleanQuota = isNaN(reqQuota) ? 250 : reqQuota;
+        maxRequests = isAdmin ? Math.min(1000000, Math.max(10, cleanQuota)) : Math.min(1000, Math.max(20, cleanQuota));
+      }
+    }
+
+    const now = Date.now();
+    const expiresAt = now + durationHours * 3600_000;
+    const key = issueSignedTrialKey({
+      clientName: rawName,
+      plan,
+      createdAt: now,
+      expiresAt,
+      maxRequests,
+      unlimited,
+    });
+    const rec: StoredTrialKey = {
+      key,
+      clientName: rawName,
+      plan,
+      createdAt: now,
+      expiresAt,
+      maxRequests,
+      unlimited,
+      usedRequests: 0,
+      lastUsedAt: null,
+      active: true,
+      createdIp: clientIp,
+    };
+
+    trialKeysMap.set(key, rec);
+    flushTrialStoreSync();
+
+    sendPrettyDemoJson(res, 201, {
+      ok: true,
+      message: 'Trial API Key generated successfully.',
+      trial: buildTrialSummary(rec, true, base),
+    });
+  });
+
+  // Check Trial Key quota & expiry without consuming a request
+  app.get('/api/trial/me', (req, res) => {
+    const base = getPublicOrigin(req);
+    const key = extractTrialApiKey(req);
+    const rec = resolveOrRecoverTrialKey(key);
+    if (!rec) {
+      sendPrettyDemoJson(res, 401, {
+        ok: false,
+        error: 'Missing or invalid Trial API Key. Generate one at ' + `${base}/trial`,
+      });
+      return;
+    }
+    sendPrettyDemoJson(res, 200, {
+      ok: true,
+      trial: buildTrialSummary(rec, false, base),
+    });
+  });
+
+  // Pause / Resume / Extend Trial Key
+  app.patch('/api/trial/keys/:key', (req, res) => {
+    const base = getPublicOrigin(req);
+    const key = String(req.params.key || '').trim();
+    const rec = resolveOrRecoverTrialKey(key);
+    if (!rec) {
+      sendPrettyDemoJson(res, 404, { ok: false, error: 'Trial API key not found.' });
+      return;
+    }
+    if (!verifyTrialManageOrAdmin(req, key)) {
+      sendPrettyDemoJson(res, 403, { ok: false, error: 'Invalid manageToken or admin key.' });
+      return;
+    }
+    const isAdmin = isTrialOwnerRequest(req);
+    if (typeof req.body?.active === 'boolean') {
+      rec.active = req.body.active;
+    }
+    if (typeof req.body?.addHours === 'number' && req.body.addHours > 0) {
+      const capHours = isAdmin ? 87600 : 168;
+      const addMs = Math.min(capHours, req.body.addHours) * 3600_000;
+      rec.expiresAt = Math.max(Date.now(), rec.expiresAt) + addMs;
+    }
+    if (isAdmin && typeof req.body?.unlimited === 'boolean') {
+      rec.unlimited = req.body.unlimited;
+      if (req.body.unlimited) rec.maxRequests = -1;
+    } else if (typeof req.body?.addRequests === 'number' && req.body.addRequests > 0 && rec.maxRequests >= 0) {
+      const capReq = isAdmin ? 1000000 : 2000;
+      rec.maxRequests += Math.min(capReq, Math.round(req.body.addRequests));
+    }
+    flushTrialStoreSync();
+    sendPrettyDemoJson(res, 200, {
+      ok: true,
+      trial: buildTrialSummary(rec, false, base),
+    });
+  });
+
+  app.delete('/api/trial/keys/:key', (req, res) => {
+    const key = String(req.params.key || '').trim();
+    const rec = resolveOrRecoverTrialKey(key);
+    if (!rec) {
+      sendPrettyDemoJson(res, 404, { ok: false, error: 'Trial API key not found.' });
+      return;
+    }
+    if (!verifyTrialManageOrAdmin(req, key)) {
+      sendPrettyDemoJson(res, 403, { ok: false, error: 'Invalid manageToken or admin key.' });
+      return;
+    }
+    rec.active = false;
+    rec.revoked = true;
+    flushTrialStoreSync();
+    sendPrettyDemoJson(res, 200, { ok: true, deleted: key });
+  });
+
+  app.get('/api/trial/admin/keys', (req, res) => {
+    if (!isTrialOwnerRequest(req)) {
+      sendPrettyDemoJson(res, 403, { ok: false, error: 'Owner login (/owner) or TRIAL_ADMIN_KEY required.' });
+      return;
+    }
+    const base = getPublicOrigin(req);
+    const list = Array.from(trialKeysMap.values())
+      .filter((r) => !r.revoked)
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .map((r) => buildTrialSummary(r, false, base));
+    sendPrettyDemoJson(res, 200, { ok: true, count: list.length, keys: list });
+  });
+
+  // Trial Key Authentication + Quota Enforcement Middleware for MovieBox Data Endpoints
+  const requireValidTrialKey = (
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction
+  ) => {
+    if (req.method !== 'GET') {
+      sendPrettyDemoJson(res, 405, { ok: false, error: 'Trial API endpoints are read-only (GET).' });
+      return;
+    }
+    const base = getPublicOrigin(req);
+    const key = extractTrialApiKey(req);
+    if (!key) {
+      sendPrettyDemoJson(res, 401, {
+        ok: false,
+        error: 'Trial API Key required. Pass X-API-Key header or ?apiKey= parameter.',
+        getTrialKeyAt: `${base}/trial`,
+      });
+      return;
+    }
+    const rec = resolveOrRecoverTrialKey(key);
+    if (!rec) {
+      sendPrettyDemoJson(res, 401, {
+        ok: false,
+        error: 'Invalid Trial API Key.',
+        getTrialKeyAt: `${base}/trial`,
+      });
+      return;
+    }
+    if (!rec.active) {
+      sendPrettyDemoJson(res, 403, {
+        ok: false,
+        error: 'This Trial API Key has been paused or revoked.',
+        trial: buildTrialSummary(rec),
+      });
+      return;
+    }
+    if (Date.now() >= rec.expiresAt) {
+      notifyTelegramTrialAlert(rec, 'EXPIRED');
+      sendPrettyDemoJson(res, 403, {
+        ok: false,
+        error: 'Trial API Key expired. Generate a new key or extend validity.',
+        trial: buildTrialSummary(rec),
+        getTrialKeyAt: `${base}/trial`,
+      });
+      return;
+    }
+    const isUnlimited = Boolean(rec.unlimited || rec.maxRequests < 0);
+    if (!isUnlimited && rec.usedRequests >= rec.maxRequests) {
+      notifyTelegramTrialAlert(rec, 'QUOTA_EXHAUSTED');
+      sendPrettyDemoJson(res, 429, {
+        ok: false,
+        error: `Trial request quota exhausted (${rec.maxRequests}/${rec.maxRequests} used).`,
+        trial: buildTrialSummary(rec),
+        getTrialKeyAt: `${base}/trial`,
+      });
+      return;
+    }
+
+    rec.usedRequests += 1;
+    rec.lastUsedAt = Date.now();
+    scheduleFlushTrialStore();
+
+    const remaining = isUnlimited ? 'UNLIMITED' : String(Math.max(0, rec.maxRequests - rec.usedRequests));
+    res.setHeader('X-Trial-Plan', rec.plan);
+    res.setHeader('X-RateLimit-Limit', isUnlimited ? 'UNLIMITED' : String(rec.maxRequests));
+    res.setHeader('X-RateLimit-Remaining', remaining);
+    res.setHeader('X-Trial-Expires-At', new Date(rec.expiresAt).toISOString());
+    (req as any)._trialKeyRec = rec;
+    next();
+  };
+
+  app.get('/api/trial/categories', requireValidTrialKey, (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    const mbCategories = ALL_CATEGORIES;
+    sendPrettyDemoJson(res, 200, {
+      ok: true,
+      source: 'official-moviebox-original',
+      trial: buildTrialSummary(rec),
+      categories: mbCategories.map((c) => ({
+        ...c,
+        catalogEndpoint: `${base}/api/trial/catalog?path=${encodeURIComponent(c.path)}&page=1`,
+      })),
+    });
+  });
+
+  app.get('/api/trial/home', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    try {
+      const [homePayload, mbMain] = await Promise.all([
+        fetchMovieBoxHomePayload(),
+        fetchMovieBoxCatalog('/', 1, ''),
+      ]);
+      const attachDetUrl = <T extends { path?: string }>(item: T) => ({
+        ...item,
+        detailsEndpoint: item.path
+          ? `${base}/api/trial/details?path=${encodeURIComponent(item.path)}`
+          : undefined,
+      });
+      const mbCategories = ALL_CATEGORIES;
+      const trendingItems = normalizeMovieCardList(mbMain.items)
+        .filter((it) => it.path?.startsWith('/mb/'))
+        .slice(0, 48);
+
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        categories: mbCategories,
+        banners: (homePayload.banners || []).map((b: any) => ({
+          ...b,
+          detailsEndpoint: b.path ? `${base}/api/trial/details?path=${encodeURIComponent(b.path)}` : undefined,
+        })),
+        liveSports: homePayload.liveSports || [],
+        quickCategories: homePayload.quickCategories || [],
+        comingSoon: (homePayload.comingSoon || []).map(attachDetUrl),
+        sections: (homePayload.sections || []).map((sec) => ({
+          ...sec,
+          items: (sec.items || []).map(attachDetUrl),
+        })),
+        trending: trendingItems.map(attachDetUrl),
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Trial home fetch failed' });
+    }
+  });
+
+  app.get('/api/trial/suggest', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    const q = String(req.query.q || '').trim();
+    if (!q) {
+      sendPrettyDemoJson(res, 200, { ok: true, source: 'official-moviebox-original', trial: buildTrialSummary(rec), items: [] });
+      return;
+    }
+    try {
+      const mbRes = await fetchMovieBoxCatalog('/', 1, q);
+      const combined = normalizeMovieCardList(deduplicateMovieCards(mbRes.items))
+        .filter((it) => it.path?.startsWith('/mb/'))
+        .slice(0, 40);
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        query: q,
+        count: combined.length,
+        items: combined.map((item) => ({
+          ...item,
+          detailsEndpoint: `${base}/api/trial/details?path=${encodeURIComponent(item.path)}`,
+        })),
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Trial suggest failed' });
+    }
+  });
+
+  app.get('/api/trial/catalog', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    const rawPath = String(req.query.path || req.query.category || '/').trim() || '/';
+    const page = Math.min(50, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
+    const search = String(req.query.q || req.query.search || '').trim();
+
+    const isNewUploadsView = rawPath === '/new-uploads';
+    const isNewReleasesView = rawPath === '/new-releases';
+    const isHotDhamakaView = rawPath === '/hot-dhamaka';
+    const isTrendingHomeView = rawPath === '/' || rawPath === '';
+    const upstreamBasePath =
+      isNewUploadsView || isNewReleasesView || isHotDhamakaView
+        ? '/'
+        : rawPath.startsWith('/')
+          ? rawPath
+          : `/${rawPath}`;
+
+    try {
+      const mbTargetPath = isNewReleasesView
+        ? '/new-releases'
+        : isNewUploadsView
+          ? '/new-uploads'
+          : upstreamBasePath;
+      const isHomeOrGlobal =
+        !search &&
+        page === 1 &&
+        (isTrendingHomeView || isHotDhamakaView || isNewUploadsView || isNewReleasesView);
+
+      const tasks: Array<Promise<{ items: MovieCardItem[]; maxPage: number }>> = [
+        fetchMovieBoxCatalog(mbTargetPath, page, search),
+      ];
+      if (isHomeOrGlobal) {
+        tasks.push(
+          fetchMovieBoxCatalog('/language/bangla', 1, ''),
+          fetchMovieBoxCatalog('/bollywood', 1, ''),
+          fetchMovieBoxCatalog('/language/hindi-dubbed', 1, '')
+        );
+      }
+
+      const settled = await Promise.allSettled(tasks);
+      const primaryMain =
+        settled[0]?.status === 'fulfilled' ? settled[0].value : { items: [], maxPage: 2500 };
+      const extraRegional: MovieCardItem[] = [];
+      for (let i = 1; i < settled.length; i++) {
+        const r = settled[i];
+        if (r.status === 'fulfilled') extraRegional.push(...r.value.items.slice(0, 10));
+      }
+
+      let items: MovieCardItem[] = deduplicateMovieCards([...primaryMain.items, ...extraRegional]).filter(
+        (it) => it.path?.startsWith('/mb/')
+      );
+      if (isNewUploadsView) {
+        items = sortItemsByRecentUpload(items);
+      } else if (isNewReleasesView) {
+        const sortedRecent = sortItemsByRecentUpload(items);
+        const release2026And2025 = sortedRecent.filter(
+          (i) => i.title.includes('2026') || i.title.includes('2025')
+        );
+        const releaseOlder = sortedRecent.filter(
+          (i) => !i.title.includes('2026') && !i.title.includes('2025')
+        );
+        items = [...release2026And2025, ...releaseOlder];
+      } else if (isHotDhamakaView) {
+        items = sortItemsByHotAndHype(items);
+      } else {
+        items = normalizeMovieCardList(items);
+      }
+      items = items.slice(0, 64);
+
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        path: rawPath,
+        page,
+        maxPage: Math.max(primaryMain.maxPage || 1, 50),
+        count: items.length,
+        items: items.map((item) => ({
+          ...item,
+          detailsEndpoint: `${base}/api/trial/details?path=${encodeURIComponent(item.path)}`,
+        })),
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Trial catalog fetch failed' });
+    }
+  });
+
+  app.get('/api/trial/search', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    const query = String(req.query.q || req.query.keyword || req.query.search || '').trim();
+    const page = Math.min(20, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
+    if (!query) {
+      sendPrettyDemoJson(res, 400, {
+        ok: false,
+        error: 'Missing ?q= search parameter.',
+        trial: buildTrialSummary(rec),
+      });
+      return;
+    }
+    try {
+      const mbRes = await fetchMovieBoxCatalog('/', page, query);
+      const items = normalizeMovieCardList(deduplicateMovieCards(mbRes.items))
+        .filter((it) => it.path?.startsWith('/mb/'))
+        .slice(0, 64);
+
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        query,
+        page,
+        count: items.length,
+        items: items.map((item) => ({
+          ...item,
+          detailsEndpoint: `${base}/api/trial/details?path=${encodeURIComponent(item.path)}`,
+        })),
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Trial search failed' });
+    }
+  });
+
+  app.get('/api/trial/details', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    const rawPath = String(req.query.path || req.query.url || '').trim();
+    const subjectId = String(req.query.id || req.query.subjectId || '').trim();
+    const slug = String(req.query.slug || req.query.detailPath || 'movie').trim();
+    const titleQuery = String(req.query.title || '').trim();
+
+    let targetPath = rawPath;
+    if (!targetPath && subjectId) {
+      targetPath = `/mb/${subjectId}/${slug}`;
+    }
+
+    const toTrialUrl = (u: string) => {
+      if (!u || !u.startsWith('/')) return u;
+      const sep = u.includes('?') ? '&' : '?';
+      const needsTk = u.startsWith('/api/mb-stream') || u.startsWith('/api/mb-subtitle-srt');
+      return `${base}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ''}`;
+    };
+
+    try {
+      let mbPath = targetPath;
+      if (!mbPath.startsWith('/mb/')) {
+        const queryFromPath = targetPath
+          .replace(/^\/(?:movie|series|anime|drama)\//i, '')
+          .replace(/[-_]+/g, ' ')
+          .trim();
+        const searchTitle = extractBaseSeriesTitle(titleQuery || queryFromPath)
+          .split(/\s+/)
+          .slice(0, 5)
+          .join(' ');
+        if (searchTitle.length >= 2) {
+          const mbSearch = await fetchMovieBoxCatalog('/', 1, searchTitle);
+          const mbMatch = mbSearch.items.find((it) => it.path?.startsWith('/mb/'));
+          if (mbMatch) {
+            mbPath = mbMatch.path;
+          }
+        }
+      }
+
+      if (!mbPath || !mbPath.startsWith('/mb/')) {
+        sendPrettyDemoJson(res, 400, {
+          ok: false,
+          error: 'Provide ?title=<name>, ?path=/mb/<subjectId>/<slug>, or ?subjectId=<id>',
+          trial: buildTrialSummary(rec),
+        });
+        return;
+      }
+
+      const cached = findCachedDetailByPathOrTitle(mbPath, titleQuery);
+      const detail =
+        cached && cached.url?.startsWith('/mb/') ? cached : await fetchMovieBoxDetail(mbPath);
+      storeDetailInCaches(mbPath, detail, Date.now() + 12 * 60_000);
+
+      const parts = mbPath.replace(/^\/mb\//, '').split('/');
+      const resolvedId = parts[0] || subjectId || '';
+      const resolvedSlug = parts[1] || slug;
+      const seasons = Array.from(
+        new Set((detail.episodes || []).map((e) => e.season).filter((s): s is number => s !== null && s > 0))
+      ).sort((a, b) => a - b);
+
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        subjectId: resolvedId,
+        detailPath: resolvedSlug,
+        totalSeasons: seasons.length || (detail.typeBadge === 'SERIES' ? 1 : 0),
+        seasons,
+        totalEpisodes: detail.episodes?.length || 0,
+        embedPlayerUrl: `${base}/trial-embed?apiKey=${encodeURIComponent(rec.key)}&subjectId=${encodeURIComponent(
+          resolvedId
+        )}&detailPath=${encodeURIComponent(resolvedSlug)}&se=${seasons[0] || 0}&ep=${
+          detail.episodes?.[0]?.number ?? 0
+        }&title=${encodeURIComponent(detail.title)}`,
+        detail: {
+          ...detail,
+          episodes: (detail.episodes || []).map((ep) => ({
+            ...ep,
+            sources: (ep.sources || []).map((s) => ({
+              ...s,
+              url: toTrialUrl(s.url),
+              downloadUrl: s.downloadUrl ? toTrialUrl(s.downloadUrl) : undefined,
+            })),
+            streamEndpoint: `${base}/api/trial/stream?subjectId=${encodeURIComponent(
+              resolvedId
+            )}&detailPath=${encodeURIComponent(resolvedSlug)}&se=${ep.season ?? 0}&ep=${
+              ep.number ?? 0
+            }&title=${encodeURIComponent(detail.title)}`,
+          })),
+        },
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Trial details failed' });
+    }
+  });
+
+  app.get('/api/trial/stream', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    const rawPathParam = String(req.query.path || '').trim();
+    let subjectId = String(req.query.subjectId || req.query.id || '').trim();
+    let detailPath = String(req.query.detailPath || req.query.slug || 'movie').trim();
+    if (!subjectId && rawPathParam.startsWith('/mb/')) {
+      const segs = rawPathParam.replace(/^\/mb\//, '').split('/');
+      subjectId = segs[0] || '';
+      detailPath = segs[1] || detailPath;
+    }
+    const se = Math.max(0, parseInt(String(req.query.se || req.query.season || '0'), 10) || 0);
+    const ep = Math.max(0, parseInt(String(req.query.ep || req.query.episode || '0'), 10) || 0);
+    let title = String(req.query.title || detailPath).trim();
+    const lang = String(req.query.lang || 'Original Audio').trim();
+
+    try {
+      if (!subjectId && title && title !== 'movie') {
+        let searchRes = await fetchMovieBoxCatalog('/', 1, title);
+        if (!searchRes.items.length) {
+          const cleanTitle = title
+            .replace(/\s*(Full\s*HD|HD|1080p|720p)\s*$/i, '')
+            .replace(/\s*\(\d{4}\)\s*/g, ' ')
+            .trim();
+          if (cleanTitle && cleanTitle !== title) {
+            searchRes = await fetchMovieBoxCatalog('/', 1, cleanTitle);
+          }
+        }
+        const firstPath = searchRes.items[0]?.path || '';
+        if (firstPath.startsWith('/mb/')) {
+          const segs = firstPath.replace(/^\/mb\//, '').split('/');
+          subjectId = segs[0] || '';
+          detailPath = segs[1] || detailPath;
+          title = searchRes.items[0]?.title || title;
+        }
+      }
+      if (!subjectId) {
+        sendPrettyDemoJson(res, 400, {
+          ok: false,
+          error: 'Provide ?path=/mb/<id>/<slug>, ?subjectId=<id>&detailPath=<slug>, or ?title=<name>',
+          trial: buildTrialSummary(rec),
+        });
+        return;
+      }
+
+      const [initialPlayRes, imdbId] = await Promise.all([
+        fetchMovieBoxPlayStreams(subjectId, detailPath, se, ep, title, lang, ''),
+        Promise.race([
+          resolveImdbIdForTitle(title, '', se > 0),
+          new Promise<string>((r) => setTimeout(() => r(''), 650)),
+        ]),
+      ]);
+      let playRes = initialPlayRes;
+      let effectiveSe = se;
+      let effectiveEp = ep;
+      if (playRes.sources.length === 0 && se > 1) {
+        const fbSe1 = await fetchMovieBoxPlayStreams(subjectId, detailPath, 1, ep || 1, title, lang, '');
+        if (fbSe1.sources.length > 0) {
+          playRes = fbSe1;
+          effectiveSe = 1;
+          effectiveEp = ep || 1;
+        }
+      }
+      if (playRes.sources.length === 0 && (se > 0 || ep > 0)) {
+        const fbMovie = await fetchMovieBoxPlayStreams(subjectId, detailPath, 0, 0, title, lang, '');
+        if (fbMovie.sources.length > 0) {
+          playRes = fbMovie;
+          effectiveSe = 0;
+          effectiveEp = 0;
+        }
+      } else if (playRes.sources.length === 0 && se === 0 && ep === 0) {
+        const fbSeries = await fetchMovieBoxPlayStreams(subjectId, detailPath, 1, 1, title, lang, '');
+        if (fbSeries.sources.length > 0) {
+          playRes = fbSeries;
+          effectiveSe = 1;
+          effectiveEp = 1;
+        }
+      }
+
+      const captions = await Promise.race([
+        fetchMovieBoxOfficialCaptions(
+          subjectId,
+          detailPath,
+          effectiveSe,
+          effectiveEp,
+          playRes.streamId || ''
+        ),
+        new Promise<Array<{ id: string; lan: string; lanName: string; url: string; delay: number }>>((r) =>
+          setTimeout(() => r([]), 900)
+        ),
+      ]).catch(() => []);
+
+      const embedBackups = buildEmbedBackupSources(imdbId, effectiveSe, effectiveEp, title, lang);
+      const toAbsoluteWithTrialTk = (u: string) => {
+        if (!u.startsWith('/')) return u;
+        const sep = u.includes('?') ? '&' : '?';
+        const needsTk = u.startsWith('/api/mb-stream') || u.startsWith('/api/mb-subtitle-srt');
+        return `${base}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ''}`;
+      };
+      const embedPlayerUrl = `${base}/trial-embed?apiKey=${encodeURIComponent(rec.key)}&subjectId=${encodeURIComponent(
+        subjectId
+      )}&detailPath=${encodeURIComponent(detailPath)}&se=${effectiveSe}&ep=${effectiveEp}&title=${encodeURIComponent(title)}`;
+
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        subjectId,
+        detailPath,
+        title,
+        season: effectiveSe,
+        episode: effectiveEp,
+        imdbId: imdbId || null,
+        embedPlayerUrl,
+        directMp4Count: playRes.sources.length,
+        cloudHlsCount: embedBackups.length,
+        subtitleCount: captions.length,
+        sources: [...playRes.sources, ...embedBackups].map((s) => ({
+          ...s,
+          url: toAbsoluteWithTrialTk(s.url),
+          downloadUrl: s.downloadUrl ? toAbsoluteWithTrialTk(s.downloadUrl) : undefined,
+        })),
+        subtitles: captions.map((c) => ({
+          ...c,
+          url: toAbsoluteWithTrialTk(c.url),
+        })),
+        downloads: (playRes.buttons || []).map((b) => ({
+          ...b,
+          url: toAbsoluteWithTrialTk(b.url),
+        })),
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Trial stream lookup failed' });
+    }
+  });
+
+  // Embeddable Video Player for Client's Own Website (<iframe src=".../trial-embed?apiKey=...&title=...">)
+  app.get('/trial-embed', async (req, res) => {
+    const base = getPublicOrigin(req);
+    const key = extractTrialApiKey(req);
+    const rec = key ? resolveOrRecoverTrialKey(key) : undefined;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+
+    const embedQuotaHit = Boolean(rec && !rec.unlimited && rec.maxRequests >= 0 && rec.usedRequests >= rec.maxRequests);
+    if (!rec || !rec.active || Date.now() >= rec.expiresAt || embedQuotaHit) {
+      const reason = !rec
+        ? 'Invalid or missing Trial API Key'
+        : !rec.active
+          ? 'Trial Key Paused'
+          : Date.now() >= rec.expiresAt
+            ? 'Trial Key Expired'
+            : 'Trial Request Quota Exhausted';
+      res.status(403).send(`<!DOCTYPE html><html><body style="margin:0;background:#09090b;color:#f4f4f5;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;text-align:center;padding:20px;">
+        <div><h3 style="color:#e50914;margin:0 0 8px;">CinePulse Trial Player Blocked</h3><p style="margin:0;color:#a1a1aa;font-size:14px;">${reason}</p></div>
+      </body></html>`);
+      return;
+    }
+
+    rec.usedRequests += 1;
+    rec.lastUsedAt = Date.now();
+    scheduleFlushTrialStore();
+
+    const rawPathParam = String(req.query.path || '').trim();
+    let subjectId = String(req.query.subjectId || req.query.id || '').trim();
+    let detailPath = String(req.query.detailPath || req.query.slug || 'movie').trim();
+    if (!subjectId && rawPathParam.startsWith('/mb/')) {
+      const segs = rawPathParam.replace(/^\/mb\//, '').split('/');
+      subjectId = segs[0] || '';
+      detailPath = segs[1] || detailPath;
+    }
+    const se = Math.max(0, parseInt(String(req.query.se || req.query.season || '0'), 10) || 0);
+    const ep = Math.max(0, parseInt(String(req.query.ep || req.query.episode || '0'), 10) || 0);
+    let title = String(req.query.title || detailPath).trim();
+    const lang = String(req.query.lang || 'Original Audio').trim();
+
+    try {
+      if (!subjectId && title && title !== 'movie') {
+        const searchRes = await fetchMovieBoxCatalog('/', 1, title);
+        const firstPath = searchRes.items[0]?.path || '';
+        if (firstPath.startsWith('/mb/')) {
+          const segs = firstPath.replace(/^\/mb\//, '').split('/');
+          subjectId = segs[0] || '';
+          detailPath = segs[1] || detailPath;
+          title = searchRes.items[0]?.title || title;
+        }
+      }
+      let playRes = subjectId
+        ? await fetchMovieBoxPlayStreams(subjectId, detailPath, se, ep, title, lang, '')
+        : { sources: [], buttons: [] };
+      if (subjectId && playRes.sources.length === 0 && (se > 0 || ep > 0)) {
+        const fbMovie = await fetchMovieBoxPlayStreams(subjectId, detailPath, 0, 0, title, lang, '');
+        if (fbMovie.sources.length > 0) playRes = fbMovie;
+      } else if (subjectId && playRes.sources.length === 0 && se === 0 && ep === 0) {
+        const fbSeries = await fetchMovieBoxPlayStreams(subjectId, detailPath, 1, 1, title, lang, '');
+        if (fbSeries.sources.length > 0) playRes = fbSeries;
+      }
+      const mp4Sources = (playRes.sources || [])
+        .filter((s) => s.url && s.url.startsWith('/api/mb-stream'))
+        .map((s) => ({
+          label: `${s.quality}p`,
+          url: `${base}${s.url}${s.url.includes('?') ? '&' : '?'}tk=${encodeURIComponent(rec.key)}`,
+        }));
+      const firstSrc = mp4Sources[0]?.url || '';
+      const safeTitle = title.replace(/[<>&"']/g, '');
+
+      res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>${safeTitle} — CinePulse Trial Embed</title>
+  <style>
+    * { box-sizing:border-box; }
+    html,body { margin:0; padding:0; width:100%; height:100%; background:#000; color:#fff; font-family:system-ui,sans-serif; overflow:hidden; }
+    .wrap { position:relative; width:100%; height:100%; display:flex; align-items:center; justify-content:center; }
+    video { width:100%; height:100%; object-fit:contain; background:#000; }
+    .bar { position:absolute; top:10px; right:10px; display:flex; gap:6px; align-items:center; z-index:10; }
+    select { background:rgba(15,15,20,.85); color:#fff; border:1px solid rgba(255,255,255,.22); border-radius:6px; padding:5px 8px; font-size:12px; }
+    .tag { background:rgba(229,9,20,.9); color:#fff; font-size:11px; font-weight:700; padding:4px 8px; border-radius:6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="bar">
+      <span class="tag">${safeTitle}</span>
+      ${mp4Sources.length > 1 ? `<select id="qSel" onchange="switchQ(this.value)">${mp4Sources.map((s, idx) => `<option value="${s.url}" ${idx === 0 ? 'selected' : ''}>${s.label}</option>`).join('')}</select>` : ''}
+    </div>
+    ${firstSrc
+      ? `<video id="vid" src="${firstSrc}" controls autoplay playsinline preload="metadata"></video>`
+      : `<div style="text-align:center;padding:24px;color:#a1a1aa;">No direct MP4 stream found for this title/episode yet.</div>`
+    }
+  </div>
+  <script>
+    function switchQ(u) {
+      const v = document.getElementById('vid');
+      if (!v) return;
+      const t = v.currentTime || 0;
+      v.src = u;
+      v.addEventListener('loadedmetadata', () => { try { v.currentTime = t; v.play(); } catch(e){} }, { once: true });
+    }
+  </script>
+</body>
+</html>`);
+    } catch {
+      res.status(500).send('Failed to load embedded trial stream.');
+    }
+  });
+
+  // Interactive Direct Trial API Key Portal (/trial)
+  app.get('/trial', (req, res) => {
+    capturePublicOriginForBot(req);
+    const base = getPublicOrigin(req);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CinePulse MovieBox API — Direct Trial Key System</title>
+  <style>
+    :root { color-scheme: dark; --bg:#08090c; --card:#111217; --sub:#181920; --border:#27272a; --accent:#e50914; --green:#22c55e; --blue:#38bdf8; --text:#f4f4f5; --muted:#a1a1aa; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background:var(--bg); color:var(--text); padding:24px 16px 60px; }
+    .wrap { max-width:1080px; margin:0 auto; }
+    .topbar { display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:12px; margin-bottom:20px; }
+    .brand { display:flex; align-items:center; gap:10px; font-size:21px; font-weight:800; letter-spacing:-0.02em; }
+    .dot { width:10px; height:10px; border-radius:999px; background:var(--green); box-shadow:0 0 10px var(--green); }
+    .nav-links { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .pill-link { font-size:12px; padding:6px 12px; border-radius:7px; background:var(--sub); border:1px solid var(--border); color:var(--text); text-decoration:none; font-weight:600; }
+    .layout { display:grid; grid-template-columns: 360px 1fr; gap:16px; align-items:start; }
+    @media (max-width: 880px) { .layout { grid-template-columns: 1fr; } }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:16px; margin-bottom:16px; }
+    h2 { margin:0 0 12px; font-size:15px; font-weight:700; display:flex; align-items:center; justify-content:space-between; }
+    label { display:block; font-size:12px; color:var(--muted); margin-bottom:5px; margin-top:10px; }
+    input, select { width:100%; background:#09090b; border:1px solid var(--border); color:var(--text); padding:9px 11px; border-radius:8px; font-size:13px; }
+    button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:9px 14px; font-weight:600; font-size:13px; cursor:pointer; }
+    button.sec { background:#27272a; color:var(--text); }
+    button.sm { padding:6px 10px; font-size:12px; }
+    button:hover { opacity:0.92; }
+    .full { width:100%; margin-top:12px; padding:10px; }
+    .key-box { background:#050507; border:1px solid #2e2e36; border-radius:10px; padding:12px; margin-top:10px; }
+    .key-val { font-family:monospace; font-size:13px; color:var(--blue); word-break:break-all; font-weight:700; }
+    .bar-bg { width:100%; height:7px; background:#27272a; border-radius:999px; overflow:hidden; margin:8px 0 6px; }
+    .bar-fill { height:100%; background:linear-gradient(90deg, var(--green), var(--blue)); width:100%; transition:width .25s ease; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .saved-item { background:var(--sub); border:1px solid var(--border); border-radius:9px; padding:10px; margin-top:8px; font-size:12px; }
+    .saved-item.active { border-color:var(--blue); }
+    .ep-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(190px, 1fr)); gap:10px; margin-top:10px; }
+    .ep-box { background:var(--sub); border:1px solid var(--border); border-radius:9px; padding:10px; display:flex; flex-direction:column; gap:7px; }
+    .tabs { display:flex; gap:6px; margin-bottom:8px; flex-wrap:wrap; }
+    .tab { background:var(--sub); color:var(--muted); border:1px solid var(--border); padding:5px 10px; border-radius:6px; font-size:12px; cursor:pointer; }
+    .tab.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+    pre { margin:0; background:#050507; border:1px solid var(--border); border-radius:10px; padding:13px; overflow:auto; max-height:460px; font-size:12px; line-height:1.5; color:#e4e4e7; }
+    .status-pill { font-size:11px; font-weight:700; padding:2px 8px; border-radius:5px; background:rgba(34,197,94,.14); color:var(--green); }
+    .status-pill.bad { background:rgba(239,68,68,.15); color:#f87171; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="topbar">
+      <div class="brand"><span class="dot"></span> MovieBox Direct Trial API System</div>
+      <div class="nav-links">
+        <a class="pill-link" style="background:rgba(229,9,20,0.2);border-color:#e50914;color:#fff;" href="/owner">👑 Owner Control Panel (বাংলা)</a>
+        <a class="pill-link" href="/demo-api">Free Public Demo</a>
+        <a class="pill-link" href="/">Open Web App</a>
+      </div>
+    </div>
+
+    <div id="devOriginBanner" class="card" style="display:none;border-color:#f59e0b;background:rgba(245,158,11,0.08);margin-bottom:16px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div style="font-size:13px;line-height:1.5;">
+          <strong style="color:#fbbf24;">Client Share Notice:</strong>
+          You are on private Dev URL (<code>ais-dev-...</code>). External clients cannot access <code>ais-dev-...</code> without your Google login.
+          Click <strong>Share / Publish</strong> in AI Studio first, then send the <strong>Public Share URL (<code>ais-pre-...</code>)</strong> below!
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;margin:0;color:#fff;cursor:pointer;white-space:nowrap;">
+          <input id="useShareOriginChk" type="checkbox" checked style="width:auto;" onchange="updateSnippet()" />
+          Use Public Share URL (ais-pre-...) in Client Copy
+        </label>
+      </div>
+    </div>
+
+    <div class="layout">
+      <div>
+        <div class="card">
+          <h2>1. Generate Client API Key</h2>
+          <label>Client / Project Name</label>
+          <input id="clientName" placeholder="e.g. Rahim OTT App" value="Client Trial Demo" />
+          <label>Plan (Duration &amp; Request Quota)</label>
+          <select id="planSelect">
+            <option value="2H">2 Hours Trial (60 Requests)</option>
+            <option value="24H" selected>24 Hours Trial (250 Requests)</option>
+            <option value="72H">3 Days Trial (600 Requests)</option>
+            <option value="7D">7 Days (5,000 Requests — Owner Key)</option>
+            <option value="30D">30 Days / 1 Month (100,000 Requests — Owner Key)</option>
+            <option value="UNLIMITED">Unlimited Access (10 Years / No Limit — Owner Key)</option>
+          </select>
+          <label>Owner Admin Key (Required only for 7D / 30D / Unlimited &amp; Client Manager)</label>
+          <input id="adminKeyInput" type="password" placeholder="Enter TRIAL_ADMIN_KEY to unlock 30D & Unlimited" />
+          <button class="full" onclick="createTrialKey()">Generate Live API Key</button>
+          <div id="createMsg" style="font-size:12px;color:var(--muted);margin-top:8px;"></div>
+        </div>
+
+        <div class="card">
+          <h2>2. Active Client Key <span id="keyStatusBadge" class="status-pill">NONE</span></h2>
+          <div class="row">
+            <input id="activeKeyInput" placeholder="Paste cp_tr1_... key" style="flex:1;font-family:monospace;font-size:12px;" />
+            <button class="sec sm" onclick="loadKeyStatus()">Verify</button>
+          </div>
+          <div class="key-box" id="activeKeyCard" style="display:none;">
+            <div class="key-val" id="activeKeyText"></div>
+            <div class="bar-bg"><div class="bar-fill" id="quotaBar"></div></div>
+            <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);">
+              <span id="quotaText">0 / 0 left</span>
+              <span id="expiryText">-</span>
+            </div>
+            <div class="row" style="margin-top:10px;">
+              <button class="sm" onclick="copyClientInvite(this)">Copy Client Message</button>
+              <button class="sec sm" onclick="copyText(currentKey, this)">Copy Key</button>
+              <button class="sec sm" id="togglePauseBtn" onclick="togglePauseCurrentKey()">Pause</button>
+              <button class="sec sm" onclick="extendCurrentKey30Days()">+30D</button>
+            </div>
+          </div>
+
+          <div class="row" style="margin-top:12px;">
+            <button class="sec sm" style="width:100%;" onclick="loadAllAdminKeys()">Load All Server Clients (Owner)</button>
+          </div>
+          <div id="savedListWrap" style="margin-top:14px;display:none;">
+            <div style="font-size:12px;color:var(--muted);font-weight:600;">Client Keys:</div>
+            <div id="savedKeysList"></div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card">
+          <h2>3. Live Trial API Tester <span style="font-size:12px;color:var(--muted);font-weight:400;">Auth: X-API-Key or ?apiKey=</span></h2>
+          <div class="ep-grid">
+            <div class="ep-box">
+              <strong style="font-size:13px;">Home + Banners</strong>
+              <span style="font-size:11px;color:var(--muted);">GET /api/trial/home</span>
+              <div class="row">
+                <button class="sm" style="flex:1" onclick="callTrial('/api/trial/home')">Home</button>
+                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/categories')">Categories</button>
+              </div>
+            </div>
+            <div class="ep-box">
+              <strong style="font-size:13px;">MovieBox Search</strong>
+              <input id="searchQ" value="Squid Game" />
+              <button class="sm" onclick="callTrial('/api/trial/search?q=' + encodeURIComponent(val('searchQ') || 'Squid Game'))">Test Search</button>
+            </div>
+            <div class="ep-box">
+              <strong style="font-size:13px;">Category Catalog</strong>
+              <select id="catSel">
+                <option value="/">Trending (All)</option>
+                <option value="/new-uploads">New Uploads</option>
+                <option value="/new-releases">New Releases</option>
+                <option value="/hot-dhamaka">Hot Dhamaka</option>
+                <option value="/language/bangla">Bangla</option>
+                <option value="/bollywood">Bollywood</option>
+                <option value="/hollywood">Hollywood</option>
+                <option value="/language/hindi-dubbed">Hindi Dubbed</option>
+                <option value="/korean">Korean</option>
+                <option value="/anime">Anime</option>
+                <option value="/adult18plus">Adult 18+ (MovieBox Original)</option>
+              </select>
+              <button class="sm" onclick="callTrial('/api/trial/catalog?path=' + encodeURIComponent(val('catSel')) + '&page=1')">Test Catalog</button>
+            </div>
+            <div class="ep-box">
+              <strong style="font-size:13px;">Details &amp; Streams</strong>
+              <input id="titleInput" value="Squid Game" />
+              <div class="row">
+                <button class="sm" style="flex:1" onclick="callTrial('/api/trial/details?title=' + encodeURIComponent(val('titleInput') || 'Squid Game'))">Details</button>
+                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/stream?title=' + encodeURIComponent(val('titleInput') || 'Squid Game') + '&se=1&ep=1', false)">Stream</button>
+                <button class="sm" style="flex:1;background:#16a34a" onclick="callTrial('/api/trial/stream?title=' + encodeURIComponent(val('titleInput') || 'Squid Game') + '&se=1&ep=1', true)">Play Video</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" id="previewPlayerBox" style="display:none;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+            <strong id="previewTitle" style="font-size:14px;">Live Video Preview</strong>
+            <div class="row">
+              <select id="previewQualitySel" style="width:auto;padding:5px 8px;font-size:12px;" onchange="switchPreviewQuality()"></select>
+              <button class="sec sm" onclick="closePreviewPlayer()">Close</button>
+            </div>
+          </div>
+          <video id="previewVideo" controls playsinline style="width:100%;max-height:380px;background:#000;border-radius:10px;"></video>
+        </div>
+
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px;">
+            <div class="tabs">
+              <button class="tab on" onclick="setSnippetTab('widget', this)">Website HTML Widget</button>
+              <button class="tab" onclick="setSnippetTab('iframe', this)">Iframe Player</button>
+              <button class="tab" onclick="setSnippetTab('curl', this)">cURL</button>
+              <button class="tab" onclick="setSnippetTab('js', this)">JavaScript</button>
+              <button class="tab" onclick="setSnippetTab('py', this)">Python</button>
+            </div>
+            <div id="respMeta" style="font-size:12px;color:var(--muted);">Ready</div>
+          </div>
+          <div class="row" style="margin-bottom:10px;align-items:flex-start;">
+            <pre class="key-box" id="snippetBox" style="margin:0;flex:1;max-height:180px;font-family:monospace;font-size:11.5px;color:var(--blue);white-space:pre-wrap;word-break:break-word;">Generate or select a Trial Key to copy website integration code</pre>
+            <button class="sec sm" onclick="copyText(document.getElementById('snippetBox').textContent, this)">Copy Code</button>
+          </div>
+          <pre id="respOut">Generate a Trial API Key on the left, then click any endpoint to test live MovieBox responses.</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script>
+    const ORIGIN = window.location.origin;
+    const STORAGE_KEY = 'cp_trial_keys_v1';
+    let currentKey = '';
+    let currentManageToken = '';
+    let currentTrialData = null;
+    let lastEndpoint = '/api/trial/home';
+    let snippetMode = 'widget';
+
+    function val(id) { return document.getElementById(id).value.trim(); }
+    function getSaved() {
+      try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch { return []; }
+    }
+    function saveKeyLocal(item) {
+      const list = getSaved().filter(x => x.key !== item.key);
+      list.unshift(item);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(list.slice(0, 15)));
+      renderSavedList();
+    }
+    function copyText(txt, btn) {
+      if (!txt) return;
+      navigator.clipboard.writeText(txt).then(() => {
+        const old = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(() => btn.textContent = old, 1400);
+      });
+    }
+    function setSnippetTab(mode, btn) {
+      snippetMode = mode;
+      document.querySelectorAll('.tab').forEach(b => b.classList.remove('on'));
+      btn.classList.add('on');
+      updateSnippet();
+    }
+    function getClientOrigin() {
+      const chk = document.getElementById('useShareOriginChk');
+      if (ORIGIN.indexOf('://ais-dev-') !== -1 && chk && chk.checked) {
+        return ORIGIN.replace('://ais-dev-', '://ais-pre-');
+      }
+      return ORIGIN;
+    }
+    if (ORIGIN.indexOf('://ais-dev-') !== -1) {
+      document.getElementById('devOriginBanner').style.display = 'block';
+    }
+    function updateSnippet() {
+      const k = currentKey || 'YOUR_TRIAL_API_KEY';
+      const SHARE_BASE = getClientOrigin();
+      const url = SHARE_BASE + lastEndpoint;
+      const box = document.getElementById('snippetBox');
+      if (snippetMode === 'widget') {
+        box.textContent = [
+          '<!-- 100% Direct API + Native Video Player (Zero Iframe) -->',
+          '<div id="cp-moviebox-widget" style="background:#0b0c10;color:#fff;padding:16px;border-radius:12px;font-family:sans-serif">',
+          '  <div style="display:flex;gap:8px;margin-bottom:12px">',
+          '    <input id="cp-q" placeholder="Search Movie / Series..." style="flex:1;padding:10px;border-radius:8px;border:1px solid #333;background:#14161d;color:#fff" />',
+          '    <button onclick="cpLoadMovies()" style="background:#e50914;color:#fff;border:0;padding:10px 16px;border-radius:8px;cursor:pointer;font-weight:700">Search</button>',
+          '  </div>',
+          '  <video id="cp-video" controls autoplay playsinline style="display:none;width:100%;max-height:420px;background:#000;border-radius:10px;margin-bottom:14px"></video>',
+          '  <div id="cp-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px"></div>',
+          '</div>',
+          '<script>',
+          'const CP_API = "' + SHARE_BASE + '";',
+          'const CP_KEY = "' + k + '";',
+          'async function cpLoadMovies(){',
+          '  const q = document.getElementById("cp-q").value.trim();',
+          '  const ep = q ? "/api/trial/search?q=" + encodeURIComponent(q) : "/api/trial/home";',
+          '  const r = await fetch(CP_API + ep, { headers: { "X-API-Key": CP_KEY } });',
+          '  const d = await r.json();',
+          '  const list = d.items || d.trending || (d.sections && d.sections[0] && d.sections[0].items) || [];',
+          '  const grid = document.getElementById("cp-grid"); grid.innerHTML = "";',
+          '  list.slice(0,12).forEach(function(m){',
+          '    var c = document.createElement("div"); c.style.cssText = "cursor:pointer;background:#151720;border-radius:8px;overflow:hidden";',
+          '    c.onclick = function(){ cpPlay(m); };',
+          '    var im = document.createElement("img"); im.src = m.poster; im.style.cssText = "width:100%;aspect-ratio:2/3;object-fit:cover";',
+          '    var tt = document.createElement("div"); tt.textContent = m.title; tt.style.cssText = "padding:8px;font-size:12px;font-weight:600";',
+          '    c.appendChild(im); c.appendChild(tt); grid.appendChild(c);',
+          '  });',
+          '}',
+          'async function cpPlay(m){',
+          '  var isMovie = m.typeBadge === "MOVIE";',
+          '  var q = m.path ? ("path=" + encodeURIComponent(m.path)) : ("title=" + encodeURIComponent(m.title));',
+          '  const r = await fetch(CP_API + "/api/trial/stream?" + q + "&se=" + (isMovie ? 0 : 1) + "&ep=" + (isMovie ? 0 : 1), { headers: { "X-API-Key": CP_KEY } });',
+          '  const d = await r.json();',
+          '  const mp4 = (d.sources || []).find(function(s){ return s.type === "mp4" && s.url; });',
+          '  if (!mp4) return;',
+          '  const v = document.getElementById("cp-video");',
+          '  v.style.display = "block"; v.src = mp4.url; v.play();',
+          '}',
+          'cpLoadMovies();',
+          '</' + 'script>',
+        ].join('\\n');
+      } else if (snippetMode === 'iframe') {
+        const title = encodeURIComponent(val('titleInput') || 'Squid Game');
+        box.textContent = '<iframe src="' + SHARE_BASE + '/trial-embed?apiKey=' + k + '&title=' + title + '&se=1&ep=1" width="100%" height="460" allowfullscreen frameborder="0"></iframe>';
+      } else if (snippetMode === 'curl') {
+        box.textContent = 'curl -H "X-API-Key: ' + k + '" "' + url + '"';
+      } else if (snippetMode === 'js') {
+        box.textContent = 'fetch("' + url + '", { headers: { "X-API-Key": "' + k + '" } }).then(r => r.json()).then(console.log);';
+      } else {
+        box.textContent = 'import requests; print(requests.get("' + url + '", headers={"X-API-Key": "' + k + '"}).json())';
+      }
+    }
+    function renderActiveCard(t) {
+      currentTrialData = t;
+      document.getElementById('activeKeyCard').style.display = 'block';
+      document.getElementById('activeKeyText').textContent = t.key;
+      const isUnlim = Boolean(t.unlimited || t.maxRequests < 0);
+      const pct = isUnlim ? 100 : (t.maxRequests > 0 ? Math.round((t.remainingRequests / t.maxRequests) * 100) : 0);
+      document.getElementById('quotaBar').style.width = Math.max(0, Math.min(100, pct)) + '%';
+      document.getElementById('quotaText').textContent = isUnlim
+        ? ('UNLIMITED (' + (t.usedRequests || 0) + ' used)')
+        : (t.remainingRequests + ' / ' + t.maxRequests + ' requests left');
+      document.getElementById('expiryText').textContent = t.expiresInMinutes >= 1440
+        ? Math.round(t.expiresInMinutes / 1440) + 'd left'
+        : t.expiresInMinutes > 60
+          ? Math.round(t.expiresInMinutes / 60) + 'h left'
+          : t.expiresInMinutes + 'm left';
+      const badge = document.getElementById('keyStatusBadge');
+      badge.textContent = t.status;
+      badge.className = 'status-pill' + (t.status === 'ACTIVE' ? '' : ' bad');
+      document.getElementById('togglePauseBtn').textContent = t.active ? 'Pause' : 'Resume';
+      updateSnippet();
+    }
+    function renderSavedList() {
+      const list = getSaved();
+      const wrap = document.getElementById('savedListWrap');
+      const box = document.getElementById('savedKeysList');
+      if (!list.length) { wrap.style.display = 'none'; return; }
+      wrap.style.display = 'block';
+      box.innerHTML = '';
+      list.forEach(item => {
+        const card = document.createElement('div');
+        card.className = 'saved-item' + (item.key === currentKey ? ' active' : '');
+        const top = document.createElement('div');
+        top.style.cssText = 'display:flex;justify-content:space-between;gap:6px;font-weight:700;align-items:center;';
+        const title = document.createElement('span');
+        title.textContent = (item.clientName || 'Client') + ' (' + (item.plan || '24H') + ')';
+        const btn = document.createElement('button');
+        btn.className = 'sec sm';
+        btn.textContent = 'Use';
+        btn.onclick = () => selectSavedKey(item.key, item.manageToken || '');
+        top.appendChild(title);
+        top.appendChild(btn);
+        const kDiv = document.createElement('div');
+        kDiv.style.cssText = 'font-family:monospace;color:var(--blue);margin-top:4px;word-break:break-all;';
+        kDiv.textContent = item.key;
+        card.appendChild(top);
+        card.appendChild(kDiv);
+        box.appendChild(card);
+      });
+    }
+    async function selectSavedKey(k, mt) {
+      currentKey = k;
+      currentManageToken = mt || '';
+      document.getElementById('activeKeyInput').value = k;
+      renderSavedList();
+      await loadKeyStatus();
+    }
+    async function createTrialKey() {
+      const msg = document.getElementById('createMsg');
+      msg.textContent = 'Generating live API key...';
+      try {
+        const hdrs = { 'Content-Type': 'application/json' };
+        const adm = val('adminKeyInput');
+        if (adm) hdrs['X-Trial-Admin'] = adm;
+        const res = await fetch(ORIGIN + '/api/trial/keys', {
+          method: 'POST',
+          headers: hdrs,
+          body: JSON.stringify({
+            clientName: val('clientName') || 'Client Trial',
+            plan: val('planSelect') || '24H',
+          }),
+        });
+        const data = await res.json();
+        if (!data.ok || !data.trial) {
+          msg.textContent = data.error || 'Failed to generate key';
+          return;
+        }
+        currentKey = data.trial.key;
+        currentManageToken = data.trial.manageToken || '';
+        document.getElementById('activeKeyInput').value = currentKey;
+        saveKeyLocal({
+          key: data.trial.key,
+          manageToken: currentManageToken,
+          clientName: data.trial.clientName,
+          plan: data.trial.plan,
+        });
+        renderActiveCard(data.trial);
+        msg.textContent = 'Key created & active! Ready to share or test.';
+        document.getElementById('respOut').textContent = JSON.stringify(data, null, 2);
+      } catch (e) {
+        msg.textContent = String(e);
+      }
+    }
+    async function loadKeyStatus() {
+      const k = val('activeKeyInput') || currentKey;
+      if (!k) return;
+      currentKey = k;
+      const saved = getSaved().find(x => x.key === k);
+      if (saved && saved.manageToken) currentManageToken = saved.manageToken;
+      const res = await fetch(ORIGIN + '/api/trial/me?apiKey=' + encodeURIComponent(k));
+      const data = await res.json();
+      if (data.ok && data.trial) {
+        renderActiveCard(data.trial);
+      } else {
+        document.getElementById('keyStatusBadge').textContent = 'INVALID';
+        document.getElementById('keyStatusBadge').className = 'status-pill bad';
+        document.getElementById('respOut').textContent = JSON.stringify(data, null, 2);
+      }
+    }
+    async function togglePauseCurrentKey() {
+      const adm = val('adminKeyInput');
+      if (!currentKey || (!currentManageToken && !adm) || !currentTrialData) {
+        document.getElementById('createMsg').textContent = 'Enter Owner Admin Key or use a browser-created key to pause/resume.';
+        return;
+      }
+      const hdrs = { 'Content-Type': 'application/json' };
+      if (currentManageToken) hdrs['X-Trial-Manage-Token'] = currentManageToken;
+      if (adm) hdrs['X-Trial-Admin'] = adm;
+      const res = await fetch(ORIGIN + '/api/trial/keys/' + encodeURIComponent(currentKey), {
+        method: 'PATCH',
+        headers: hdrs,
+        body: JSON.stringify({ active: !currentTrialData.active }),
+      });
+      const data = await res.json();
+      if (data.ok && data.trial) renderActiveCard(data.trial);
+    }
+    async function extendCurrentKey30Days() {
+      const adm = val('adminKeyInput');
+      if (!currentKey || !adm) {
+        document.getElementById('createMsg').textContent = 'Enter Owner Admin Key above to add +30 Days.';
+        return;
+      }
+      const res = await fetch(ORIGIN + '/api/trial/keys/' + encodeURIComponent(currentKey), {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', 'X-Trial-Admin': adm },
+        body: JSON.stringify({ addHours: 720, unlimited: true }),
+      });
+      const data = await res.json();
+      if (data.ok && data.trial) {
+        renderActiveCard(data.trial);
+        document.getElementById('createMsg').textContent = 'Extended +30 Days (Unlimited requests)!';
+      } else {
+        document.getElementById('createMsg').textContent = data.error || 'Failed to extend key';
+      }
+    }
+    async function loadAllAdminKeys() {
+      const adm = val('adminKeyInput');
+      if (!adm) {
+        document.getElementById('createMsg').textContent = 'Enter Owner Admin Key above to view all clients.';
+        return;
+      }
+      const res = await fetch(ORIGIN + '/api/trial/admin/keys', { headers: { 'X-Trial-Admin': adm } });
+      const data = await res.json();
+      if (!data.ok || !Array.isArray(data.keys)) {
+        document.getElementById('createMsg').textContent = data.error || 'Invalid Admin Key';
+        return;
+      }
+      data.keys.forEach(t => saveKeyLocal({ key: t.key, manageToken: '', clientName: t.clientName, plan: t.plan }));
+      document.getElementById('createMsg').textContent = 'Loaded ' + data.keys.length + ' client keys from server.';
+      document.getElementById('respOut').textContent = JSON.stringify(data, null, 2);
+    }
+    function showPreviewPlayer(parsed, autoPlay) {
+      const mp4s = (parsed.sources || []).filter(function(s) { return s.type === 'mp4' && s.url; });
+      if (!mp4s.length) return;
+      const box = document.getElementById('previewPlayerBox');
+      const titleEl = document.getElementById('previewTitle');
+      const sel = document.getElementById('previewQualitySel');
+      const vid = document.getElementById('previewVideo');
+      titleEl.textContent = (parsed.title || 'MovieBox Preview') + (parsed.season ? ' (S' + parsed.season + ' E' + parsed.episode + ')' : '');
+      sel.innerHTML = '';
+      mp4s.forEach(function(s, idx) {
+        const opt = document.createElement('option');
+        opt.value = s.url;
+        opt.textContent = (s.quality || 'HD') + 'p MP4';
+        if (idx === 0) opt.selected = true;
+        sel.appendChild(opt);
+      });
+      box.style.display = 'block';
+      vid.src = mp4s[0].url;
+      if (autoPlay) vid.play().catch(function(){});
+    }
+    function switchPreviewQuality() {
+      const sel = document.getElementById('previewQualitySel');
+      const vid = document.getElementById('previewVideo');
+      if (!sel.value) return;
+      const t = vid.currentTime || 0;
+      vid.src = sel.value;
+      vid.onloadedmetadata = function() { try { vid.currentTime = t; } catch {} vid.play().catch(function(){}); };
+    }
+    function closePreviewPlayer() {
+      const vid = document.getElementById('previewVideo');
+      vid.pause();
+      vid.removeAttribute('src');
+      document.getElementById('previewPlayerBox').style.display = 'none';
+    }
+    async function callTrial(path, autoPlay) {
+      if (!currentKey) {
+        await createTrialKey();
+        if (!currentKey) return;
+      }
+      lastEndpoint = path;
+      updateSnippet();
+      const fullUrl = ORIGIN + path;
+      document.getElementById('respMeta').textContent = 'Calling ' + path + '...';
+      const t0 = performance.now();
+      try {
+        const res = await fetch(fullUrl, { headers: { 'X-API-Key': currentKey } });
+        const ms = Math.round(performance.now() - t0);
+        const text = await res.text();
+        document.getElementById('respMeta').textContent = 'HTTP ' + res.status + ' • ' + ms + ' ms';
+        try {
+          const parsed = JSON.parse(text);
+          if (parsed.trial) renderActiveCard(parsed.trial);
+          if (parsed.sources && parsed.sources.length) showPreviewPlayer(parsed, Boolean(autoPlay));
+          document.getElementById('respOut').textContent = JSON.stringify(parsed, null, 2);
+        } catch {
+          document.getElementById('respOut').textContent = text;
+        }
+      } catch (e) {
+        document.getElementById('respMeta').textContent = 'Error';
+        document.getElementById('respOut').textContent = String(e);
+      }
+    }
+    function copyClientInvite(btn) {
+      if (!currentKey || !currentTrialData) return;
+      const SHARE_BASE = getClientOrigin();
+      const quotaLabel = (currentTrialData.unlimited || currentTrialData.maxRequests < 0)
+        ? 'UNLIMITED'
+        : (currentTrialData.maxRequests + ' Requests');
+      const msg = [
+        'MovieBox Direct API Credentials (' + currentTrialData.clientName + ' - ' + currentTrialData.plan + '):',
+        '',
+        'Base URL: ' + SHARE_BASE + '/api/trial',
+        'API Key: ' + currentKey,
+        'Quota: ' + quotaLabel + ' | Expires: ' + currentTrialData.expiresAt,
+        'Live Tester Portal: ' + SHARE_BASE + '/trial',
+        '',
+        'Sample Endpoints (pass header X-API-Key or ?apiKey=):',
+        '- Home: ' + SHARE_BASE + '/api/trial/home?apiKey=' + currentKey,
+        '- Search: ' + SHARE_BASE + '/api/trial/search?q=Squid+Game&apiKey=' + currentKey,
+        '- Details: ' + SHARE_BASE + '/api/trial/details?title=Squid+Game&apiKey=' + currentKey,
+        '- Stream: ' + SHARE_BASE + '/api/trial/stream?title=Squid+Game&se=1&ep=1&apiKey=' + currentKey,
+      ].join('\\n');
+      copyText(msg, btn);
+    }
+    renderSavedList();
+    const first = getSaved()[0];
+    if (first) selectSavedKey(first.key, first.manageToken);
+    else updateSnippet();
+  </script>
+</body>
+</html>`);
+  });
+
+  // ==========================================================================================
+  // 6a-6. TELEGRAM BOT OWNER ADMIN CONTROLLER (LIST / PAUSE / RESUME / RENEW / CREATE / DELETE)
+  // ==========================================================================================
+  const botConfigPath = path.join(trialDataDir, 'cinepulse-bot-config.json');
+  interface BotConfigState {
+    publicUrl?: string;
+    ownerPinHash?: string;
+    ownerPinSalt?: string;
+  }
+  const loadBotConfig = (): BotConfigState => {
+    try {
+      if (!fs.existsSync(botConfigPath)) return {};
+      const parsed = JSON.parse(fs.readFileSync(botConfigPath, 'utf8'));
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  };
+  const saveBotConfig = (cfg: BotConfigState) => {
+    try {
+      if (!fs.existsSync(trialDataDir)) fs.mkdirSync(trialDataDir, { recursive: true });
+      const tmpFile = `${botConfigPath}.tmp`;
+      fs.writeFileSync(tmpFile, JSON.stringify(cfg, null, 2), 'utf8');
+      fs.renameSync(tmpFile, botConfigPath);
+    } catch {
+      // ignore write failure on read-only fs
+    }
+  };
+
+  let botConfigState: BotConfigState = loadBotConfig();
+  let capturedPublicBaseUrl = '';
+
+  capturePublicOriginForBot = (req: express.Request) => {
+    const rawOrigin = getPublicOrigin(req).replace(/\/+$/, '');
+    if (!rawOrigin) return;
+    if (/localhost|127\.0\.0\.1|0\.0\.0\.0/i.test(rawOrigin)) return;
+    capturedPublicBaseUrl = rawOrigin.includes('://ais-dev-')
+      ? rawOrigin.replace('://ais-dev-', '://ais-pre-')
+      : rawOrigin;
+  };
+
+  const resolvePublicBotBaseUrl = (): string => {
+    const envPublic = String(process.env.TRIAL_PUBLIC_URL || '').trim().replace(/\/+$/, '');
+    if (envPublic && envPublic.startsWith('http')) return envPublic;
+    if (botConfigState.publicUrl && botConfigState.publicUrl.startsWith('http')) {
+      return botConfigState.publicUrl.replace(/\/+$/, '');
+    }
+    if (capturedPublicBaseUrl && capturedPublicBaseUrl.startsWith('http')) {
+      return capturedPublicBaseUrl.replace(/\/+$/, '');
+    }
+    const renderExt = String(process.env.RENDER_EXTERNAL_URL || '').trim().replace(/\/+$/, '');
+    if (renderExt && renderExt.startsWith('http')) return renderExt;
+    const appUrl = String(process.env.APP_URL || '').trim().replace(/\/+$/, '');
+    if (appUrl && appUrl !== 'MY_APP_URL' && appUrl.startsWith('http')) return appUrl;
+    return `http://127.0.0.1:${PORT}`;
+  };
+
+  const getTelegramBotToken = (): string => String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  const getAllowedTelegramAdminIds = (): Set<string> => {
+    const raw = String(process.env.TELEGRAM_ADMIN_CHAT_ID || '').trim();
+    if (!raw) return new Set();
+    return new Set(
+      raw
+        .split(/[\s,;]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+    );
+  };
+
+  const getTrialShortId = (key: string): string =>
+    crypto.createHash('sha1').update(key).digest('hex').slice(0, 10);
+
+  const escTgHtml = (val: unknown): string =>
+    String(val ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+  const formatRemainingDurationBn = (expiresAt: number): string => {
+    const msLeft = expiresAt - Date.now();
+    if (msLeft <= 0) return 'মেয়াদ শেষ ❌';
+    const totalMins = Math.ceil(msLeft / 60_000);
+    if (totalMins >= 1440) {
+      const days = Math.floor(totalMins / 1440);
+      const hrs = Math.floor((totalMins % 1440) / 60);
+      return hrs > 0 ? `${days} দিন ${hrs} ঘন্টা` : `${days} দিন`;
+    }
+    if (totalMins >= 60) {
+      const hrs = Math.floor(totalMins / 60);
+      const mins = totalMins % 60;
+      return mins > 0 ? `${hrs} ঘন্টা ${mins} মি.` : `${hrs} ঘন্টা`;
+    }
+    return `${totalMins} মিনিট`;
+  };
+
+  const getTrialStatusMeta = (rec: StoredTrialKey) => {
+    const now = Date.now();
+    const isUnlimited = Boolean(rec.unlimited || rec.maxRequests < 0);
+    const remainingRequests = isUnlimited ? -1 : Math.max(0, rec.maxRequests - rec.usedRequests);
+    const expired = now >= rec.expiresAt;
+    if (!rec.active) return { code: 'PAUSED' as const, badge: '🔴 PAUSED (বন্ধ)' };
+    if (expired) return { code: 'EXPIRED' as const, badge: '⏰ EXPIRED (মেয়াদ শেষ)' };
+    if (!isUnlimited && remainingRequests <= 0) {
+      return { code: 'QUOTA_EXHAUSTED' as const, badge: '⚠️ QUOTA শেষ' };
+    }
+    return { code: 'ACTIVE' as const, badge: '🟢 ACTIVE (চালু)' };
+  };
+
+  const listAllNonRevokedTrials = (): StoredTrialKey[] =>
+    Array.from(trialKeysMap.values())
+      .filter((r) => !r.revoked)
+      .sort((a, b) => b.createdAt - a.createdAt);
+
+  const findTrialMatches = (query: string): { exact?: StoredTrialKey; matches: StoredTrialKey[] } => {
+    const clean = query.trim().replace(/^#/, '');
+    if (!clean) return { matches: [] };
+    const all = listAllNonRevokedTrials();
+
+    // 1. Exact full key
+    const exactFull = all.find((r) => r.key === clean);
+    if (exactFull) return { exact: exactFull, matches: [exactFull] };
+
+    // 2. Exact 10-char shortId
+    const lower = clean.toLowerCase();
+    const exactShort = all.find((r) => getTrialShortId(r.key) === lower);
+    if (exactShort) return { exact: exactShort, matches: [exactShort] };
+
+    // 3. Partial key / shortId prefix or case-insensitive clientName substring
+    const matches = all.filter(
+      (r) =>
+        getTrialShortId(r.key).startsWith(lower) ||
+        r.key.toLowerCase().startsWith(lower) ||
+        r.clientName.toLowerCase().includes(lower)
+    );
+    if (matches.length === 1) return { exact: matches[0], matches };
+    return { matches };
+  };
+
+  const createClientKeyForOwner = (
+    clientName: string,
+    planInput: StoredTrialKey['plan'],
+    forceUnlimited = false
+  ): StoredTrialKey => {
+    let durationHours = 24;
+    let maxRequests = 250;
+    let unlimited = forceUnlimited;
+
+    if (planInput === '2H') {
+      durationHours = 2;
+      maxRequests = 60;
+    } else if (planInput === '72H') {
+      durationHours = 72;
+      maxRequests = 600;
+    } else if (planInput === '7D') {
+      durationHours = 24 * 7;
+      maxRequests = forceUnlimited ? -1 : 5000;
+    } else if (planInput === '30D') {
+      durationHours = 24 * 30;
+      maxRequests = forceUnlimited ? -1 : 100000;
+    } else if (planInput === 'UNLIMITED') {
+      durationHours = 24 * 3650;
+      maxRequests = -1;
+      unlimited = true;
+    }
+    if (unlimited) maxRequests = -1;
+
+    const now = Date.now();
+    const expiresAt = now + durationHours * 3600_000;
+    const cleanName = String(clientName || 'Client').trim().slice(0, 48) || 'Client';
+    const key = issueSignedTrialKey({
+      clientName: cleanName,
+      plan: planInput,
+      createdAt: now,
+      expiresAt,
+      maxRequests,
+      unlimited,
+    });
+    const rec: StoredTrialKey = {
+      key,
+      clientName: cleanName,
+      plan: planInput,
+      createdAt: now,
+      expiresAt,
+      maxRequests,
+      unlimited,
+      usedRequests: 0,
+      lastUsedAt: null,
+      active: true,
+      createdIp: 'telegram-bot',
+    };
+    trialKeysMap.set(key, rec);
+    flushTrialStoreSync();
+    return rec;
+  };
+
+  const buildDashboardSummaryHtml = (): string => {
+    const all = listAllNonRevokedTrials();
+    let activeCount = 0;
+    let pausedCount = 0;
+    let expiredCount = 0;
+    let quotaCount = 0;
+    let totalRequests = 0;
+
+    for (const r of all) {
+      totalRequests += r.usedRequests || 0;
+      const st = getTrialStatusMeta(r).code;
+      if (st === 'ACTIVE') activeCount++;
+      else if (st === 'PAUSED') pausedCount++;
+      else if (st === 'EXPIRED') expiredCount++;
+      else if (st === 'QUOTA_EXHAUSTED') quotaCount++;
+    }
+
+    const baseUrl = resolvePublicBotBaseUrl();
+    const isPrivatePreview = /localhost|127\.0\.0\.1|:\/\/ais-dev-/i.test(baseUrl);
+
+    return [
+      '🎬 <b>MovieBox Original Direct API — Owner Panel</b>',
+      '',
+      `👥 <b>মোট ক্লায়েন্ট:</b> ${all.length} জন`,
+      `🟢 <b>Active (চালু):</b> ${activeCount}`,
+      `🔴 <b>Paused (বন্ধ):</b> ${pausedCount}`,
+      `⏰ <b>Expired (মেয়াদ শেষ):</b> ${expiredCount}`,
+      `⚠️ <b>Quota শেষ:</b> ${quotaCount}`,
+      `📊 <b>মোট API হিট:</b> ${totalRequests.toLocaleString()}`,
+      '',
+      `🌐 <b>API Base URL:</b> <code>${escTgHtml(baseUrl)}</code>`,
+      ...(isPrivatePreview
+        ? [
+            '⚠️ <i>নোট: অ্যাপটি Cloud Run / Render / Custom Domain-এ Deploy করে /seturl দিন যাতে ক্লায়েন্টদের অ্যাপ/ওয়েবসাইটে কোনো কুকি ব্লক ছাড়া সরাসরি চলে।</i>',
+          ]
+        : []),
+    ].join('\n');
+  };
+
+  const buildMainMenuKeyboard = () => ({
+    inline_keyboard: [
+      [
+        { text: '➕ নতুন ক্লায়েন্ট তৈরি', callback_data: 'tb:newmenu' },
+        { text: '📋 সব ক্লায়েন্ট লিস্ট', callback_data: 'tb:list:0' },
+      ],
+      [
+        { text: '📊 লাইভ স্ট্যাটাস', callback_data: 'tb:stats' },
+        { text: '🔍 ক্লায়েন্ট খুঁজুন', callback_data: 'tb:findask' },
+      ],
+      [
+        { text: '⏸️ বন্ধ (Paused)', callback_data: 'tb:paused:0' },
+        { text: '⏰ মেয়াদ শেষ (Expired)', callback_data: 'tb:expired:0' },
+      ],
+    ],
+  });
+
+  const buildClientCardHtml = (rec: StoredTrialKey): string => {
+    const shortId = getTrialShortId(rec.key);
+    const st = getTrialStatusMeta(rec);
+    const isUnlim = Boolean(rec.unlimited || rec.maxRequests < 0);
+    const quotaLine = isUnlim
+      ? `♾️ UNLIMITED (ব্যবহার: ${rec.usedRequests})`
+      : `${Math.max(0, rec.maxRequests - rec.usedRequests)} / ${rec.maxRequests} বাকি (ব্যবহার: ${rec.usedRequests})`;
+    const lastUsedStr = rec.lastUsedAt
+      ? new Date(rec.lastUsedAt).toISOString().replace('T', ' ').slice(0, 16) + ' UTC'
+      : 'এখনো ব্যবহার হয়নি';
+    const expiryIso = new Date(rec.expiresAt).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+
+    return [
+      `👤 <b>${escTgHtml(rec.clientName)}</b>  (<code>#${shortId}</code>)`,
+      `📌 <b>অবস্থা:</b> ${st.badge}`,
+      `📦 <b>প্ল্যান:</b> <code>${escTgHtml(rec.plan)}</code>`,
+      `⏳ <b>সময় বাকি:</b> ${formatRemainingDurationBn(rec.expiresAt)}`,
+      `📅 <b>মেয়াদ শেষ:</b> <code>${expiryIso}</code>`,
+      `📈 <b>লিমিট/ব্যবহার:</b> ${quotaLine}`,
+      `🕒 <b>শেষ ব্যবহার:</b> ${lastUsedStr}`,
+      `🔑 <b>API Key:</b> <code>${escTgHtml(rec.key)}</code>`,
+    ].join('\n');
+  };
+
+  const buildClientInlineKeyboard = (rec: StoredTrialKey) => {
+    const sid = getTrialShortId(rec.key);
+    const isUnlim = Boolean(rec.unlimited || rec.maxRequests < 0);
+    const toggleBtn = rec.active
+      ? { text: '⏸️ বন্ধ করুন (Pause)', callback_data: `tb:pause:${sid}` }
+      : { text: '▶️ চালু করুন (Resume)', callback_data: `tb:resume:${sid}` };
+
+    const row2: Array<{ text: string; callback_data: string }> = [];
+    if (!isUnlim) {
+      row2.push({ text: '♾️ আনলিমিটেড করুন', callback_data: `tb:unlim:${sid}` });
+    }
+    row2.push({ text: '📋 ক্লায়েন্ট মেসেজ', callback_data: `tb:msg:${sid}` });
+
+    return {
+      inline_keyboard: [
+        [
+          toggleBtn,
+          { text: '➕ ৭ দিন', callback_data: `tb:ext7:${sid}` },
+          { text: '➕ ৩০ দিন', callback_data: `tb:ext30:${sid}` },
+        ],
+        row2,
+        [
+          { text: '🔄 রিফ্রেশ', callback_data: `tb:view:${sid}` },
+          { text: '🗑 ডিলিট', callback_data: `tb:del:${sid}` },
+        ],
+        [
+          { text: '⬅️ ক্লায়েন্ট লিস্ট', callback_data: 'tb:list:0' },
+          { text: '🏠 মেইন মেনু', callback_data: 'tb:menu' },
+        ],
+      ],
+    };
+  };
+
+  const buildClientShareMessageText = (rec: StoredTrialKey): string => {
+    const base = resolvePublicBotBaseUrl();
+    const isUnlim = Boolean(rec.unlimited || rec.maxRequests < 0);
+    const quotaLabel = isUnlim ? 'UNLIMITED' : `${rec.maxRequests} Requests`;
+    const expIso = new Date(rec.expiresAt).toISOString();
+    return [
+      `MovieBox Original Direct API Credentials (${rec.clientName} - ${rec.plan}):`,
+      '',
+      `Base URL: ${base}/api/trial`,
+      `API Key: ${rec.key}`,
+      `Quota: ${quotaLabel} | Expires: ${expIso}`,
+      `Live Tester Portal: ${base}/trial`,
+      '',
+      'Sample Endpoints (pass header X-API-Key or ?apiKey=):',
+      `- Home: ${base}/api/trial/home?apiKey=${rec.key}`,
+      `- Search: ${base}/api/trial/search?q=Squid+Game&apiKey=${rec.key}`,
+      `- Catalog (18+): ${base}/api/trial/catalog?path=/adult18plus&page=1&apiKey=${rec.key}`,
+      `- Details: ${base}/api/trial/details?title=Squid+Game&apiKey=${rec.key}`,
+      `- Stream: ${base}/api/trial/stream?title=Squid+Game&se=1&ep=1&apiKey=${rec.key}`,
+    ].join('\n');
+  };
+
+  interface TelegramDispatchResult {
+    ok: boolean;
+    result?: any;
+    description?: string;
+  }
+
+  type TelegramDispatchFn = (method: string, payload: Record<string, any>) => Promise<TelegramDispatchResult>;
+
+  const callTelegramBotApi: TelegramDispatchFn = async (method, payload) => {
+    const token = getTelegramBotToken();
+    if (!token) return { ok: false, description: 'TELEGRAM_BOT_TOKEN not configured' };
+    try {
+      const resp = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(30_000),
+      });
+      const json = (await resp.json().catch(() => ({ ok: false }))) as TelegramDispatchResult;
+      return json;
+    } catch (err: any) {
+      return { ok: false, description: err?.message || 'Telegram API network error' };
+    }
+  };
+
+  const botPendingState = new Map<
+    string,
+    { step: 'await_new_name' | 'await_new_plan' | 'await_find_query'; clientName?: string; updatedAt: number }
+  >();
+  const notifiedTrialAlerts = new Map<string, string>();
+
+  notifyTelegramTrialAlert = (rec, reason) => {
+    const token = getTelegramBotToken();
+    const admins = getAllowedTelegramAdminIds();
+    if (!token || admins.size === 0) return;
+
+    const sig = `${reason}:${rec.expiresAt}:${rec.maxRequests}`;
+    if (notifiedTrialAlerts.get(rec.key) === sig) return;
+    notifiedTrialAlerts.set(rec.key, sig);
+
+    const shortId = getTrialShortId(rec.key);
+    const title =
+      reason === 'EXPIRED'
+        ? '⏰ <b>ক্লায়েন্টের মেয়াদ শেষ হয়েছে!</b>'
+        : '⚠️ <b>ক্লায়েন্টের রিকোয়েস্ট Quota শেষ হয়েছে!</b>';
+    const text = [
+      title,
+      '',
+      `👤 ক্লায়েন্ট: <b>${escTgHtml(rec.clientName)}</b> (<code>#${shortId}</code>)`,
+      `📦 প্ল্যান: <code>${escTgHtml(rec.plan)}</code>`,
+      `📈 ব্যবহার: ${rec.usedRequests}${rec.unlimited || rec.maxRequests < 0 ? '' : '/' + rec.maxRequests}`,
+      '',
+      'নিচের বাটন থেকে রিনিউ করুন অথবা বন্ধ রাখুন:',
+    ].join('\n');
+
+    const reply_markup = {
+      inline_keyboard: [
+        [
+          { text: '➕ ৩০ দিন রিনিউ', callback_data: `tb:ext30:${sidForAlert(rec.key)}` },
+          { text: '⏸️ বন্ধ করুন', callback_data: `tb:pause:${sidForAlert(rec.key)}` },
+        ],
+        [{ text: '👤 বিস্তারিত দেখুন', callback_data: `tb:view:${sidForAlert(rec.key)}` }],
+      ],
+    };
+
+    for (const chatId of admins) {
+      void callTelegramBotApi('sendMessage', {
+        chat_id: chatId,
+        text,
+        parse_mode: 'HTML',
+        reply_markup,
+      }).catch(() => {});
+    }
+  };
+
+  const sidForAlert = (k: string) => getTrialShortId(k);
+
+  const renderClientListMessage = (
+    filterMode: 'ALL' | 'PAUSED' | 'EXPIRED',
+    pageNum: number
+  ): { text: string; reply_markup: any } => {
+    const all = listAllNonRevokedTrials().filter((r) => {
+      if (filterMode === 'ALL') return true;
+      const code = getTrialStatusMeta(r).code;
+      return filterMode === 'PAUSED' ? code === 'PAUSED' : code === 'EXPIRED' || code === 'QUOTA_EXHAUSTED';
+    });
+
+    const pageSize = 8;
+    const totalPages = Math.max(1, Math.ceil(all.length / pageSize));
+    const page = Math.min(totalPages - 1, Math.max(0, pageNum));
+    const slice = all.slice(page * pageSize, page * pageSize + pageSize);
+
+    const headerTitle =
+      filterMode === 'PAUSED'
+        ? `⏸️ <b>বন্ধ (Paused) ক্লায়েন্ট (${all.length} জন)</b>`
+        : filterMode === 'EXPIRED'
+          ? `⏰ <b>মেয়াদ/কোটা শেষ ক্লায়েন্ট (${all.length} জন)</b>`
+          : `📋 <b>সব API ক্লায়েন্ট তালিকা (${all.length} জন)</b>`;
+
+    const lines = [headerTitle, ''];
+    if (slice.length === 0) {
+      lines.push('এই তালিকায় কোনো ক্লায়েন্ট নেই।');
+    } else {
+      slice.forEach((r, idx) => {
+        const st = getTrialStatusMeta(r);
+        const icon = st.code === 'ACTIVE' ? '🟢' : st.code === 'PAUSED' ? '🔴' : '⏰';
+        const timeStr = r.active ? formatRemainingDurationBn(r.expiresAt) : 'Paused';
+        lines.push(
+          `${page * pageSize + idx + 1}. ${icon} <b>${escTgHtml(r.clientName)}</b> — <code>${escTgHtml(
+            r.plan
+          )}</code> (${timeStr}) [<code>#${getTrialShortId(r.key)}</code>]`
+        );
+      });
+      lines.push('', 'যেকোনো ক্লায়েন্ট কন্ট্রোল করতে নিচের বাটনে ট্যাপ করুন:');
+    }
+
+    const prefix = filterMode === 'PAUSED' ? 'paused' : filterMode === 'EXPIRED' ? 'expired' : 'list';
+    const keyboard: Array<Array<{ text: string; callback_data: string }>> = slice.map((r) => {
+      const st = getTrialStatusMeta(r);
+      const icon = st.code === 'ACTIVE' ? '🟢' : st.code === 'PAUSED' ? '🔴' : '⏰';
+      const timeStr = st.code === 'PAUSED' ? 'Paused' : formatRemainingDurationBn(r.expiresAt);
+      return [
+        {
+          text: `${icon} ${r.clientName.slice(0, 22)} (${r.plan} • ${timeStr})`,
+          callback_data: `tb:view:${getTrialShortId(r.key)}`,
+        },
+      ];
+    });
+
+    const navRow: Array<{ text: string; callback_data: string }> = [];
+    if (page > 0) navRow.push({ text: '◀️ আগের', callback_data: `tb:${prefix}:${page - 1}` });
+    if (page + 1 < totalPages) navRow.push({ text: 'পরের ▶️', callback_data: `tb:${prefix}:${page + 1}` });
+    if (navRow.length) keyboard.push(navRow);
+
+    keyboard.push([
+      { text: '➕ নতুন ক্লায়েন্ট', callback_data: 'tb:newmenu' },
+      { text: '🏠 মেইন মেনু', callback_data: 'tb:menu' },
+    ]);
+
+    return { text: lines.join('\n'), reply_markup: { inline_keyboard: keyboard } };
+  };
+
+  const handleTelegramUpdate = async (
+    update: any,
+    dispatch: TelegramDispatchFn = callTelegramBotApi
+  ): Promise<{ handled: boolean; reason?: string }> => {
+    if (!update || typeof update !== 'object') return { handled: false, reason: 'empty_update' };
+
+    const allowedAdmins = getAllowedTelegramAdminIds();
+    const cb = update.callback_query;
+    const msg = update.message || update.edited_message;
+
+    const chatId = cb
+      ? String(cb.message?.chat?.id || cb.from?.id || '')
+      : msg
+        ? String(msg.chat?.id || msg.from?.id || '')
+        : '';
+    const fromId = cb ? String(cb.from?.id || '') : msg ? String(msg.from?.id || '') : '';
+    if (!chatId) return { handled: false, reason: 'no_chat_id' };
+
+    const isAuthorized = allowedAdmins.size > 0 && (allowedAdmins.has(chatId) || allowedAdmins.has(fromId));
+    if (!isAuthorized) {
+      const replyText =
+        allowedAdmins.size === 0
+          ? [
+              '🔒 <b>Admin Bot সুরক্ষিত আছে!</b>',
+              `আপনার Telegram Chat ID: <code>${escTgHtml(fromId || chatId)}</code>`,
+              '',
+              'সার্ভার Env Variable-এ <code>TELEGRAM_ADMIN_CHAT_ID</code> সেট করে সার্ভার রিস্টার্ট করলে বট অ্যাক্সেস চালু হবে।',
+            ].join('\n')
+          : '⛔ Unauthorized. শুধুমাত্র Bot Owner এই কন্ট্রোল প্যানেল ব্যবহার করতে পারবেন।';
+      if (cb?.id) {
+        await dispatch('answerCallbackQuery', {
+          callback_query_id: cb.id,
+          text: 'Unauthorized admin ID',
+          show_alert: true,
+        });
+      }
+      await dispatch('sendMessage', { chat_id: chatId, text: replyText, parse_mode: 'HTML' });
+      return { handled: true, reason: 'unauthorized' };
+    }
+
+    const sendOrEdit = async (text: string, reply_markup?: any, forceNew = false) => {
+      if (cb && cb.message?.message_id && !forceNew) {
+        const res = await dispatch('editMessageText', {
+          chat_id: chatId,
+          message_id: cb.message.message_id,
+          text,
+          parse_mode: 'HTML',
+          ...(reply_markup ? { reply_markup } : {}),
+        });
+        if (res.ok) return res;
+      }
+      return dispatch('sendMessage', {
+        chat_id: chatId,
+        text,
+        parse_mode: 'HTML',
+        ...(reply_markup ? { reply_markup } : {}),
+      });
+    };
+
+    const sendClientCreatedMessages = async (rec: StoredTrialKey) => {
+      notifiedTrialAlerts.delete(rec.key);
+      await dispatch('sendMessage', {
+        chat_id: chatId,
+        text: `✅ <b>নতুন ক্লায়েন্ট API Key তৈরি হয়েছে!</b>\n\n${buildClientCardHtml(rec)}`,
+        parse_mode: 'HTML',
+        reply_markup: buildClientInlineKeyboard(rec),
+      });
+      await dispatch('sendMessage', {
+        chat_id: chatId,
+        text: `📋 <b>ক্লায়েন্টকে দেওয়ার জন্য কপি/ফরওয়ার্ড মেসেজ:</b>\n\n<pre>${escTgHtml(
+          buildClientShareMessageText(rec)
+        )}</pre>`,
+        parse_mode: 'HTML',
+      });
+    };
+
+    const sendSearchMatches = async (query: string) => {
+      const { exact, matches } = findTrialMatches(query);
+      if (exact) {
+        await sendOrEdit(buildClientCardHtml(exact), buildClientInlineKeyboard(exact), true);
+        return;
+      }
+      if (matches.length === 0) {
+        await dispatch('sendMessage', {
+          chat_id: chatId,
+          text: `❌ "<b>${escTgHtml(query)}</b>" নামে কোনো ক্লায়েন্ট পাওয়া যায়নি।`,
+          parse_mode: 'HTML',
+          reply_markup: { inline_keyboard: [[{ text: '📋 সব ক্লায়েন্ট লিস্ট', callback_data: 'tb:list:0' }]] },
+        });
+        return;
+      }
+      const buttons = matches.slice(0, 10).map((r) => {
+        const icon = getTrialStatusMeta(r).code === 'ACTIVE' ? '🟢' : '🔴';
+        return [
+          {
+            text: `${icon} ${r.clientName} (${r.plan} • #${getTrialShortId(r.key)})`,
+            callback_data: `tb:view:${getTrialShortId(r.key)}`,
+          },
+        ];
+      });
+      await dispatch('sendMessage', {
+        chat_id: chatId,
+        text: `🔍 "<b>${escTgHtml(query)}</b>" এর জন্য ${matches.length} জন মিলেছে। সিলেক্ট করুন:`,
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: buttons },
+      });
+    };
+
+    // 1. Inline Button Callbacks
+    if (cb) {
+      const data = String(cb.data || '');
+      let toast = '';
+
+      if (data === 'tb:menu' || data === 'tb:stats') {
+        botPendingState.delete(chatId);
+        await sendOrEdit(buildDashboardSummaryHtml(), buildMainMenuKeyboard());
+      } else if (data.startsWith('tb:list:')) {
+        const pg = parseInt(data.slice(8), 10) || 0;
+        const view = renderClientListMessage('ALL', pg);
+        await sendOrEdit(view.text, view.reply_markup);
+      } else if (data.startsWith('tb:paused:')) {
+        const pg = parseInt(data.slice(10), 10) || 0;
+        const view = renderClientListMessage('PAUSED', pg);
+        await sendOrEdit(view.text, view.reply_markup);
+      } else if (data.startsWith('tb:expired:')) {
+        const pg = parseInt(data.slice(11), 10) || 0;
+        const view = renderClientListMessage('EXPIRED', pg);
+        await sendOrEdit(view.text, view.reply_markup);
+      } else if (data === 'tb:newmenu') {
+        botPendingState.set(chatId, { step: 'await_new_name', updatedAt: Date.now() });
+        await sendOrEdit(
+          '➕ <b>নতুন ক্লায়েন্ট API Key তৈরি</b>\n\nক্লায়েন্ট বা অ্যাপের নাম লিখে পাঠান (যেমন: <code>Rahim OTT App</code>):',
+          { inline_keyboard: [[{ text: '❌ বাতিল', callback_data: 'tb:menu' }]] }
+        );
+      } else if (data === 'tb:findask') {
+        botPendingState.set(chatId, { step: 'await_find_query', updatedAt: Date.now() });
+        await sendOrEdit(
+          '🔍 <b>ক্লায়েন্ট খুঁজুন</b>\n\nক্লায়েন্টের নাম অথবা Short ID (যেমন <code>Rahim</code>) লিখে পাঠান:',
+          { inline_keyboard: [[{ text: '❌ বাতিল', callback_data: 'tb:menu' }]] }
+        );
+      } else if (data.startsWith('tb:mk:')) {
+        const code = data.slice(6);
+        const pending = botPendingState.get(chatId);
+        const name = (pending && pending.clientName) || `Client ${new Date().toISOString().slice(5, 16)}`;
+        botPendingState.delete(chatId);
+        let plan: StoredTrialKey['plan'] = '30D';
+        let forceUnlim = false;
+        if (code === '24H') plan = '24H';
+        else if (code === '72H') plan = '72H';
+        else if (code === '7D') plan = '7D';
+        else if (code === '30D') plan = '30D';
+        else if (code === '30DU') {
+          plan = '30D';
+          forceUnlim = true;
+        } else if (code === 'UNLIM') {
+          plan = 'UNLIMITED';
+          forceUnlim = true;
+        }
+        const created = createClientKeyForOwner(name, plan, forceUnlim);
+        toast = 'API Key তৈরি হয়েছে!';
+        await sendClientCreatedMessages(created);
+      } else if (data.startsWith('tb:view:')) {
+        const sid = data.slice(8);
+        const { exact } = findTrialMatches(sid);
+        if (!exact) {
+          toast = 'ক্লায়েন্ট পাওয়া যায়নি';
+          await sendOrEdit('❌ ক্লায়েন্টটি পাওয়া যায়নি বা ডিলিট করা হয়েছে।', buildMainMenuKeyboard());
+        } else {
+          await sendOrEdit(buildClientCardHtml(exact), buildClientInlineKeyboard(exact));
+        }
+      } else if (data.startsWith('tb:pause:')) {
+        const sid = data.slice(9);
+        const { exact } = findTrialMatches(sid);
+        if (exact) {
+          exact.active = false;
+          flushTrialStoreSync();
+          toast = 'ক্লায়েন্ট API বন্ধ (Paused) করা হয়েছে!';
+          await sendOrEdit(buildClientCardHtml(exact), buildClientInlineKeyboard(exact));
+        }
+      } else if (data.startsWith('tb:resume:')) {
+        const sid = data.slice(10);
+        const { exact } = findTrialMatches(sid);
+        if (exact) {
+          exact.active = true;
+          notifiedTrialAlerts.delete(exact.key);
+          flushTrialStoreSync();
+          toast = 'ক্লায়েন্ট API চালু (Resumed) করা হয়েছে!';
+          await sendOrEdit(buildClientCardHtml(exact), buildClientInlineKeyboard(exact));
+        }
+      } else if (data.startsWith('tb:ext7:') || data.startsWith('tb:ext30:')) {
+        const is30 = data.startsWith('tb:ext30:');
+        const sid = data.slice(is30 ? 9 : 8);
+        const days = is30 ? 30 : 7;
+        const { exact } = findTrialMatches(sid);
+        if (exact) {
+          exact.expiresAt = Math.max(Date.now(), exact.expiresAt) + days * 86_400_000;
+          exact.active = true;
+          notifiedTrialAlerts.delete(exact.key);
+          flushTrialStoreSync();
+          toast = `+${days} দিন মেয়াদ বাড়ানো হয়েছে!`;
+          await sendOrEdit(buildClientCardHtml(exact), buildClientInlineKeyboard(exact));
+        }
+      } else if (data.startsWith('tb:unlim:')) {
+        const sid = data.slice(9);
+        const { exact } = findTrialMatches(sid);
+        if (exact) {
+          exact.unlimited = true;
+          exact.maxRequests = -1;
+          exact.active = true;
+          notifiedTrialAlerts.delete(exact.key);
+          flushTrialStoreSync();
+          toast = 'আনলিমিটেড রিকোয়েস্ট চালু হয়েছে!';
+          await sendOrEdit(buildClientCardHtml(exact), buildClientInlineKeyboard(exact));
+        }
+      } else if (data.startsWith('tb:msg:')) {
+        const sid = data.slice(7);
+        const { exact } = findTrialMatches(sid);
+        if (exact) {
+          toast = 'ক্লায়েন্ট মেসেজ পাঠানো হয়েছে';
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: `📋 <b>${escTgHtml(exact.clientName)} — কপি/ফরওয়ার্ড মেসেজ:</b>\n\n<pre>${escTgHtml(
+              buildClientShareMessageText(exact)
+            )}</pre>`,
+            parse_mode: 'HTML',
+          });
+        }
+      } else if (data.startsWith('tb:del:')) {
+        const sid = data.slice(7);
+        const { exact } = findTrialMatches(sid);
+        if (exact) {
+          await sendOrEdit(
+            `⚠️ আপনি কি নিশ্চিতভাবে <b>${escTgHtml(exact.clientName)}</b> (<code>#${sid}</code>)-এর API Key স্থায়ীভাবে ডিলিট করতে চান?\n\nডিলিট করলে এই Key দিয়ে আর কোনো ভিডিও বা API কাজ করবে না।`,
+            {
+              inline_keyboard: [
+                [
+                  { text: '✅ হ্যাঁ, ডিলিট করুন', callback_data: `tb:delok:${sid}` },
+                  { text: '❌ না, ফিরে যান', callback_data: `tb:view:${sid}` },
+                ],
+              ],
+            }
+          );
+        }
+      } else if (data.startsWith('tb:delok:')) {
+        const sid = data.slice(9);
+        const { exact } = findTrialMatches(sid);
+        if (exact) {
+          exact.active = false;
+          exact.revoked = true;
+          flushTrialStoreSync();
+          toast = 'API Key স্থায়ীভাবে ডিলিট হয়েছে!';
+        }
+        const view = renderClientListMessage('ALL', 0);
+        await sendOrEdit(view.text, view.reply_markup);
+      }
+
+      if (cb.id) {
+        await dispatch('answerCallbackQuery', {
+          callback_query_id: cb.id,
+          ...(toast ? { text: toast } : {}),
+        });
+      }
+      return { handled: true, reason: `callback:${data}` };
+    }
+
+    // 2. Text Commands & Pending Interactive Steps
+    const text = String(msg?.text || '').trim();
+    if (!text) return { handled: false, reason: 'no_text' };
+
+    const cmdMatch = text.match(/^\/([a-zA-Z0-9_]+)(?:@[a-zA-Z0-9_]+)?(?:\s+([\s\S]*))?$/);
+    if (cmdMatch) {
+      botPendingState.delete(chatId);
+      const cmd = cmdMatch[1].toLowerCase();
+      const arg = (cmdMatch[2] || '').trim();
+
+      if (cmd === 'start' || cmd === 'menu' || cmd === 'help' || cmd === 'stats') {
+        const helpFooter =
+          cmd === 'help'
+            ? [
+                '',
+                '⚡ <b>সকল কমান্ড:</b>',
+                '• <code>/list</code> — সব ক্লায়েন্ট ও মেয়াদ',
+                '• <code>/new RahimOTT 30D</code> — নতুন Key (24H/72H/7D/30D/UNLIMITED)',
+                '• <code>/find Rahim</code> — ক্লায়েন্ট খুঁজুন',
+                '• <code>/pause Rahim</code> — টাকা না দিলে সাথে সাথে বন্ধ করুন',
+                '• <code>/resume Rahim</code> — আবার চালু করুন',
+                '• <code>/renew Rahim 30</code> — মেয়াদ ৩০ দিন বাড়ান',
+                '• <code>/unlimited Rahim</code> — রিকোয়েস্ট আনলিমিটেড করুন',
+                '• <code>/delete Rahim</code> — Key স্থায়ীভাবে ডিলিট করুন',
+                '• <code>/msg Rahim</code> — ক্লায়েন্টকে দেওয়ার মেসেজ আনুন',
+                '• <code>/seturl https://...</code> — লাইভ ডোমেইন সেট করুন',
+              ].join('\n')
+            : '';
+        await dispatch('sendMessage', {
+          chat_id: chatId,
+          text: buildDashboardSummaryHtml() + helpFooter,
+          parse_mode: 'HTML',
+          reply_markup: buildMainMenuKeyboard(),
+        });
+        return { handled: true, reason: `cmd:${cmd}` };
+      }
+
+      if (cmd === 'list') {
+        const pg = Math.max(0, (parseInt(arg, 10) || 1) - 1);
+        const view = renderClientListMessage('ALL', pg);
+        await dispatch('sendMessage', {
+          chat_id: chatId,
+          text: view.text,
+          parse_mode: 'HTML',
+          reply_markup: view.reply_markup,
+        });
+        return { handled: true, reason: 'cmd:list' };
+      }
+
+      if (cmd === 'new') {
+        if (!arg) {
+          botPendingState.set(chatId, { step: 'await_new_name', updatedAt: Date.now() });
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: '➕ ক্লায়েন্টের নাম লিখুন (যেমন: <code>Rahim OTT</code>):',
+            parse_mode: 'HTML',
+          });
+          return { handled: true, reason: 'cmd:new:prompt' };
+        }
+        const parts = arg.split(/\s+/);
+        const lastUpper = parts[parts.length - 1].toUpperCase();
+        const planTokens = ['2H', '24H', '72H', '7D', '30D', 'UNLIMITED', 'UNLIM'];
+        let plan: StoredTrialKey['plan'] = '30D';
+        let clientName = arg;
+        if (parts.length > 1 && planTokens.includes(lastUpper)) {
+          plan = lastUpper === 'UNLIM' ? 'UNLIMITED' : (lastUpper as StoredTrialKey['plan']);
+          clientName = parts.slice(0, -1).join(' ');
+        }
+        const created = createClientKeyForOwner(clientName, plan, plan === 'UNLIMITED');
+        await sendClientCreatedMessages(created);
+        return { handled: true, reason: `cmd:new:${plan}` };
+      }
+
+      if (cmd === 'find' || cmd === 'info') {
+        if (!arg) {
+          botPendingState.set(chatId, { step: 'await_find_query', updatedAt: Date.now() });
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: '🔍 ক্লায়েন্টের নাম অথবা ID লিখুন:',
+            parse_mode: 'HTML',
+          });
+          return { handled: true, reason: `cmd:${cmd}:prompt` };
+        }
+        await sendSearchMatches(arg);
+        return { handled: true, reason: `cmd:${cmd}` };
+      }
+
+      if (cmd === 'pause' || cmd === 'resume' || cmd === 'unlimited' || cmd === 'delete' || cmd === 'msg') {
+        if (!arg) {
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: `ব্যবহার: <code>/${cmd} ক্লায়েন্টের_নাম_বা_ID</code>`,
+            parse_mode: 'HTML',
+          });
+          return { handled: true, reason: `cmd:${cmd}:missing_arg` };
+        }
+        const { exact, matches } = findTrialMatches(arg);
+        if (!exact) {
+          await sendSearchMatches(arg);
+          return { handled: true, reason: `cmd:${cmd}:not_exact_${matches.length}` };
+        }
+        if (cmd === 'pause') {
+          exact.active = false;
+          flushTrialStoreSync();
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: `⏸️ <b>বন্ধ করা হয়েছে (API ও ভিডিও ব্লক):</b>\n\n${buildClientCardHtml(exact)}`,
+            parse_mode: 'HTML',
+            reply_markup: buildClientInlineKeyboard(exact),
+          });
+        } else if (cmd === 'resume') {
+          exact.active = true;
+          notifiedTrialAlerts.delete(exact.key);
+          flushTrialStoreSync();
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: `▶️ <b>পুনরায় চালু করা হয়েছে:</b>\n\n${buildClientCardHtml(exact)}`,
+            parse_mode: 'HTML',
+            reply_markup: buildClientInlineKeyboard(exact),
+          });
+        } else if (cmd === 'unlimited') {
+          exact.unlimited = true;
+          exact.maxRequests = -1;
+          exact.active = true;
+          notifiedTrialAlerts.delete(exact.key);
+          flushTrialStoreSync();
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: `♾️ <b>আনলিমিটেড রিকোয়েস্ট চালু:</b>\n\n${buildClientCardHtml(exact)}`,
+            parse_mode: 'HTML',
+            reply_markup: buildClientInlineKeyboard(exact),
+          });
+        } else if (cmd === 'delete') {
+          exact.active = false;
+          exact.revoked = true;
+          flushTrialStoreSync();
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: `🗑 <b>${escTgHtml(exact.clientName)}</b> (<code>#${getTrialShortId(
+              exact.key
+            )}</code>) এর API Key স্থায়ীভাবে ডিলিট করা হয়েছে।`,
+            parse_mode: 'HTML',
+            reply_markup: buildMainMenuKeyboard(),
+          });
+        } else if (cmd === 'msg') {
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: `📋 <b>${escTgHtml(exact.clientName)} — ক্লায়েন্ট মেসেজ:</b>\n\n<pre>${escTgHtml(
+              buildClientShareMessageText(exact)
+            )}</pre>`,
+            parse_mode: 'HTML',
+          });
+        }
+        return { handled: true, reason: `cmd:${cmd}:ok` };
+      }
+
+      if (cmd === 'renew') {
+        const parts = arg.split(/\s+/).filter(Boolean);
+        if (!parts.length) {
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: 'ব্যবহার: <code>/renew ক্লায়েন্টের_নাম 30</code> (ডিফল্ট ৩০ দিন)',
+            parse_mode: 'HTML',
+          });
+          return { handled: true, reason: 'cmd:renew:missing_arg' };
+        }
+        let days = 30;
+        let query = arg;
+        if (parts.length > 1 && /^\d{1,4}$/.test(parts[parts.length - 1])) {
+          days = Math.min(3650, Math.max(1, parseInt(parts[parts.length - 1], 10)));
+          query = parts.slice(0, -1).join(' ');
+        }
+        const { exact } = findTrialMatches(query);
+        if (!exact) {
+          await sendSearchMatches(query);
+          return { handled: true, reason: 'cmd:renew:not_exact' };
+        }
+        exact.expiresAt = Math.max(Date.now(), exact.expiresAt) + days * 86_400_000;
+        exact.active = true;
+        notifiedTrialAlerts.delete(exact.key);
+        flushTrialStoreSync();
+        await dispatch('sendMessage', {
+          chat_id: chatId,
+          text: `✅ <b>+${days} দিন মেয়াদ বাড়ানো (Renew) হয়েছে!</b>\n\n${buildClientCardHtml(exact)}`,
+          parse_mode: 'HTML',
+          reply_markup: buildClientInlineKeyboard(exact),
+        });
+        return { handled: true, reason: `cmd:renew:${days}` };
+      }
+
+      if (cmd === 'seturl') {
+        const cleanUrl = arg.replace(/\/+$/, '');
+        if (!/^https?:\/\/.+/i.test(cleanUrl)) {
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: `ব্যবহার: <code>/seturl https://your-domain.run.app</code>\nবর্তমান URL: <code>${escTgHtml(
+              resolvePublicBotBaseUrl()
+            )}</code>`,
+            parse_mode: 'HTML',
+          });
+          return { handled: true, reason: 'cmd:seturl:invalid' };
+        }
+        botConfigState.publicUrl = cleanUrl;
+        saveBotConfig(botConfigState);
+        await dispatch('sendMessage', {
+          chat_id: chatId,
+          text: `✅ পাবলিক API Base URL আপডেট হয়েছে:\n<code>${escTgHtml(cleanUrl)}</code>`,
+          parse_mode: 'HTML',
+        });
+        return { handled: true, reason: 'cmd:seturl:ok' };
+      }
+
+      await dispatch('sendMessage', {
+        chat_id: chatId,
+        text: '❓ অজানা কমান্ড। <code>/menu</code> বা <code>/help</code> লিখে দেখুন।',
+        parse_mode: 'HTML',
+        reply_markup: buildMainMenuKeyboard(),
+      });
+      return { handled: true, reason: `cmd:unknown:${cmd}` };
+    }
+
+    // 3. Pending interactive text input (from inline button prompts)
+    const pending = botPendingState.get(chatId);
+    if (pending && Date.now() - pending.updatedAt < 10 * 60_000) {
+      if (pending.step === 'await_new_name') {
+        const cleanName = text.slice(0, 48);
+        botPendingState.set(chatId, { step: 'await_new_plan', clientName: cleanName, updatedAt: Date.now() });
+        await dispatch('sendMessage', {
+          chat_id: chatId,
+          text: `👤 ক্লায়েন্ট: <b>${escTgHtml(cleanName)}</b>\n\nএখন মেয়াদ ও প্ল্যান সিলেক্ট করুন:`,
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '⏱️ 24H ট্রায়াল (250 Req)', callback_data: 'tb:mk:24H' },
+                { text: '📅 72H ট্রায়াল (600 Req)', callback_data: 'tb:mk:72H' },
+              ],
+              [
+                { text: '🗓 7 দিন (5,000 Req)', callback_data: 'tb:mk:7D' },
+                { text: '🚀 30 দিন (100k Req)', callback_data: 'tb:mk:30D' },
+              ],
+              [
+                { text: '💎 30 দিন আনলিমিটেড', callback_data: 'tb:mk:30DU' },
+                { text: '♾️ লাইফটাইম আনলিমিটেড (10Yr)', callback_data: 'tb:mk:UNLIM' },
+              ],
+              [{ text: '❌ বাতিল', callback_data: 'tb:menu' }],
+            ],
+          },
+        });
+        return { handled: true, reason: 'pending:new_name' };
+      }
+      if (pending.step === 'await_find_query') {
+        botPendingState.delete(chatId);
+        await sendSearchMatches(text);
+        return { handled: true, reason: 'pending:find_query' };
+      }
+    }
+
+    // Fallback: quick search or show menu
+    await dispatch('sendMessage', {
+      chat_id: chatId,
+      text: buildDashboardSummaryHtml(),
+      parse_mode: 'HTML',
+      reply_markup: buildMainMenuKeyboard(),
+    });
+    return { handled: true, reason: 'text:menu' };
+  };
+
+  // Telegram Webhook + Admin Self-Test Endpoint
+  app.post('/api/trial/telegram/webhook', express.json({ limit: '256kb' }), async (req, res) => {
+    const token = getTelegramBotToken();
+    const adminEnv = String(process.env.TRIAL_ADMIN_KEY || '').trim();
+    const adminHdr = String(req.headers['x-trial-admin'] || '').trim();
+    const isAdminHdr = Boolean(adminEnv && adminHdr && adminHdr === adminEnv);
+    const tgSecretHdr = String(req.headers['x-telegram-bot-api-secret-token'] || '').trim();
+    const expectedSecret = token
+      ? crypto.createHmac('sha256', CINEPULSE_AES_KEY).update(`tg-webhook::${token}`).digest('hex').slice(0, 32)
+      : '';
+
+    if (!isAdminHdr && (!expectedSecret || tgSecretHdr !== expectedSecret)) {
+      res.status(403).json({ ok: false, error: 'Forbidden webhook request' });
+      return;
+    }
+
+    const captureOnly = isAdminHdr && req.query.dryRun === '1';
+    const capturedReplies: Array<{ method: string; payload: any }> = [];
+    const dispatch: TelegramDispatchFn = captureOnly
+      ? async (method, payload) => {
+          capturedReplies.push({ method, payload });
+          return { ok: true, result: { message_id: capturedReplies.length } };
+        }
+      : callTelegramBotApi;
+
+    try {
+      const result = await handleTelegramUpdate(req.body, dispatch);
+      res.status(200).json({ ok: true, ...result, ...(captureOnly ? { replies: capturedReplies } : {}) });
+    } catch (err: any) {
+      res.status(500).json({ ok: false, error: err?.message || 'Telegram webhook failed' });
+    }
+  });
+
+  let telegramPollerStarted = false;
+  startTelegramBotPoller = () => {
+    if (telegramPollerStarted) return;
+    const token = getTelegramBotToken();
+    if (!token) return;
+    telegramPollerStarted = true;
+
+    const runLoop = async () => {
+      try {
+        await callTelegramBotApi('deleteWebhook', { drop_pending_updates: false });
+        await callTelegramBotApi('setMyCommands', {
+          commands: [
+            { command: 'menu', description: 'Owner কন্ট্রোল প্যানেল ও স্ট্যাটাস' },
+            { command: 'list', description: 'সব ক্লায়েন্ট ও কার কতদিন মেয়াদ' },
+            { command: 'new', description: 'নতুন ক্লায়েন্ট API Key তৈরি' },
+            { command: 'find', description: 'নাম বা ID দিয়ে ক্লায়েন্ট খুঁজুন' },
+            { command: 'pause', description: 'টাকা না দিলে ক্লায়েন্ট বন্ধ করুন' },
+            { command: 'resume', description: 'বন্ধ ক্লায়েন্ট পুনরায় চালু করুন' },
+            { command: 'renew', description: 'মেয়াদ বাড়ান (/renew Name 30)' },
+            { command: 'unlimited', description: 'রিকোয়েস্ট আনলিমিটেড করুন' },
+            { command: 'delete', description: 'ক্লায়েন্ট Key স্থায়ীভাবে ডিলিট' },
+            { command: 'seturl', description: 'লাইভ API ডোমেইন সেট করুন' },
+          ],
+        });
+        console.log('[Telegram Admin Bot] Connected & polling for owner commands.');
+      } catch {
+        // continue into polling
+      }
+
+      let offset = 0;
+      let backoffMs = 1500;
+      while (telegramPollerStarted) {
+        try {
+          const curToken = getTelegramBotToken();
+          if (!curToken) break;
+          const resp = await fetch(`https://api.telegram.org/bot${curToken}/getUpdates`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              offset,
+              timeout: 25,
+              allowed_updates: ['message', 'edited_message', 'callback_query'],
+            }),
+            signal: AbortSignal.timeout(35_000),
+          });
+          const data = (await resp.json().catch(() => null)) as { ok?: boolean; result?: any[] } | null;
+          if (data?.ok && Array.isArray(data.result)) {
+            backoffMs = 1500;
+            for (const upd of data.result) {
+              if (typeof upd.update_id === 'number' && upd.update_id >= offset) {
+                offset = upd.update_id + 1;
+              }
+              await handleTelegramUpdate(upd, callTelegramBotApi).catch(() => {});
+            }
+          } else {
+            await new Promise((r) => setTimeout(r, backoffMs));
+            backoffMs = Math.min(20_000, Math.round(backoffMs * 1.5));
+          }
+        } catch {
+          await new Promise((r) => setTimeout(r, backoffMs));
+          backoffMs = Math.min(20_000, Math.round(backoffMs * 1.5));
+        }
+      }
+    };
+
+    void runLoop();
+  };
+
+  // ==========================================================================================
+  // 6a-7. ZERO-CONFIG WEB OWNER CONTROL PANEL (/owner & /api/owner/*)
+  // ==========================================================================================
+  const hashOwnerPassword = (pw: string, salt: string) =>
+    crypto.createHmac('sha256', CINEPULSE_AES_KEY).update(`owner-pw::${salt}::${pw}`).digest('hex');
+
+  const signOwnerSessionToken = () => {
+    const exp = Date.now() + 30 * 86_400_000;
+    const payload = Buffer.from(JSON.stringify({ role: 'owner', exp }), 'utf8').toString('base64url');
+    const sig = crypto.createHmac('sha256', CINEPULSE_AES_KEY).update(`owner-sess::${payload}`).digest('base64url');
+    return `${payload}.${sig}`;
+  };
+
+  const verifyOwnerSessionToken = (token: string): boolean => {
+    try {
+      const [payload, sig] = String(token || '').trim().split('.');
+      if (!payload || !sig) return false;
+      const expected = crypto
+        .createHmac('sha256', CINEPULSE_AES_KEY)
+        .update(`owner-sess::${payload}`)
+        .digest('base64url');
+      if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
+        return false;
+      }
+      const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+      return Boolean(parsed?.role === 'owner' && typeof parsed?.exp === 'number' && Date.now() < parsed.exp);
+    } catch {
+      return false;
+    }
+  };
+
+  const extractOwnerCookie = (req: express.Request): string => {
+    const hdrToken = String(req.headers['x-owner-token'] || '').trim();
+    if (hdrToken) return hdrToken;
+    const rawCookie = String(req.headers.cookie || '');
+    const match = rawCookie.match(/(?:^|;\s*)cp_owner_session=([^;]+)/);
+    return match ? decodeURIComponent(match[1]) : '';
+  };
+
+  isTrialOwnerRequest = (req: express.Request): boolean => {
+    const adminEnv = String(process.env.TRIAL_ADMIN_KEY || '').trim();
+    const adminHdr = String(req.headers['x-trial-admin'] || req.query.adminKey || '').trim();
+    if (adminEnv && adminHdr && adminHdr === adminEnv) return true;
+    const sess = extractOwnerCookie(req);
+    return Boolean(sess && verifyOwnerSessionToken(sess));
+  };
+
+  const buildOwnerOverviewPayload = () => {
+    const all = listAllNonRevokedTrials();
+    let activeCount = 0;
+    let pausedCount = 0;
+    let expiredCount = 0;
+    let quotaCount = 0;
+    let totalRequests = 0;
+
+    const clients = all.map((r) => {
+      totalRequests += r.usedRequests || 0;
+      const st = getTrialStatusMeta(r);
+      if (st.code === 'ACTIVE') activeCount++;
+      else if (st.code === 'PAUSED') pausedCount++;
+      else if (st.code === 'EXPIRED') expiredCount++;
+      else if (st.code === 'QUOTA_EXHAUSTED') quotaCount++;
+      return {
+        shortId: getTrialShortId(r.key),
+        statusCode: st.code,
+        statusBadge: st.badge,
+        remainingTextBn: r.active ? formatRemainingDurationBn(r.expiresAt) : 'বন্ধ (Paused)',
+        ...buildTrialSummary(r, false),
+        shareMessage: buildClientShareMessageText(r),
+      };
+    });
+
+    return {
+      stats: {
+        total: all.length,
+        active: activeCount,
+        paused: pausedCount,
+        expired: expiredCount,
+        quotaExhausted: quotaCount,
+        totalRequests,
+      },
+      publicUrl: resolvePublicBotBaseUrl(),
+      telegramReady: Boolean(getTelegramBotToken() && getAllowedTelegramAdminIds().size > 0),
+      clients,
+    };
+  };
+
+  app.use('/api/owner', express.json({ limit: '64kb' }), (_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    next();
+  });
+
+  app.get('/api/owner/status', (req, res) => {
+    capturePublicOriginForBot(req);
+    const authenticated = isTrialOwnerRequest(req);
+    const overview = authenticated ? buildOwnerOverviewPayload() : null;
+    res.json({
+      ok: true,
+      hasOwnerPin: Boolean(botConfigState.ownerPinHash),
+      hasAdminEnv: Boolean(process.env.TRIAL_ADMIN_KEY),
+      authenticated,
+      publicUrl: resolvePublicBotBaseUrl(),
+      telegramReady: Boolean(getTelegramBotToken() && getAllowedTelegramAdminIds().size > 0),
+      ...(overview ? overview : {}),
+    });
+  });
+
+  app.post('/api/owner/setup', (req, res) => {
+    capturePublicOriginForBot(req);
+    if (botConfigState.ownerPinHash) {
+      res.status(409).json({ ok: false, error: 'Owner পাসওয়ার্ড আগে থেকেই সেট করা আছে। লগইন করুন।' });
+      return;
+    }
+    const pw = String(req.body?.password || '').trim();
+    if (pw.length < 4 || pw.length > 32) {
+      res.status(400).json({ ok: false, error: 'পাসওয়ার্ড কমপক্ষে ৪ অক্ষরের হতে হবে।' });
+      return;
+    }
+    const salt = crypto.randomBytes(8).toString('hex');
+    botConfigState.ownerPinSalt = salt;
+    botConfigState.ownerPinHash = hashOwnerPassword(pw, salt);
+    saveBotConfig(botConfigState);
+
+    const token = signOwnerSessionToken();
+    res.setHeader('Set-Cookie', `cp_owner_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`);
+    res.json({ ok: true, ownerToken: token, ...buildOwnerOverviewPayload() });
+  });
+
+  app.post('/api/owner/login', (req, res) => {
+    capturePublicOriginForBot(req);
+    const pw = String(req.body?.password || '').trim();
+    const adminEnv = String(process.env.TRIAL_ADMIN_KEY || '').trim();
+    const matchesEnv = Boolean(adminEnv && pw && pw === adminEnv);
+    const matchesPin = Boolean(
+      botConfigState.ownerPinHash &&
+        botConfigState.ownerPinSalt &&
+        hashOwnerPassword(pw, botConfigState.ownerPinSalt) === botConfigState.ownerPinHash
+    );
+    if (!matchesEnv && !matchesPin) {
+      res.status(401).json({ ok: false, error: 'ভুল পাসওয়ার্ড! আবার চেষ্টা করুন।' });
+      return;
+    }
+    const token = signOwnerSessionToken();
+    res.setHeader('Set-Cookie', `cp_owner_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`);
+    res.json({ ok: true, ownerToken: token, ...buildOwnerOverviewPayload() });
+  });
+
+  app.post('/api/owner/logout', (_req, res) => {
+    res.setHeader('Set-Cookie', 'cp_owner_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+    res.json({ ok: true });
+  });
+
+  app.post('/api/owner/config', (req, res) => {
+    if (!isTrialOwnerRequest(req)) {
+      res.status(401).json({ ok: false, error: 'Owner login required' });
+      return;
+    }
+    const rawUrl = String(req.body?.publicUrl || '').trim().replace(/\/+$/, '');
+    if (rawUrl && !/^https?:\/\/.+/i.test(rawUrl)) {
+      res.status(400).json({ ok: false, error: 'সঠিক https:// ডোমেইন URL দিন।' });
+      return;
+    }
+    botConfigState.publicUrl = rawUrl || undefined;
+    saveBotConfig(botConfigState);
+    res.json({ ok: true, ...buildOwnerOverviewPayload() });
+  });
+
+  app.post('/api/owner/clients', (req, res) => {
+    if (!isTrialOwnerRequest(req)) {
+      res.status(401).json({ ok: false, error: 'Owner login required' });
+      return;
+    }
+    const name = String(req.body?.clientName || '').trim().slice(0, 48) || 'Client App';
+    const planCode = String(req.body?.plan || '30D').toUpperCase();
+    let plan: StoredTrialKey['plan'] = '30D';
+    let forceUnlimited = false;
+    if (planCode === '24H') plan = '24H';
+    else if (planCode === '72H') plan = '72H';
+    else if (planCode === '7D') plan = '7D';
+    else if (planCode === '30D') plan = '30D';
+    else if (planCode === '30DU') {
+      plan = '30D';
+      forceUnlimited = true;
+    } else if (planCode === 'UNLIMITED') {
+      plan = 'UNLIMITED';
+      forceUnlimited = true;
+    }
+    const rec = createClientKeyForOwner(name, plan, forceUnlimited);
+    res.status(201).json({
+      ok: true,
+      created: {
+        shortId: getTrialShortId(rec.key),
+        ...buildTrialSummary(rec, false),
+        shareMessage: buildClientShareMessageText(rec),
+      },
+      ...buildOwnerOverviewPayload(),
+    });
+  });
+
+  app.post('/api/owner/clients/:shortId/action', (req, res) => {
+    if (!isTrialOwnerRequest(req)) {
+      res.status(401).json({ ok: false, error: 'Owner login required' });
+      return;
+    }
+    const sid = String(req.params.shortId || '').trim();
+    const { exact } = findTrialMatches(sid);
+    if (!exact) {
+      res.status(404).json({ ok: false, error: 'ক্লায়েন্ট পাওয়া যায়নি।' });
+      return;
+    }
+    const action = String(req.body?.action || '').trim();
+    if (action === 'pause') {
+      exact.active = false;
+    } else if (action === 'resume') {
+      exact.active = true;
+      notifiedTrialAlerts.delete(exact.key);
+    } else if (action === 'ext7' || action === 'ext30' || action === 'renew') {
+      const days = action === 'ext7' ? 7 : action === 'ext30' ? 30 : Math.min(3650, Math.max(1, Number(req.body?.days) || 30));
+      exact.expiresAt = Math.max(Date.now(), exact.expiresAt) + days * 86_400_000;
+      exact.active = true;
+      notifiedTrialAlerts.delete(exact.key);
+    } else if (action === 'unlimited') {
+      exact.unlimited = true;
+      exact.maxRequests = -1;
+      exact.active = true;
+      notifiedTrialAlerts.delete(exact.key);
+    } else if (action === 'delete') {
+      exact.active = false;
+      exact.revoked = true;
+    } else {
+      res.status(400).json({ ok: false, error: 'অজানা অ্যাকশন' });
+      return;
+    }
+    flushTrialStoreSync();
+    res.json({ ok: true, ...buildOwnerOverviewPayload() });
+  });
+
+  app.get('/owner', (req, res) => {
+    capturePublicOriginForBot(req);
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(`<!DOCTYPE html>
+<html lang="bn">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MovieBox API — Owner কন্ট্রোল প্যানেল</title>
+  <style>
+    :root { color-scheme: dark; --bg:#07080b; --card:#11131a; --sub:#171a24; --border:#272a36; --red:#e50914; --green:#22c55e; --amber:#f59e0b; --blue:#38bdf8; --text:#f4f4f5; --muted:#a1a1aa; }
+    * { box-sizing:border-box; }
+    body { margin:0; font-family: system-ui, -apple-system, 'Noto Sans Bengali', sans-serif; background:var(--bg); color:var(--text); padding:20px 14px 64px; }
+    .wrap { max-width:1040px; margin:0 auto; }
+    .top { display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:18px; }
+    .brand { font-size:20px; font-weight:800; display:flex; align-items:center; gap:9px; }
+    .dot { width:10px; height:10px; border-radius:99px; background:var(--green); box-shadow:0 0 10px var(--green); }
+    .nav { display:flex; gap:8px; flex-wrap:wrap; }
+    .linkbtn, button { background:var(--red); color:#fff; border:0; border-radius:8px; padding:9px 14px; font-weight:700; font-size:13px; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; gap:5px; }
+    .sec { background:var(--sub); border:1px solid var(--border); color:var(--text); }
+    .green { background:#16a34a; }
+    .amber { background:#d97706; }
+    .sm { padding:6px 10px; font-size:12px; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:16px; margin-bottom:16px; }
+    .stats { display:grid; grid-template-columns:repeat(auto-fit, minmax(140px, 1fr)); gap:10px; margin-bottom:16px; }
+    .stat { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px; }
+    .stat .num { font-size:24px; font-weight:800; margin-top:4px; }
+    .stat .lbl { font-size:12px; color:var(--muted); }
+    .grid2 { display:grid; grid-template-columns:360px 1fr; gap:16px; align-items:start; }
+    @media (max-width:860px){ .grid2 { grid-template-columns:1fr; } }
+    input, select { width:100%; background:#090b10; border:1px solid var(--border); color:var(--text); padding:10px 12px; border-radius:8px; font-size:14px; }
+    label { display:block; font-size:12px; color:var(--muted); margin:10px 0 5px; }
+    .client-card { background:var(--sub); border:1px solid var(--border); border-radius:12px; padding:14px; margin-top:10px; }
+    .client-head { display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }
+    .badge { font-size:11px; font-weight:800; padding:3px 9px; border-radius:6px; }
+    .b-active { background:rgba(34,197,94,.16); color:var(--green); }
+    .b-paused { background:rgba(239,68,68,.18); color:#f87171; }
+    .b-expired { background:rgba(245,158,11,.18); color:#fbbf24; }
+    .row { display:flex; gap:7px; flex-wrap:wrap; align-items:center; }
+    .tabs { display:flex; gap:6px; flex-wrap:wrap; margin:10px 0; }
+    .tab { background:var(--sub); border:1px solid var(--border); color:var(--muted); padding:6px 11px; border-radius:7px; font-size:12px; cursor:pointer; }
+    .tab.on { background:var(--red); color:#fff; border-color:var(--red); }
+    pre { margin:10px 0 0; background:#050608; border:1px solid var(--border); border-radius:9px; padding:11px; font-size:12px; white-space:pre-wrap; word-break:break-word; color:#93c5fd; }
+    .toast { position:fixed; bottom:18px; right:18px; background:#16a34a; color:#fff; padding:10px 16px; border-radius:10px; font-weight:700; font-size:13px; display:none; z-index:99; box-shadow:0 8px 24px rgba(0,0,0,.5); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand"><span class="dot"></span> MovieBox API — বাংলা Owner প্যানেল</div>
+      <div class="nav">
+        <a class="linkbtn sec" href="/trial">API টেস্ট পোর্টাল</a>
+        <a class="linkbtn sec" href="/">ওয়েব অ্যাপ</a>
+        <button id="logoutBtn" class="sec" style="display:none" onclick="doLogout()">লগআউট</button>
+      </div>
+    </div>
+
+    <div id="authBox" class="card" style="max-width:440px;margin:40px auto;display:none;">
+      <h2 id="authTitle" style="margin:0 0 8px;font-size:18px;">Owner প্যানেল চালু করুন</h2>
+      <p id="authDesc" style="margin:0 0 12px;font-size:13px;color:var(--muted);line-height:1.6;"></p>
+      <input id="ownerPassInput" type="password" placeholder="আপনার গোপন পাসওয়ার্ড লিখুন (কমপক্ষে ৪ অক্ষর)" />
+      <button id="authSubmitBtn" style="width:100%;margin-top:12px;justify-content:center;" onclick="submitAuth()">প্রবেশ করুন</button>
+      <div id="authErr" style="color:#f87171;font-size:12px;margin-top:8px;"></div>
+    </div>
+
+    <div id="dashBox" style="display:none;">
+      <div class="stats">
+        <div class="stat"><div class="lbl">👥 মোট ক্লায়েন্ট</div><div class="num" id="stTotal">0</div></div>
+        <div class="stat"><div class="lbl">🟢 চালু (Active)</div><div class="num" style="color:var(--green)" id="stActive">0</div></div>
+        <div class="stat"><div class="lbl">🔴 বন্ধ (Paused)</div><div class="num" style="color:#f87171" id="stPaused">0</div></div>
+        <div class="stat"><div class="lbl">⏰ মেয়াদ/কোটা শেষ</div><div class="num" style="color:var(--amber)" id="stExpired">0</div></div>
+        <div class="stat"><div class="lbl">📊 মোট API হিট</div><div class="num" style="color:var(--blue)" id="stHits">0</div></div>
+      </div>
+
+      <div id="previewWarnCard" class="card" style="display:none;border-color:var(--amber);background:rgba(245,158,11,0.08);">
+        <strong style="color:#fbbf24;">⚠️ গুরুত্বপূর্ণ (ক্লায়েন্টের অ্যাপে চালানোর জন্য):</strong>
+        <div style="font-size:13px;line-height:1.6;margin-top:4px;">
+          আপনি এখন প্রিভিউ লিংকে আছেন। বাইরে কোনো ক্লায়েন্টের ওয়েবসাইট বা অ্যাপে API দিতে উপরে ডানদিকের <strong>Deploy</strong> বাটনে ক্লিক করে Cloud Run-এ Deploy করুন এবং নিচের <strong>পাবলিক ডোমেইন</strong> ঘরে ওই লাইভ লিংকটি সেভ করে দিন।
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div>
+          <div class="card">
+            <h3 style="margin:0 0 8px;font-size:16px;">➕ নতুন ক্লায়েন্ট Key বানান</h3>
+            <label>ক্লায়েন্ট / অ্যাপের নাম</label>
+            <input id="newClientName" placeholder="যেমন: Rahim OTT App" />
+            <label>মেয়াদ ও লিমিট প্ল্যান</label>
+            <select id="newPlan">
+              <option value="24H">২৪ ঘন্টা ট্রায়াল (250 Req)</option>
+              <option value="72H">৩ দিন ট্রায়াল (600 Req)</option>
+              <option value="7D">৭ দিন (5,000 Req)</option>
+              <option value="30D" selected>৩০ দিন / ১ মাস (100,000 Req)</option>
+              <option value="30DU">৩০ দিন আনলিমিটেড রিকোয়েস্ট</option>
+              <option value="UNLIMITED">♾️ লাইফটাইম আনলিমিটেড (১০ বছর)</option>
+            </select>
+            <button style="width:100%;margin-top:14px;justify-content:center;" onclick="createClient()">🚀 API Key তৈরি করুন</button>
+            <div id="createdBox" style="display:none;margin-top:12px;">
+              <div class="row" style="justify-content:space-between;">
+                <strong style="font-size:12px;color:var(--green);">✅ তৈরি হয়েছে! ক্লায়েন্টকে পাঠান:</strong>
+                <button class="sm green" onclick="copyText(lastShareMsg)">📋 মেসেজ কপি</button>
+              </div>
+              <pre id="createdPreview"></pre>
+            </div>
+          </div>
+
+          <div class="card">
+            <h3 style="margin:0 0 8px;font-size:15px;">🌐 লাইভ API ডোমেইন সেটিং</h3>
+            <label>ক্লায়েন্ট মেসেজে যে Base URL যাবে</label>
+            <div class="row">
+              <input id="pubUrlInput" placeholder="https://your-live-app.run.app" style="flex:1;" />
+              <button class="sec sm" onclick="savePubUrl()">সেভ</button>
+            </div>
+            <div style="margin-top:12px;font-size:12px;color:var(--muted);line-height:1.6;">
+              <strong>Telegram বট স্ট্যাটাস:</strong> <span id="tgStatusText">অপেক্ষায়...</span><br/>
+              Telegram-এ এই একই কন্ট্রোল প্যানেল পেতে সার্ভার Secrets-এ <code>TELEGRAM_BOT_TOKEN</code> এবং <code>TELEGRAM_ADMIN_CHAT_ID</code> যোগ করলেই অটো চালু হবে।
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+            <h3 style="margin:0;font-size:16px;">📋 সব ক্লায়েন্ট লিস্ট ও কন্ট্রোল</h3>
+            <button class="sec sm" onclick="refreshStatus()">🔄 রিফ্রেশ</button>
+          </div>
+          <div class="row" style="margin-top:10px;">
+            <input id="searchClient" placeholder="নাম বা ID দিয়ে খুঁজুন..." oninput="renderClients()" style="flex:1;" />
+          </div>
+          <div class="tabs">
+            <button class="tab on" onclick="setFilter('ALL', this)">সব</button>
+            <button class="tab" onclick="setFilter('ACTIVE', this)">🟢 চালু</button>
+            <button class="tab" onclick="setFilter('PAUSED', this)">🔴 বন্ধ (টাকা বাকি)</button>
+            <button class="tab" onclick="setFilter('EXPIRED', this)">⏰ মেয়াদ শেষ</button>
+          </div>
+          <div id="clientsList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div id="toast" class="toast"></div>
+
+  <script>
+    let state = { clients: [], hasOwnerPin: false };
+    let filterMode = 'ALL';
+    let lastShareMsg = '';
+    let pendingDeleteId = '';
+
+    function showToast(txt) {
+      const t = document.getElementById('toast');
+      t.textContent = txt;
+      t.style.display = 'block';
+      setTimeout(() => { t.style.display = 'none'; }, 2200);
+    }
+    function copyText(txt) {
+      if (!txt) return;
+      navigator.clipboard.writeText(txt).then(() => showToast('কপি হয়েছে! এখন WhatsApp/Telegram-এ Paste করুন'));
+    }
+    function setFilter(mode, btn) {
+      filterMode = mode;
+      document.querySelectorAll('.tab').forEach(b => b.classList.remove('on'));
+      btn.classList.add('on');
+      renderClients();
+    }
+    async function api(path, opts) {
+      const r = await fetch(path, opts);
+      return r.json();
+    }
+    async function refreshStatus() {
+      const d = await api('/api/owner/status');
+      state.hasOwnerPin = Boolean(d.hasOwnerPin);
+      if (!d.authenticated) {
+        document.getElementById('dashBox').style.display = 'none';
+        document.getElementById('logoutBtn').style.display = 'none';
+        document.getElementById('authBox').style.display = 'block';
+        if (!d.hasOwnerPin) {
+          document.getElementById('authTitle').textContent = '১ বারের জন্য Owner পাসওয়ার্ড সেট করুন';
+          document.getElementById('authDesc').textContent = 'নিজের পছন্দের যেকোনো পাসওয়ার্ড লিখে চাপ দিন — সাথে সাথে আপনার পুরো ক্লায়েন্ট কন্ট্রোল প্যানেল চালু হয়ে যাবে!';
+          document.getElementById('authSubmitBtn').textContent = 'Owner প্যানেল চালু করুন';
+        } else {
+          document.getElementById('authTitle').textContent = 'Owner লগইন';
+          document.getElementById('authDesc').textContent = 'আপনার Owner পাসওয়ার্ড দিয়ে প্রবেশ করুন।';
+          document.getElementById('authSubmitBtn').textContent = 'লগইন করুন';
+        }
+        return;
+      }
+      document.getElementById('authBox').style.display = 'none';
+      document.getElementById('dashBox').style.display = 'block';
+      document.getElementById('logoutBtn').style.display = 'inline-flex';
+      applyOverview(d);
+    }
+    function applyOverview(d) {
+      state.clients = d.clients || [];
+      document.getElementById('stTotal').textContent = d.stats?.total ?? 0;
+      document.getElementById('stActive').textContent = d.stats?.active ?? 0;
+      document.getElementById('stPaused').textContent = d.stats?.paused ?? 0;
+      document.getElementById('stExpired').textContent = (d.stats?.expired ?? 0) + (d.stats?.quotaExhausted ?? 0);
+      document.getElementById('stHits').textContent = (d.stats?.totalRequests ?? 0).toLocaleString();
+      document.getElementById('pubUrlInput').value = d.publicUrl || '';
+      document.getElementById('tgStatusText').textContent = d.telegramReady
+        ? '🟢 কানেক্টেড (Telegram Bot চালু আছে)'
+        : '⚪ চালু নয় (চাইলে শুধু ওয়েব প্যানেল থেকেই সব চালাতে পারবেন)';
+      document.getElementById('previewWarnCard').style.display = /localhost|127\\.0\\.0\\.1|:\\/\\/ais-dev-/i.test(d.publicUrl || '') ? 'block' : 'none';
+      renderClients();
+    }
+    async function submitAuth() {
+      const pw = document.getElementById('ownerPassInput').value.trim();
+      const ep = state.hasOwnerPin ? '/api/owner/login' : '/api/owner/setup';
+      const d = await api(ep, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: pw }),
+      });
+      if (!d.ok) {
+        document.getElementById('authErr').textContent = d.error || 'ব্যর্থ হয়েছে';
+        return;
+      }
+      document.getElementById('authErr').textContent = '';
+      await refreshStatus();
+    }
+    async function doLogout() {
+      await api('/api/owner/logout', { method: 'POST' });
+      await refreshStatus();
+    }
+    async function createClient() {
+      const name = document.getElementById('newClientName').value.trim() || 'Client App';
+      const plan = document.getElementById('newPlan').value;
+      const d = await api('/api/owner/clients', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientName: name, plan }),
+      });
+      if (!d.ok) { showToast(d.error || 'Error'); return; }
+      applyOverview(d);
+      lastShareMsg = d.created?.shareMessage || '';
+      document.getElementById('createdBox').style.display = 'block';
+      document.getElementById('createdPreview').textContent = lastShareMsg;
+      document.getElementById('newClientName').value = '';
+      showToast('নতুন ক্লায়েন্ট API Key তৈরি হয়েছে!');
+    }
+    async function clientAct(shortId, action) {
+      const d = await api('/api/owner/clients/' + encodeURIComponent(shortId) + '/action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+      });
+      if (!d.ok) { showToast(d.error || 'Error'); return; }
+      pendingDeleteId = '';
+      applyOverview(d);
+      showToast('আপডেট সম্পন্ন হয়েছে!');
+    }
+    async function savePubUrl() {
+      const u = document.getElementById('pubUrlInput').value.trim();
+      const d = await api('/api/owner/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ publicUrl: u }),
+      });
+      if (!d.ok) { showToast(d.error || 'সঠিক URL দিন'); return; }
+      applyOverview(d);
+      showToast('পাবলিক ডোমেইন সেভ হয়েছে!');
+    }
+    function renderClients() {
+      const q = document.getElementById('searchClient').value.trim().toLowerCase();
+      const box = document.getElementById('clientsList');
+      const list = (state.clients || []).filter(c => {
+        if (filterMode === 'ACTIVE' && c.statusCode !== 'ACTIVE') return false;
+        if (filterMode === 'PAUSED' && c.statusCode !== 'PAUSED') return false;
+        if (filterMode === 'EXPIRED' && c.statusCode !== 'EXPIRED' && c.statusCode !== 'QUOTA_EXHAUSTED') return false;
+        if (q && !c.clientName.toLowerCase().includes(q) && !c.shortId.includes(q)) return false;
+        return true;
+      });
+      box.innerHTML = '';
+      if (!list.length) {
+        box.innerHTML = '<div style="padding:24px;text-align:center;color:var(--muted);font-size:13px;">এই তালিকায় কোনো ক্লায়েন্ট নেই। বাম পাশ থেকে নতুন ক্লায়েন্ট তৈরি করুন।</div>';
+        return;
+      }
+      list.forEach(c => {
+        const card = document.createElement('div');
+        card.className = 'client-card';
+        const badgeCls = c.statusCode === 'ACTIVE' ? 'b-active' : c.statusCode === 'PAUSED' ? 'b-paused' : 'b-expired';
+        const quotaTxt = c.unlimited || c.maxRequests < 0
+          ? ('♾️ আনলিমিটেড (ব্যবহার: ' + c.usedRequests + ')')
+          : (c.remainingRequests + ' / ' + c.maxRequests + ' বাকি (ব্যবহার: ' + c.usedRequests + ')');
+
+        const head = document.createElement('div');
+        head.className = 'client-head';
+        head.innerHTML = '<div><strong>' + esc(c.clientName) + '</strong> <span style="font-family:monospace;font-size:11px;color:var(--blue);">#' + c.shortId + '</span> <span style="font-size:11px;color:var(--muted);">(' + c.plan + ')</span></div>'
+          + '<span class="badge ' + badgeCls + '">' + esc(c.statusBadge) + '</span>';
+
+        const meta = document.createElement('div');
+        meta.style.cssText = 'font-size:12px;color:var(--muted);margin:8px 0;line-height:1.6;';
+        meta.textContent = '⏳ সময় বাকি: ' + c.remainingTextBn + '  •  📈 ' + quotaTxt;
+
+        const btns = document.createElement('div');
+        btns.className = 'row';
+        const bToggle = mkBtn(c.active ? '⏸️ বন্ধ করুন' : '▶️ চালু করুন', c.active ? 'sm amber' : 'sm green', () => clientAct(c.shortId, c.active ? 'pause' : 'resume'));
+        const b7 = mkBtn('+৭ দিন', 'sm sec', () => clientAct(c.shortId, 'ext7'));
+        const b30 = mkBtn('+৩০ দিন', 'sm sec', () => clientAct(c.shortId, 'ext30'));
+        const bCopy = mkBtn('📋 মেসেজ কপি', 'sm sec', () => copyText(c.shareMessage));
+        btns.append(bToggle, b7, b30);
+        if (!c.unlimited) btns.append(mkBtn('♾️ আনলিমিটেড', 'sm sec', () => clientAct(c.shortId, 'unlimited')));
+        btns.append(bCopy);
+
+        if (pendingDeleteId === c.shortId) {
+          btns.append(mkBtn('✅ নিশ্চিত ডিলিট', 'sm', () => clientAct(c.shortId, 'delete')));
+          btns.append(mkBtn('বাতিল', 'sm sec', () => { pendingDeleteId = ''; renderClients(); }));
+        } else {
+          btns.append(mkBtn('🗑 ডিলিট', 'sm sec', () => { pendingDeleteId = c.shortId; renderClients(); }));
+        }
+
+        card.append(head, meta, btns);
+        box.appendChild(card);
+      });
+    }
+    function mkBtn(txt, cls, fn) {
+      const b = document.createElement('button');
+      b.className = cls;
+      b.textContent = txt;
+      b.onclick = fn;
+      return b;
+    }
+    function esc(s) {
+      return String(s || '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+    }
+    refreshStatus();
+  </script>
+</body>
+</html>`);
   });
 
   // 6b. Ultra-Fast Sequential MKV-to-HLS Live Streamer for iPhone / iPad (iOS Safari)
@@ -6758,6 +10636,29 @@ async function startServer() {
     res.status(204).end();
   });
 
+  // Direct 1-click Native Android APK Download Endpoint
+  app.get(['/CinePulse.apk', '/api/download-apk'], (_req, res) => {
+    const candidates = [
+      path.join(__dirname, 'public', 'downloads', 'CinePulse-v1.0.apk'),
+      path.join(__dirname, 'dist', 'downloads', 'CinePulse-v1.0.apk'),
+      '/tmp/CinePulse-v1.0.apk',
+    ];
+    const apkFile = candidates.find((p) => fs.existsSync(p));
+    if (!apkFile) {
+      res.status(404).json({
+        ok: false,
+        error: 'APK build is not present yet. Please try again in a moment.',
+      });
+      return;
+    }
+    const stat = fs.statSync(apkFile);
+    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+    res.setHeader('Content-Disposition', 'attachment; filename="CinePulse-v1.0.apk"');
+    res.setHeader('Content-Length', String(stat.size));
+    res.setHeader('Cache-Control', 'no-cache');
+    fs.createReadStream(apkFile).pipe(res);
+  });
+
   // Never serve expired static db-shards (HTTP 410 Gone URLs) — force clients to use live /api/details
   app.get('/db-shards/:file', (_req, res) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
@@ -6853,6 +10754,9 @@ async function startServer() {
         }).catch(() => {});
       }, 10 * 60 * 1000).unref();
     }
+
+    // Start Telegram Owner Admin Bot (if TELEGRAM_BOT_TOKEN is configured)
+    startTelegramBotPoller();
   });
 }
 

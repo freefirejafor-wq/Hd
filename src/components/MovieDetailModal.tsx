@@ -167,6 +167,12 @@ function syncVideoAudioBooster(videoEl: HTMLVideoElement, volumePercent: number,
         return;
       }
 
+      // Never attach Web Audio MediaElementSource before the <video> actually has media & is playing,
+      // because a suspended AudioContext before user gesture can stall Android Chrome / iOS Safari startup!
+      if (videoEl.paused || videoEl.readyState < 2) {
+        return;
+      }
+
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       if (!AudioCtx) return;
 
@@ -561,6 +567,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [hasStartedPlayback, setHasStartedPlayback] = useState(false);
+  const [showStartupActions, setShowStartupActions] = useState(false);
   const [standbyUpgradeIdx, setStandbyUpgradeIdx] = useState<number | null>(null);
   const [isBuffering, setIsBuffering] = useState(false);
   const [isScrubbing, setIsScrubbing] = useState(false);
@@ -1023,6 +1030,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     setPlayerMode('stream');
     setVideoError(false);
     setHasStartedPlayback(false);
+    setShowStartupActions(false);
     setStandbyUpgradeIdx(null);
     setResumedBannerSec(null);
     setShowDownloadSheet(false);
@@ -1836,9 +1844,10 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
   }, [movie, effectiveVideoUrl, isEmbedSource, isMiniPlayer, onToggleMiniPlayer]);
 
   // Immediately trigger native video.play() inside useLayoutEffect (preserving user tap gesture!)
-  // and only show buffering spinner if the stream takes > 600ms so instant streams never flash a spinner!
+  // and only show buffering spinner if the stream takes > 500ms so instant streams never flash a spinner!
   useLayoutEffect(() => {
     stopBackgroundWarmVideo();
+    setShowStartupActions(false);
     if (!effectiveVideoUrl) {
       if (!useHlsBridge) setIsBuffering(false);
       return;
@@ -1883,7 +1892,11 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
               v.muted = true;
               setIsMuted(true);
               setAutoMutedForiOS(true);
-              v.play().catch(() => {});
+              v.play().catch(() => {
+                setIsBuffering(false);
+                setShowStartupActions(true);
+                setShowOverlayControls(true);
+              });
             }
           });
         }
@@ -1896,6 +1909,39 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
         setIsBuffering(true);
       }
     }, 500);
+
+    // 2.2s Rescue Check: If metadata already loaded (readyState >= 1), lift the Starting Stream overlay
+    // immediately and reveal controls if autoplay was blocked so the user is never stuck!
+    const rescueReadyTimer = window.setTimeout(() => {
+      const curV = videoRef.current;
+      if (!curV || isEmbedSource) return;
+      if (curV.readyState >= 1) {
+        setHasStartedPlayback(true);
+        setIsBuffering(false);
+        if (curV.paused) {
+          setShowOverlayControls(true);
+          setShowStartupActions(true);
+        }
+      }
+    }, 2200);
+
+    // 3.2s Interactive Rescue: Show "Play Now" & "Switch Server" buttons if still waiting to start
+    const actionRevealTimer = window.setTimeout(() => {
+      const curV = videoRef.current;
+      if (!curV || isEmbedSource) return;
+      if (curV.paused || curV.readyState < 2) {
+        setShowStartupActions(true);
+      }
+    }, 3200);
+
+    // 7.5s Automatic Failover: If CDN stream hasn't even loaded metadata (readyState === 0), try next server automatically!
+    const failoverTimer = window.setTimeout(() => {
+      const curV = videoRef.current;
+      if (!curV || isEmbedSource) return;
+      if (curV.readyState === 0 && !hasStartedPlayback) {
+        handleVideoErrorRef.current();
+      }
+    }, 7500);
 
     if (startupWatchdogTimerRef.current) {
       window.clearTimeout(startupWatchdogTimerRef.current);
@@ -1914,6 +1960,9 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
 
     return () => {
       window.clearTimeout(bufTimer);
+      window.clearTimeout(rescueReadyTimer);
+      window.clearTimeout(actionRevealTimer);
+      window.clearTimeout(failoverTimer);
       if (startupWatchdogTimerRef.current) {
         window.clearTimeout(startupWatchdogTimerRef.current);
         startupWatchdogTimerRef.current = null;
@@ -2137,6 +2186,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     setPlayerMode('stream');
     setVideoError(false);
     setHasStartedPlayback(false);
+    setShowStartupActions(false);
     setStandbyUpgradeIdx(null);
     setResumedBannerSec(null);
     setShowAllEpisodesModal(false);
@@ -2179,6 +2229,7 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     smoothPlaySecondsRef.current = 0;
     setShowQualityMenu(false);
     setShowAudioServerMenu(false);
+    setShowStartupActions(false);
     setSelectedSourceIdx(idx);
     setPlayerMode('stream');
     setVideoError(false);
@@ -2443,6 +2494,9 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
     setIsBuffering(false);
     setVideoError(true);
   };
+
+  const handleVideoErrorRef = useRef<() => void>(() => {});
+  handleVideoErrorRef.current = handleVideoError;
 
   const flushCurrentProgress = useCallback(() => {
     const v = videoRef.current;
@@ -4481,7 +4535,9 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                   />
 
                   {/* Official MovieBox-Style Clean Single-Row Bottom Bar (Only shown when user taps screen) */}
-                  {!isMiniPlayer && hasStartedPlayback && showOverlayControls && (
+                  {!isMiniPlayer &&
+                    (hasStartedPlayback || (videoRef.current && videoRef.current.readyState >= 1)) &&
+                    showOverlayControls && (
                     <div
                       onClick={() => setShowOverlayControls(false)}
                       className="absolute inset-0 z-30 flex flex-col justify-end bg-gradient-to-t from-black/75 via-transparent to-transparent select-none"
@@ -4602,9 +4658,23 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                     </div>
                   )}
 
-                  {/* Steady Poster & Buffering Shield until First Video Frame is Decoded */}
+                  {/* Steady Poster & Interactive Buffering Shield until First Video Frame is Decoded */}
                   {!hasStartedPlayback && (
-                    <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center bg-black">
+                    <div
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        const curV = videoRef.current;
+                        if (curV) {
+                          curV.muted = isMuted;
+                          curV.play().catch(() => {
+                            curV.muted = true;
+                            setIsMuted(true);
+                            curV.play().catch(() => {});
+                          });
+                        }
+                      }}
+                      className="absolute inset-0 z-20 flex items-center justify-center bg-black cursor-pointer"
+                    >
                       {(movie.poster || effectiveDetail?.poster) && (
                         <img
                           src={movie.poster || effectiveDetail?.poster}
@@ -4612,11 +4682,49 @@ export const MovieDetailModal: React.FC<MovieDetailModalProps> = ({
                           className="absolute inset-0 w-full h-full object-cover opacity-35 blur-xs"
                         />
                       )}
-                      <div className="relative z-10 flex flex-col items-center gap-2 px-4 py-2 rounded-xl bg-black/65 backdrop-blur-xs">
+                      <div className="relative z-10 flex flex-col items-center gap-2.5 px-4 py-3 rounded-xl bg-black/75 backdrop-blur-xs border border-white/10">
                         <Loader2 className="w-7 h-7 animate-spin text-[#dc2626]" />
                         <span className="text-[11px] font-semibold text-white tracking-wide">
                           Starting Stream...
                         </span>
+                        {showStartupActions && (
+                          <div className="flex flex-wrap items-center justify-center gap-2 pt-0.5">
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                const curV = videoRef.current;
+                                if (curV) {
+                                  curV.muted = isMuted;
+                                  curV.play().catch(() => {
+                                    curV.muted = true;
+                                    setIsMuted(true);
+                                    curV.play().catch(() => {});
+                                  });
+                                  if (curV.readyState >= 1) {
+                                    setHasStartedPlayback(true);
+                                  }
+                                }
+                              }}
+                              className="px-3 py-1.5 rounded-lg bg-[#dc2626] hover:bg-[#b91c1c] text-white text-[11px] font-bold flex items-center gap-1 cursor-pointer"
+                            >
+                              <Play className="w-3 h-3 fill-current" />
+                              <span>Play Now</span>
+                            </button>
+                            {sources.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleSelectSource((selectedSourceIdx + 1) % sources.length, true);
+                                }}
+                                className="px-3 py-1.5 rounded-lg bg-white/15 hover:bg-white/25 text-white text-[11px] font-bold cursor-pointer"
+                              >
+                                Switch Server
+                              </button>
+                            )}
+                          </div>
+                        )}
                       </div>
                     </div>
                   )}

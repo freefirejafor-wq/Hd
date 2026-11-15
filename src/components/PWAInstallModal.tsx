@@ -136,7 +136,17 @@ export const PWAInstallModal: React.FC<PWAInstallModalProps> = ({
           </button>
         </div>
 
-        {/* 2. Install Status or 1-Tap Android/Chrome Install + iPhone Safari Steps */}
+        {/* 2. Native Android APK 1-Click Download */}
+        <a
+          href="/CinePulse.apk"
+          download="CinePulse-v1.0.apk"
+          className="w-full min-h-[48px] px-4 py-3 rounded-2xl bg-[#dc2626] hover:bg-[#b91c1c] text-white font-extrabold text-sm flex items-center justify-center gap-2 shadow-[0_8px_25px_rgba(220,38,38,0.35)] transition-all"
+        >
+          <Download className="w-4 h-4 stroke-[2.5]" />
+          <span>Download Native Android APK (1-Click)</span>
+        </a>
+
+        {/* 3. Install Status or 1-Tap Android/Chrome Install + iPhone Safari Steps */}
         {isInstalled ? (
           <div className="rounded-2xl bg-[#00e68a]/10 border border-[#00e68a]/30 p-4 flex items-center gap-3 text-emerald-200 text-xs">
             <CheckCircle2 className="w-5 h-5 text-[#00e68a] shrink-0" />
