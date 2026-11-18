@@ -1643,6 +1643,47 @@ async function fetchMovieBoxHomePayloadFresh(): Promise<MovieBoxHomePayload> {
             );
             if (card) banners.push(card);
           }
+        } else if (opType === 'SPORT_LIVE' && (Array.isArray(op?.liveList) || opTitle)) {
+          const liveArr = Array.isArray(op?.liveList) ? op.liveList : [];
+          if (liveArr.length > 0) {
+            for (const m of liveArr.slice(0, 10)) {
+              const t1 = m?.team1?.name || 'Team A';
+              const t2 = m?.team2?.name || 'Team B';
+              const s1 = m?.team1?.score ?? '0';
+              const s2 = m?.team2?.score ?? '0';
+              const sportRaw = String(m?.team1?.type || opTitle || 'football').toLowerCase();
+              const sportType: MovieBoxLiveSportItem['sportType'] = sportRaw.includes('cricket')
+                ? 'cricket'
+                : sportRaw.includes('basket')
+                  ? 'basketball'
+                  : sportRaw.includes('wwe')
+                    ? 'wwe'
+                    : 'football';
+              liveSports.push({
+                id: String(m?.matchId || `${t1}-${t2}`),
+                title: `${t1} vs ${t2}`,
+                bnTitle: `${t1} (${s1}) vs ${t2} (${s2})`,
+                subtitle: `${opTitle || 'Live Match'} • ${s1} - ${s2}`,
+                sportType,
+                liveUrl: String(op?.url || 'https://sportsnow.top/live?tab=live&sportType=football'),
+                categoryPath: '/',
+                badge: 'LIVE',
+                accentColor: '#e50914',
+              });
+            }
+          } else {
+            liveSports.push({
+              id: String(op?.opId || `sport-${liveSports.length}`),
+              title: opTitle || 'Football Live',
+              bnTitle: `${opTitle || 'লাইভ স্পোর্টস'} (Live)`,
+              subtitle: 'MovieBox Official Live Sports',
+              sportType: /cricket/i.test(opTitle) ? 'cricket' : 'football',
+              liveUrl: String(op?.url || 'https://sportsnow.top/live?tab=live&sportType=football'),
+              categoryPath: '/',
+              badge: 'LIVE',
+              accentColor: '#e50914',
+            });
+          }
         } else if (opType === 'APPOINTMENT_LIST' && Array.isArray(op?.subjects)) {
           for (const raw of op.subjects) {
             const sid = String(raw?.subjectId || '').trim();
@@ -1709,6 +1750,34 @@ async function fetchMovieBoxHomePayloadFresh(): Promise<MovieBoxHomePayload> {
               badge: meta.badge,
               items: cards.slice(0, 18),
             });
+          }
+        }
+      }
+
+      // Supplement comingSoon from cachedMovieBoxHomeSections whenever SSR HTML omitted APPOINTMENT_LIST
+      if (comingSoon.length === 0 && cachedMovieBoxHomeSections.length > 0) {
+        for (const sec of cachedMovieBoxHomeSections) {
+          if (sec.type === 'APPOINTMENT_LIST' && Array.isArray(sec.subjects)) {
+            for (const raw of sec.subjects) {
+              const sid = String(raw?.subjectId || '').trim();
+              const t = String(raw?.title || '').trim();
+              const p = String(raw?.cover?.url || '').trim();
+              if (!sid || !t || !p || seenComingIds.has(sid)) continue;
+              seenComingIds.add(sid);
+              const detailSlug = String(raw?.detailPath || t).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+              const rd = String(raw?.releaseDate || raw?.appointmentDate || '').trim();
+              comingSoon.push({
+                id: `mb_coming_${sid}`,
+                title: t,
+                releaseDate: rd,
+                releaseBadge: rd || 'Coming Soon',
+                bookedCount: Number(raw?.appointmentCnt) || 120,
+                poster: p,
+                path: `/mb/${sid}/${detailSlug || 'movie'}`,
+                genre: String(raw?.genre || 'Action, Drama'),
+                country: String(raw?.countryName || ''),
+              });
+            }
           }
         }
       }
@@ -2379,18 +2448,18 @@ async function fetchMovieBoxCatalog(
       try {
         const [globalList, southAsiaList, hindiCompanionList, primaryWordList, extraGopalList] =
           await Promise.all([
-            fetchSearchEndpoint(cleanQ, headers, 36, 1500),
+            fetchSearchEndpoint(cleanQ, headers, 36, 4500),
             page === 1
-              ? fetchSearchEndpoint(cleanQ, southAsiaHeaders, 36, 1500)
+              ? fetchSearchEndpoint(cleanQ, southAsiaHeaders, 36, 4500)
               : Promise.resolve([] as any[]),
             wantHindiCompanion
-              ? fetchSearchEndpoint(`${cleanQ} [Hindi]`, southAsiaHeaders, 24, 1300)
+              ? fetchSearchEndpoint(`${cleanQ} [Hindi]`, southAsiaHeaders, 24, 3800)
               : Promise.resolve([] as any[]),
             page === 1 && isMultiWord
-              ? fetchSearchEndpoint(primaryWord, southAsiaHeaders, 28, 1400)
+              ? fetchSearchEndpoint(primaryWord, southAsiaHeaders, 28, 3800)
               : Promise.resolve([] as any[]),
             page === 1 && isGopalQuery
-              ? fetchSearchEndpoint('Golmaal', southAsiaHeaders, 16, 1300)
+              ? fetchSearchEndpoint('Golmaal', southAsiaHeaders, 16, 3500)
               : Promise.resolve([] as any[]),
           ]);
 
@@ -2672,7 +2741,7 @@ async function fetchMovieBoxCatalog(
   // Fetch primary category filter across BOTH gateways so the fastest MovieBox edge responds in ~120ms!
   const filterPayload: Record<string, any> = { ...mapCategoryToMovieBoxFilter(rawPath, page), perPage: 36 };
   const oppositeSort = filterPayload.sort === 'Latest' ? 'Hottest' : 'Latest';
-  const fetchFastFilter = (bodyObj: Record<string, any>, timeoutMs = 2400): Promise<any> =>
+  const fetchFastFilter = (bodyObj: Record<string, any>, timeoutMs = 4500): Promise<any> =>
     Promise.any(
       [MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
         const r = await fetch(`${origin}/wefeed-h5api-bff/subject/filter`, {
@@ -2689,7 +2758,7 @@ async function fetchMovieBoxCatalog(
       })
     ).catch(() => null);
 
-  const fetchQuickKeyword = (kw: string, timeoutMs = 2000): Promise<any> =>
+  const fetchQuickKeyword = (kw: string, timeoutMs = 3500): Promise<any> =>
     Promise.any(
       [MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
         const r = await fetch(`${origin}/wefeed-h5api-bff/subject/search`, {
@@ -2706,9 +2775,9 @@ async function fetchMovieBoxCatalog(
       })
     ).catch(() => null);
 
-  const primaryPromise = fetchFastFilter(filterPayload, 2500);
+  const primaryPromise = fetchFastFilter(filterPayload, 4500);
   const secondaryPromises: Promise<any>[] = [
-    fetchFastFilter({ ...filterPayload, sort: oppositeSort }, 1800),
+    fetchFastFilter({ ...filterPayload, sort: oppositeSort }, 3200),
   ];
 
   // Category-specific companion queries so specialized categories (Anime in Hindi, South Indian, Tamil, Telugu, etc.) are rich and distinct
@@ -7022,13 +7091,169 @@ async function startServer() {
     });
   });
 
+  const trialHotSearchCache = { data: null as any, expiresAt: 0 };
+  const fetchMovieBoxHotSearches = async () => {
+    if (trialHotSearchCache.data && trialHotSearchCache.expiresAt > Date.now()) {
+      return trialHotSearchCache.data;
+    }
+    const hdrs: Record<string, string> = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      Accept: 'application/json',
+      Referer: `${MOVIEBOX_ORIGIN}/`,
+      'X-Client-Info': JSON.stringify({ timezone: 'Asia/Dhaka' }),
+    };
+    const json = await Promise.any(
+      [MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
+        const r = await fetch(`${origin}/wefeed-h5api-bff/subject/everyone-search`, {
+          headers: hdrs,
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!r.ok) throw new Error('Bad status');
+        const j = await r.json();
+        if (!j?.data) throw new Error('Empty');
+        return j.data;
+      })
+    ).catch(() => null);
+
+    const keywords: string[] = Array.isArray(json?.everyoneSearch)
+      ? json.everyoneSearch.map((x: any) => String(x?.title || '').trim()).filter(Boolean)
+      : [];
+    const hotGroups = Array.isArray(json?.hot)
+      ? json.hot.map((grp: any) => ({
+          category: String(grp?.name || grp?.category || 'Hot'),
+          items: normalizeMovieCardList(
+            (Array.isArray(grp?.items) ? grp.items : [])
+              .map((raw: any, i: number) => mapMovieBoxItemToCard(raw, i))
+              .filter(Boolean) as MovieCardItem[]
+          ).slice(0, 18),
+        }))
+      : [];
+    const out = { keywords, hotGroups };
+    if (keywords.length > 0 || hotGroups.length > 0) {
+      trialHotSearchCache.data = out;
+      trialHotSearchCache.expiresAt = Date.now() + 600_000;
+    }
+    return out;
+  };
+
+  const trialRelatedCache = new Map<string, { items: MovieCardItem[]; expiresAt: number }>();
+  const fetchMovieBoxRelatedItems = async (subjectId: string, page = 1): Promise<MovieCardItem[]> => {
+    if (!subjectId) return [];
+    const ck = `${subjectId}::${page}`;
+    const hit = trialRelatedCache.get(ck);
+    if (hit && hit.expiresAt > Date.now()) return hit.items;
+    const hdrs: Record<string, string> = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      Accept: 'application/json',
+      Referer: `${MOVIEBOX_ORIGIN}/`,
+      'X-Client-Info': JSON.stringify({ timezone: 'Asia/Dhaka' }),
+    };
+    const json = await Promise.any(
+      [MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
+        const r = await fetch(
+          `${origin}/wefeed-h5api-bff/subject/detail-rec?subjectId=${encodeURIComponent(subjectId)}&page=${page}&perPage=18`,
+          { headers: hdrs, signal: AbortSignal.timeout(5000) }
+        );
+        if (!r.ok) throw new Error('Bad status');
+        const j = await r.json();
+        if (!Array.isArray(j?.data?.items)) throw new Error('Empty');
+        return j.data.items;
+      })
+    ).catch(() => [] as any[]);
+
+    const cards = normalizeMovieCardList(
+      (json as any[])
+        .map((raw: any, idx: number) => mapMovieBoxItemToCard(raw, idx))
+        .filter(Boolean) as MovieCardItem[]
+    ).slice(0, 18);
+
+    if (cards.length > 0) {
+      if (trialRelatedCache.size > 200) trialRelatedCache.clear();
+      trialRelatedCache.set(ck, { items: cards, expiresAt: Date.now() + 600_000 });
+    }
+    return cards;
+  };
+
+  const trialAllOpsCache = { sections: [] as Array<{ title: string; items: MovieCardItem[] }>, expiresAt: 0 };
+  const fetchMovieBoxUnfilteredSections = async () => {
+    if (trialAllOpsCache.sections.length > 0 && trialAllOpsCache.expiresAt > Date.now()) {
+      return trialAllOpsCache.sections;
+    }
+    const hdrs: Record<string, string> = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      Accept: 'application/json',
+      Referer: `${MOVIEBOX_ORIGIN}/`,
+      'X-Client-Info': JSON.stringify({ timezone: 'Asia/Dhaka' }),
+    };
+    const json = await Promise.any(
+      [MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
+        const r = await fetch(`${origin}/wefeed-h5api-bff/home?host=movie-box.co`, {
+          headers: hdrs,
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!r.ok) throw new Error('Bad status');
+        const j = await r.json();
+        if (!Array.isArray(j?.data?.operatingList)) throw new Error('Empty');
+        return j.data.operatingList;
+      })
+    ).catch(() => [] as any[]);
+
+    const out: Array<{ title: string; items: MovieCardItem[] }> = [];
+    const seenTitle = new Set<string>();
+    for (const op of json as any[]) {
+      if (op?.type !== 'SUBJECTS_MOVIE' || !op?.title || !Array.isArray(op?.subjects) || !op.subjects.length) {
+        continue;
+      }
+      const title = String(op.title).trim();
+      const key = title.toLowerCase();
+      if (seenTitle.has(key)) continue;
+      seenTitle.add(key);
+      const cards = normalizeMovieCardList(
+        op.subjects.map((raw: any, i: number) => mapMovieBoxItemToCard(raw, i)).filter(Boolean) as MovieCardItem[]
+      ).slice(0, 20);
+      if (cards.length > 0) out.push({ title, items: cards });
+    }
+    if (out.length > 0) {
+      trialAllOpsCache.sections = out;
+      trialAllOpsCache.expiresAt = Date.now() + 600_000;
+    }
+    return out;
+  };
+
+  app.get('/api/trial/hot-search', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    try {
+      const hot = await fetchMovieBoxHotSearches();
+      const attachDet = (items: MovieCardItem[]) =>
+        items.map((it) => ({
+          ...it,
+          detailsEndpoint: it.path ? `${base}/api/trial/details?path=${encodeURIComponent(it.path)}` : undefined,
+        }));
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        keywords: hot.keywords,
+        hotGroups: hot.hotGroups.map((g: any) => ({ ...g, items: attachDet(g.items) })),
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Hot search fetch failed' });
+    }
+  });
+
   app.get('/api/trial/home', requireValidTrialKey, async (req, res) => {
     const rec = (req as any)._trialKeyRec as StoredTrialKey;
     const base = getPublicOrigin(req);
     try {
-      const [homePayload, mbMain] = await Promise.all([
+      const [homePayload, mbMain, hotData, allOfficial] = await Promise.all([
         fetchMovieBoxHomePayload(),
         fetchMovieBoxCatalog('/', 1, ''),
+        fetchMovieBoxHotSearches(),
+        fetchMovieBoxUnfilteredSections(),
       ]);
       const attachDetUrl = <T extends { path?: string }>(item: T) => ({
         ...item,
@@ -7053,9 +7278,14 @@ async function startServer() {
         liveSports: homePayload.liveSports || [],
         quickCategories: homePayload.quickCategories || [],
         comingSoon: (homePayload.comingSoon || []).map(attachDetUrl),
+        hotSearches: hotData.keywords || [],
         sections: (homePayload.sections || []).map((sec) => ({
           ...sec,
           items: (sec.items || []).map(attachDetUrl),
+        })),
+        allOfficialSections: allOfficial.map((sec) => ({
+          ...sec,
+          items: sec.items.map(attachDetUrl),
         })),
         trending: trendingItems.map(attachDetUrl),
       });
@@ -7267,8 +7497,10 @@ async function startServer() {
       }
 
       const cached = findCachedDetailByPathOrTitle(mbPath, titleQuery);
-      const detail =
-        cached && cached.url?.startsWith('/mb/') ? cached : await fetchMovieBoxDetail(mbPath);
+      const [detail, relatedRaw] = await Promise.all([
+        cached && cached.url?.startsWith('/mb/') ? Promise.resolve(cached) : fetchMovieBoxDetail(mbPath),
+        fetchMovieBoxRelatedItems(mbPath.replace(/^\/mb\//, '').split('/')[0] || subjectId || '', 1),
+      ]);
       storeDetailInCaches(mbPath, detail, Date.now() + 12 * 60_000);
 
       const parts = mbPath.replace(/^\/mb\//, '').split('/');
@@ -7294,6 +7526,17 @@ async function startServer() {
         }&title=${encodeURIComponent(detail.title)}`,
         detail: {
           ...detail,
+          dubs: Array.isArray((detail as any).dubs)
+            ? (detail as any).dubs.map((d: any) => ({
+                ...d,
+                detailsEndpoint: d?.path ? `${base}/api/trial/details?path=${encodeURIComponent(d.path)}` : undefined,
+                streamEndpoint: d?.path
+                  ? `${base}/api/trial/stream?path=${encodeURIComponent(d.path)}&se=${seasons[0] || 0}&ep=${
+                      detail.episodes?.[0]?.number ?? 0
+                    }&title=${encodeURIComponent(detail.title)}`
+                  : undefined,
+              }))
+            : undefined,
           downloadButtons: (detail.downloadButtons || []).map((b) => ({
             ...b,
             url: toTrialUrl(b.url),
@@ -7312,9 +7555,51 @@ async function startServer() {
             }&title=${encodeURIComponent(detail.title)}`,
           })),
         },
+        relatedMovies: relatedRaw.map((item) => ({
+          ...item,
+          detailsEndpoint: `${base}/api/trial/details?path=${encodeURIComponent(item.path)}`,
+        })),
       });
     } catch (err: any) {
       sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Trial details failed' });
+    }
+  });
+
+  app.get('/api/trial/related', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    const rawPath = String(req.query.path || '').trim();
+    let subjectId = String(req.query.subjectId || req.query.id || '').trim();
+    const titleQuery = String(req.query.title || '').trim();
+    const page = Math.min(10, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
+    try {
+      if (!subjectId && rawPath.startsWith('/mb/')) {
+        subjectId = rawPath.replace(/^\/mb\//, '').split('/')[0] || '';
+      }
+      if (!subjectId && titleQuery) {
+        const s = await fetchMovieBoxCatalog('/', 1, titleQuery);
+        const match = s.items.find((it) => it.path?.startsWith('/mb/'));
+        if (match) subjectId = match.path.replace(/^\/mb\//, '').split('/')[0] || '';
+      }
+      if (!subjectId) {
+        sendPrettyDemoJson(res, 400, { ok: false, error: 'Provide ?subjectId=, ?path=/mb/..., or ?title=' });
+        return;
+      }
+      const items = await fetchMovieBoxRelatedItems(subjectId, page);
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        subjectId,
+        page,
+        count: items.length,
+        items: items.map((item) => ({
+          ...item,
+          detailsEndpoint: `${base}/api/trial/details?path=${encodeURIComponent(item.path)}`,
+        })),
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Related movies fetch failed' });
     }
   });
 
@@ -7363,8 +7648,49 @@ async function startServer() {
         return;
       }
 
+      const requestedLangRaw = String(req.query.lang || '').trim();
+      const requestedLangLower = requestedLangRaw.toLowerCase();
+      const streamMbPath = `/mb/${subjectId}/${detailPath}`;
+      const cachedDetailForStream = findCachedDetailByPathOrTitle(streamMbPath, title);
+      const streamDetailObj =
+        cachedDetailForStream && cachedDetailForStream.url?.startsWith('/mb/')
+          ? cachedDetailForStream
+          : await Promise.race([
+              fetchMovieBoxDetail(streamMbPath),
+              new Promise<null>((r) => setTimeout(() => r(null), 1600)),
+            ]).catch(() => null);
+      if (streamDetailObj) {
+        storeDetailInCaches(streamMbPath, streamDetailObj, Date.now() + 12 * 60_000);
+      }
+
+      const dubList: any[] = Array.isArray((streamDetailObj as any)?.dubs) ? (streamDetailObj as any).dubs : [];
+      if (requestedLangLower && requestedLangLower !== 'all' && dubList.length > 0) {
+        const matchedDub = dubList.find((d) => {
+          const lbl = String(d?.label || '').toLowerCase();
+          const code = String(d?.lanCode || '').toLowerCase();
+          return (
+            lbl === requestedLangLower ||
+            lbl.includes(requestedLangLower) ||
+            (requestedLangLower.startsWith('hi') && (code === 'hi' || lbl.includes('hindi'))) ||
+            (requestedLangLower.startsWith('bn') && (code === 'bn' || lbl.includes('bangla') || lbl.includes('bengali'))) ||
+            (requestedLangLower.startsWith('en') && (code === 'en' || lbl.includes('english'))) ||
+            (requestedLangLower.startsWith('ta') && (code === 'ta' || lbl.includes('tamil'))) ||
+            (requestedLangLower.startsWith('te') && (code === 'te' || lbl.includes('telugu'))) ||
+            code === requestedLangLower
+          );
+        });
+        if (matchedDub?.id && matchedDub.id !== subjectId) {
+          subjectId = String(matchedDub.id);
+          const dParts = String(matchedDub.path || '').replace(/^\/mb\//, '').split('/');
+          if (dParts[1]) detailPath = dParts[1];
+        }
+      }
+
+      const activeDubEntry = dubList.find((d) => String(d?.id) === subjectId);
+      const activeAudioLabel = activeDubEntry?.label || streamDetailObj?.language || lang || 'Original Audio';
+
       const [initialPlayRes, imdbId] = await Promise.all([
-        fetchMovieBoxPlayStreams(subjectId, detailPath, se, ep, title, lang, ''),
+        fetchMovieBoxPlayStreams(subjectId, detailPath, se, ep, title, activeAudioLabel, ''),
         Promise.race([
           resolveImdbIdForTitle(title, '', se > 0),
           new Promise<string>((r) => setTimeout(() => r(''), 650)),
@@ -7374,7 +7700,7 @@ async function startServer() {
       let effectiveSe = se;
       let effectiveEp = ep;
       if (playRes.sources.length === 0 && se > 1) {
-        const fbSe1 = await fetchMovieBoxPlayStreams(subjectId, detailPath, 1, ep || 1, title, lang, '');
+        const fbSe1 = await fetchMovieBoxPlayStreams(subjectId, detailPath, 1, ep || 1, title, activeAudioLabel, '');
         if (fbSe1.sources.length > 0) {
           playRes = fbSe1;
           effectiveSe = 1;
@@ -7382,18 +7708,68 @@ async function startServer() {
         }
       }
       if (playRes.sources.length === 0 && (se > 0 || ep > 0)) {
-        const fbMovie = await fetchMovieBoxPlayStreams(subjectId, detailPath, 0, 0, title, lang, '');
+        const fbMovie = await fetchMovieBoxPlayStreams(subjectId, detailPath, 0, 0, title, activeAudioLabel, '');
         if (fbMovie.sources.length > 0) {
           playRes = fbMovie;
           effectiveSe = 0;
           effectiveEp = 0;
         }
       } else if (playRes.sources.length === 0 && se === 0 && ep === 0) {
-        const fbSeries = await fetchMovieBoxPlayStreams(subjectId, detailPath, 1, 1, title, lang, '');
+        const fbSeries = await fetchMovieBoxPlayStreams(subjectId, detailPath, 1, 1, title, activeAudioLabel, '');
         if (fbSeries.sources.length > 0) {
           playRes = fbSeries;
           effectiveSe = 1;
           effectiveEp = 1;
+        }
+      }
+
+      // Auto-include Hindi & Bangla dub MP4 sources inside sources[] when available and no single lang was locked
+      const extraDubSources: StreamSource[] = [];
+      const extraDubButtons: DirectDownloadButton[] = [];
+      if ((!requestedLangRaw || requestedLangLower === 'all') && dubList.length > 1) {
+        const priorityDubs = dubList
+          .filter((d) => {
+            const l = String(d?.label || '').toLowerCase();
+            return (
+              d?.id &&
+              d.id !== subjectId &&
+              (l.includes('hindi') || l.includes('bangla') || l.includes('bengali') || l.includes('original'))
+            );
+          })
+          .slice(0, 2);
+        if (priorityDubs.length > 0) {
+          const dubResults = await Promise.allSettled(
+            priorityDubs.map(async (d) => {
+              const dp = String(d.path || '').replace(/^\/mb\//, '').split('/')[1] || detailPath;
+              const r = await Promise.race([
+                fetchMovieBoxPlayStreams(String(d.id), dp, effectiveSe, effectiveEp, `${title} [${d.label}]`, String(d.label), ''),
+                new Promise<null>((resv) => setTimeout(() => resv(null), 1300)),
+              ]);
+              return { dub: d, res: r };
+            })
+          );
+          for (const dr of dubResults) {
+            if (dr.status === 'fulfilled' && dr.value.res && dr.value.res.sources.length > 0) {
+              const lbl = String(dr.value.dub.label || 'Dubbed');
+              for (const s of dr.value.res.sources) {
+                extraDubSources.push({
+                  ...s,
+                  id: `${s.id}-${dr.value.dub.id}`,
+                  audio: lbl,
+                  audioLanguages: [lbl],
+                  qualityLabel: `${s.quality}p [${lbl}]`,
+                  provider: `CinePulse ${lbl} ${s.quality}p`,
+                  name: `${title} [${lbl}] (${s.quality}p MP4)`,
+                });
+              }
+              for (const b of dr.value.res.buttons || []) {
+                extraDubButtons.push({
+                  ...b,
+                  label: `[${lbl}] ${b.label}`,
+                });
+              }
+            }
+          }
         }
       }
 
@@ -7410,7 +7786,7 @@ async function startServer() {
         ),
       ]).catch(() => []);
 
-      const embedBackups = buildEmbedBackupSources(imdbId, effectiveSe, effectiveEp, title, lang);
+      const embedBackups = buildEmbedBackupSources(imdbId, effectiveSe, effectiveEp, title, activeAudioLabel);
       const toAbsoluteWithTrialTk = (u: string) => {
         if (!u.startsWith('/')) return u;
         const sep = u.includes('?') ? '&' : '?';
@@ -7421,6 +7797,13 @@ async function startServer() {
         subjectId
       )}&detailPath=${encodeURIComponent(detailPath)}&se=${effectiveSe}&ep=${effectiveEp}&title=${encodeURIComponent(title)}`;
 
+      const primarySources = playRes.sources.map((s) => ({
+        ...s,
+        audio: activeAudioLabel,
+        audioLanguages: [activeAudioLabel],
+      }));
+      const combinedSources = [...primarySources, ...extraDubSources, ...embedBackups];
+
       sendPrettyDemoJson(res, 200, {
         ok: true,
         source: 'official-moviebox-original',
@@ -7428,14 +7811,22 @@ async function startServer() {
         subjectId,
         detailPath,
         title,
+        activeAudio: activeAudioLabel,
+        availableDubs: dubList.map((d) => ({
+          id: d.id,
+          label: d.label,
+          lanCode: d.lanCode,
+          active: String(d.id) === subjectId,
+          streamEndpoint: `${base}/api/trial/stream?path=${encodeURIComponent(d.path)}&se=${effectiveSe}&ep=${effectiveEp}&title=${encodeURIComponent(title)}`,
+        })),
         season: effectiveSe,
         episode: effectiveEp,
         imdbId: imdbId || null,
         embedPlayerUrl,
-        directMp4Count: playRes.sources.length,
+        directMp4Count: primarySources.length + extraDubSources.length,
         cloudHlsCount: embedBackups.length,
         subtitleCount: captions.length,
-        sources: [...playRes.sources, ...embedBackups].map((s) => ({
+        sources: combinedSources.map((s) => ({
           ...s,
           url: toAbsoluteWithTrialTk(s.url),
           downloadUrl: s.downloadUrl ? toAbsoluteWithTrialTk(s.downloadUrl) : undefined,
@@ -7444,7 +7835,7 @@ async function startServer() {
           ...c,
           url: toAbsoluteWithTrialTk(c.url),
         })),
-        downloads: (playRes.buttons || []).map((b) => ({
+        downloads: [...(playRes.buttons || []), ...extraDubButtons].map((b) => ({
           ...b,
           url: toAbsoluteWithTrialTk(b.url),
         })),
@@ -7665,6 +8056,7 @@ async function startServer() {
               <div class="row">
                 <button class="sm" style="flex:1" onclick="callTrial('/api/trial/home')">Home</button>
                 <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/categories')">Categories</button>
+                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/hot-search')">Hot Search</button>
               </div>
             </div>
             <div class="ep-box">
@@ -7694,6 +8086,7 @@ async function startServer() {
               <input id="titleInput" value="Squid Game" />
               <div class="row">
                 <button class="sm" style="flex:1" onclick="callTrial('/api/trial/details?title=' + encodeURIComponent(val('titleInput') || 'Squid Game'))">Details</button>
+                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/related?title=' + encodeURIComponent(val('titleInput') || 'Squid Game'))">Related</button>
                 <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/stream?title=' + encodeURIComponent(val('titleInput') || 'Squid Game') + '&se=1&ep=1', false)">Stream</button>
                 <button class="sm" style="flex:1;background:#16a34a" onclick="callTrial('/api/trial/stream?title=' + encodeURIComponent(val('titleInput') || 'Squid Game') + '&se=1&ep=1', true)">Play Video</button>
               </div>

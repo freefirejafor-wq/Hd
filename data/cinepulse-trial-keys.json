@@ -1,31 +1,17 @@
 {
   "keys": [
     {
-      "key": "cp_tr1_eyJuIjoiQnlzaXIiLCJwIjoiMjRIIiwiYyI6MTc5NDc2Njk0NzQwOCwiZSI6MTc5NDg1MzM0NzQwOCwibSI6MjUwLCJyIjoiZTAzNjMzZjdmNCJ9.U0gJtzqyV4tipvKlBNfKyO",
-      "clientName": "Bysir",
+      "key": "cp_tr1_eyJuIjoiVHVzaGFyIiwicCI6IjI0SCIsImMiOjE3OTQ5MTg5MTE2OTUsImUiOjE3OTUwMDUzMTE2OTUsIm0iOjI1MCwiciI6IjM0YTFjYmNjNjAifQ.Vc4bf7C2YyugRsQJ8ahFOd",
+      "clientName": "Tushar",
       "plan": "24H",
-      "createdAt": 1794766947408,
-      "expiresAt": 1794853347408,
+      "createdAt": 1794918911695,
+      "expiresAt": 1795005311695,
       "maxRequests": 250,
       "unlimited": false,
-      "usedRequests": 2,
-      "lastUsedAt": 1794767047000,
+      "usedRequests": 29,
+      "lastUsedAt": 1794963516841,
       "active": true,
       "createdIp": "synced"
-    },
-    {
-      "key": "cp_tr1_eyJuIjoiQXBrV2ViVmVyaWZ5IiwicCI6IjJIIiwiYyI6MTc5NDc2NzM5Njk2NSwiZSI6MTc5NDc3NDU5Njk2NSwibSI6NjAsInIiOiJkZGE1NmEwOWY5In0.Q8PKtt1H9cgJ5fNqA2Y-4r",
-      "clientName": "ApkWebVerify",
-      "plan": "2H",
-      "createdAt": 1794767396965,
-      "expiresAt": 1794774596965,
-      "maxRequests": 60,
-      "unlimited": false,
-      "usedRequests": 2,
-      "lastUsedAt": 1794767397551,
-      "active": false,
-      "createdIp": "127.0.0.1",
-      "revoked": true
     }
   ]
 }
