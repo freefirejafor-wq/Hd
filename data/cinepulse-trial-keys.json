@@ -8,8 +8,8 @@
       "expiresAt": 1795005311695,
       "maxRequests": 250,
       "unlimited": false,
-      "usedRequests": 29,
-      "lastUsedAt": 1794963516841,
+      "usedRequests": 35,
+      "lastUsedAt": 1794964326574,
       "active": true,
       "createdIp": "synced"
     }

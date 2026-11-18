@@ -1976,15 +1976,18 @@ function mapCategoryToMovieBoxFilter(rawPath: string, page = 1): Record<string, 
     sort: 'Hottest',
   };
 
-  if (p === '/' || p === '/hot-dhamaka' || p === '/mostwatch/7d') {
+  if (p === '/' || p === '/hot-dhamaka' || p === '/mostwatch/7d' || p === '/ranking-list') {
     payload.channelId = 1;
     payload.sort = 'Hottest';
-  } else if (p === '/type/movies' || p === '/movies') {
+  } else if (p === '/type/movies' || p === '/movies' || p === '/web/movie') {
     payload.channelId = 1;
     payload.sort = 'Latest';
-  } else if (p === '/type/series' || p === '/ongoing') {
+  } else if (p === '/type/series' || p === '/ongoing' || p === '/web/tv-series') {
     payload.channelId = 2;
     payload.sort = p === '/ongoing' ? 'Latest' : 'Hottest';
+  } else if (p === '/web/animated-series') {
+    payload.channelId = 1006;
+    payload.sort = 'Hottest';
   } else if (p === '/new-uploads' || p === '/new-releases' || p === '/upcoming') {
     payload.channelId = 1;
     payload.sort = 'Latest';
@@ -2087,7 +2090,7 @@ function mapCategoryToMovieBoxFilter(rawPath: string, page = 1): Record<string, 
   } else if (p.includes('malaysian')) {
     payload.channelId = 1;
     payload.country = 'Malaysia';
-  } else if (p.includes('adult18plus') || p.includes('18plus') || p === '/genre/adult') {
+  } else if (p.includes('adult18plus') || p.includes('18plus') || p === '/genre/adult' || p === '/web/midnight') {
     payload.channelId = 1;
     payload.genre = 'Adult';
     payload.sort = 'Hottest';
@@ -2815,7 +2818,7 @@ async function fetchMovieBoxCatalog(
     secondaryPromises.unshift(fetchQuickKeyword('[Punjabi]', 2200), fetchQuickKeyword('Punjabi', 2200));
   } else if (normalizedRawPath.includes('bangla-dubbed') || normalizedRawPath.includes('best-bangla-dubbed')) {
     secondaryPromises.unshift(fetchQuickKeyword('[Bengali]', 2200), fetchQuickKeyword('Bangla Dubbed', 2200));
-  } else if (normalizedRawPath.includes('adult18plus') || normalizedRawPath.includes('18plus') || normalizedRawPath === '/genre/adult' || normalizedRawPath === '/genre/erotic') {
+  } else if (normalizedRawPath.includes('adult18plus') || normalizedRawPath.includes('18plus') || normalizedRawPath === '/genre/adult' || normalizedRawPath === '/genre/erotic' || normalizedRawPath === '/web/midnight') {
     secondaryPromises.unshift(
       fetchFastFilter({ page, perPage: 28, channelId: 1, genre: 'Erotic', sort: 'Hottest' }, 2000),
       fetchFastFilter({ page, perPage: 28, channelId: 2, genre: 'Adult', sort: 'Hottest' }, 2000),
