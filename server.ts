@@ -4511,6 +4511,7 @@ async function startServer() {
     const isPublicApiOrTrialStream =
       req.path.startsWith('/api/demo') ||
       req.path.startsWith('/api/trial') ||
+      req.path.startsWith('/api/app') ||
       ((req.path.startsWith('/api/mb-stream') || req.path.startsWith('/api/mb-subtitle-srt')) &&
         Boolean(trialTkEarly && isActiveTrialStreamToken(trialTkEarly)));
 
@@ -4629,6 +4630,7 @@ async function startServer() {
       req.path !== '/api/download-apk' &&
       !req.path.startsWith('/api/demo') &&
       !req.path.startsWith('/api/trial') &&
+      !req.path.startsWith('/api/app') &&
       !req.path.startsWith('/api/owner')
     ) {
       const ua = String(req.headers['user-agent'] || '');
@@ -4654,13 +4656,12 @@ async function startServer() {
         return;
       }
 
-      // 2. Block automated CLI scrapers & bots across protected /api/* routes (exempting ?tk= authenticated client APK/web streams)
-      if (
-        !(isStreamOrSubRoute && hasValidTrialTk) &&
-        /\b(curl|wget|python|requests|urllib|httpx|aiohttp|scrapy|postman|insomnia|libwww|go-http-client|java\/|okhttp|apache-httpclient|headlesschrome|phantomjs)\b/i.test(
-          ua
-        )
-      ) {
+      // 2. Block automated CLI scrapers & bots across protected /api/* routes (exempting ?tk= authenticated streams & /api/app official Android APK)
+      const isOfficialAppRoute = req.path.startsWith('/api/app/') || req.path === '/api/app';
+      const scraperRegex = isOfficialAppRoute
+        ? /\b(curl|wget|python|requests|urllib|httpx|aiohttp|scrapy|postman|insomnia|libwww|go-http-client|headlesschrome|phantomjs)\b/i
+        : /\b(curl|wget|python|requests|urllib|httpx|aiohttp|scrapy|postman|insomnia|libwww|go-http-client|java\/|okhttp|apache-httpclient|headlesschrome|phantomjs)\b/i;
+      if (!(isStreamOrSubRoute && hasValidTrialTk) && scraperRegex.test(ua)) {
         res.status(403).json({ ok: false, error: 'Access denied by CinePulse Security Shield' });
         return;
       }
@@ -6719,6 +6720,7 @@ async function startServer() {
   };
 
   isActiveTrialStreamToken = (token: string) => {
+    if (token === 'cp_app_official') return true;
     const rec = resolveOrRecoverTrialKey(token);
     if (!rec || !rec.active || Date.now() >= rec.expiresAt) return false;
     const isUnlimited = Boolean(rec.unlimited || rec.maxRequests < 0);
@@ -7007,6 +7009,15 @@ async function startServer() {
     sendPrettyDemoJson(res, 200, { ok: true, count: list.length, keys: list });
   });
 
+  // Public Unlimited Official Android App (/api/app/*) — opens straight into MovieBox without requiring a client trial key
+  app.use((req, _res, next) => {
+    if (req.url === '/api/app' || req.url.startsWith('/api/app/') || req.url.startsWith('/api/app?')) {
+      req.url = req.url.replace(/^\/api\/app(?=\/|$|\?)/, '/api/trial');
+      (req as any)._officialPublicApp = true;
+    }
+    next();
+  });
+
   // Trial Key Authentication + Quota Enforcement Middleware for MovieBox Data Endpoints
   const requireValidTrialKey = (
     req: express.Request,
@@ -7015,6 +7026,21 @@ async function startServer() {
   ) => {
     if (req.method !== 'GET') {
       sendPrettyDemoJson(res, 405, { ok: false, error: 'Trial API endpoints are read-only (GET).' });
+      return;
+    }
+    if ((req as any)._officialPublicApp) {
+      (req as any)._trialKeyRec = {
+        key: 'cp_app_official',
+        clientName: 'MovieBox Official App',
+        plan: 'UNLIMITED',
+        createdAt: 0,
+        expiresAt: 4102444800000,
+        maxRequests: -1,
+        usedRequests: 0,
+        active: true,
+        unlimited: true,
+      } as StoredTrialKey;
+      next();
       return;
     }
     const base = getPublicOrigin(req);
@@ -10860,26 +10886,61 @@ async function startServer() {
   });
 
   // Direct 1-click Native Android APK Download Endpoint
-  app.get(['/CinePulse.apk', '/api/download-apk'], (_req, res) => {
+  app.get(['/download-apk', '/MovieBox-HD.apk', '/CinePulse.apk', '/api/download-apk'], async (_req, res) => {
     const candidates = [
+      path.join(__dirname, 'public', 'downloads', 'MovieBox-HD.apk'),
+      path.join(__dirname, 'dist', 'downloads', 'MovieBox-HD.apk'),
       path.join(__dirname, 'public', 'downloads', 'CinePulse-v1.0.apk'),
       path.join(__dirname, 'dist', 'downloads', 'CinePulse-v1.0.apk'),
-      '/tmp/CinePulse-v1.0.apk',
+      '/tmp/MovieBox-HD.apk',
     ];
     const apkFile = candidates.find((p) => fs.existsSync(p));
-    if (!apkFile) {
-      res.status(404).json({
-        ok: false,
-        error: 'APK build is not present yet. Please try again in a moment.',
-      });
+    if (apkFile) {
+      const stat = fs.statSync(apkFile);
+      res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+      res.setHeader('Content-Disposition', 'attachment; filename="MovieBox-HD.apk"');
+      res.setHeader('Content-Length', String(stat.size));
+      res.setHeader('Cache-Control', 'no-cache');
+      fs.createReadStream(apkFile).pipe(res);
       return;
     }
-    const stat = fs.statSync(apkFile);
-    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-    res.setHeader('Content-Disposition', 'attachment; filename="CinePulse-v1.0.apk"');
-    res.setHeader('Content-Length', String(stat.size));
-    res.setHeader('Cache-Control', 'no-cache');
-    fs.createReadStream(apkFile).pipe(res);
+    const releaseApkUrl = 'https://github.com/freefirejafor-wq/Hd/releases/download/latest/MovieBox-HD.apk';
+    try {
+      const check = await fetch(releaseApkUrl, {
+        method: 'HEAD',
+        redirect: 'manual',
+        signal: AbortSignal.timeout(3000),
+      });
+      if (check.status === 200 || check.status === 301 || check.status === 302) {
+        res.redirect(302, releaseApkUrl);
+        return;
+      }
+    } catch {
+      // Fall through to status page if GitHub release is not published yet
+    }
+    res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8').send(`
+      <!doctype html>
+      <html lang="bn">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>MovieBox HD APK Download</title>
+        <style>
+          body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#121318;color:#fff;font-family:system-ui,sans-serif;padding:20px}
+          .card{max-width:440px;width:100%;background:#1b1d24;border:1px solid #2e3240;border-radius:16px;padding:22px;text-align:center}
+          .btn{display:inline-block;margin-top:14px;background:#1ce783;color:#041d11;font-weight:700;padding:12px 20px;border-radius:10px;text-decoration:none}
+          p{color:#9aa1b2;font-size:14px;line-height:1.6}
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h2 style="margin:0 0 8px">MovieBox HD APK এখনো তৈরি হয়নি</h2>
+          <p>সোর্স কোড GitHub-এ Push করার ৩–৫ মিনিট পর GitHub Actions অটোমেটিক APK বানিয়ে এই লিংকে সরাসরি ডাউনলোড চালু করে দেবে।</p>
+          <a class="btn" href="https://github.com/freefirejafor-wq/Hd/actions">Build Status দেখুন</a>
+        </div>
+      </body>
+      </html>
+    `);
   });
 
   // Never serve expired static db-shards (HTTP 410 Gone URLs) — force clients to use live /api/details

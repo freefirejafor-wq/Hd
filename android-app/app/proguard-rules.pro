@@ -1,2 +1,3 @@
--keep class com.cinepulse.app.** { *; }
--dontwarn androidx.media3.**
+# Keep Media3 and OkHttp
+-dontwarn okhttp3.**
+-dontwarn okio.**

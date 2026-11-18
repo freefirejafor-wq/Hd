@@ -1,0 +1,59 @@
+name: Build MovieBox HD Android APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'android-app/**'
+      - '.github/workflows/build-apk.yml'
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build Debug APK
+        working-directory: android-app
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Prepare APK output
+        run: |
+          mkdir -p apk-output
+          cp android-app/app/build/outputs/apk/debug/app-debug.apk apk-output/MovieBox-HD.apk
+          ls -lh apk-output/MovieBox-HD.apk
+
+      - name: Publish 1-Click Direct APK Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: MovieBox HD Official APK
+          body: Direct 1-click installable MovieBox HD Android APK (powered by CinePulse Live API).
+          files: apk-output/MovieBox-HD.apk
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MovieBox-HD-APK
+          path: apk-output/MovieBox-HD.apk
+          retention-days: 30
