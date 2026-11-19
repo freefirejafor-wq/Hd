@@ -12,6 +12,32 @@
       "lastUsedAt": 1794964326574,
       "active": true,
       "createdIp": "synced"
+    },
+    {
+      "key": "cp_tr1_eyJuIjoiX2Z1bGxjaGVjayIsInAiOiIySCIsImMiOjE3OTUwNTUxMTA1MjgsImUiOjE3OTUwNTU0MTA1MjgsIm0iOjEwMCwiciI6ImZ1bGxjaGswMDEifQ.mK_7TZg_38IowiRuWLZv3O",
+      "clientName": "_fullcheck",
+      "plan": "2H",
+      "createdAt": 1795055110528,
+      "expiresAt": 1795055410528,
+      "maxRequests": 100,
+      "unlimited": false,
+      "usedRequests": 17,
+      "lastUsedAt": 1795055113533,
+      "active": true,
+      "createdIp": "synced"
+    },
+    {
+      "key": "cp_tr1_eyJuIjoiX2NoazIiLCJwIjoiMkgiLCJjIjoxNzk1MDU1MTMwMjA3LCJlIjoxNzk1MDU1NDMwMjA3LCJtIjo1MCwiciI6ImNoazAwMDAwMDIifQ.XuL4Y4UpviLUFEWTdUYO1I",
+      "clientName": "_chk2",
+      "plan": "2H",
+      "createdAt": 1795055130207,
+      "expiresAt": 1795055430207,
+      "maxRequests": 50,
+      "unlimited": false,
+      "usedRequests": 3,
+      "lastUsedAt": 1795055130362,
+      "active": true,
+      "createdIp": "synced"
     }
   ]
 }

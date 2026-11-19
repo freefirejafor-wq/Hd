@@ -7520,13 +7520,25 @@ async function startServer() {
   app.get('/api/trial/comments', requireValidTrialKey, async (req, res) => {
     const rec = (req as any)._trialKeyRec as StoredTrialKey;
     const rawPath = String(req.query.path || '').trim();
+    const rawTitle = String(req.query.title || '').trim();
     let subjectId = String(req.query.subjectId || req.query.id || '').trim();
-    const page = Math.min(20, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
+    const rawPage = String(req.query.page || req.query.cursor || '').trim();
+    // MovieBox post/list/subject uses timestamp cursor pagination: page=0 (or empty) returns newest page 1; numeric cursor (>1000) returns next page
+    const upstreamPage = !rawPage || rawPage === '1' || rawPage === '0' ? '0' : rawPage;
     if (!subjectId && rawPath.startsWith('/mb/')) {
       subjectId = rawPath.replace(/^\/mb\//, '').split('/')[0] || '';
     }
+    if (!subjectId && rawTitle) {
+      try {
+        const searchRes = await fetchMovieBoxCatalog('/', 1, rawTitle);
+        const first = searchRes.items.find((it) => it.path?.startsWith('/mb/'));
+        if (first) subjectId = first.path.replace(/^\/mb\//, '').split('/')[0] || '';
+      } catch {
+        // ignore lookup failure
+      }
+    }
     if (!subjectId) {
-      sendPrettyDemoJson(res, 400, { ok: false, error: 'Provide ?subjectId= or ?path=/mb/...' });
+      sendPrettyDemoJson(res, 400, { ok: false, error: 'Provide ?subjectId=, ?title=, or ?path=/mb/...' });
       return;
     }
     try {
@@ -7534,7 +7546,7 @@ async function startServer() {
       const data = await Promise.any(
         ['https://moviebox01.com', MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
           const r = await fetch(
-            `${origin}/wefeed-h5api-bff/post/list/subject?id=${encodeURIComponent(subjectId)}&page=${page}&perPage=20`,
+            `${origin}/wefeed-h5api-bff/post/list/subject?id=${encodeURIComponent(subjectId)}&page=${encodeURIComponent(upstreamPage)}&perPage=20`,
             { headers, signal: AbortSignal.timeout(4500) }
           );
           if (!r.ok) throw new Error('Bad status');
@@ -7542,15 +7554,17 @@ async function startServer() {
           if (!j?.data) throw new Error('Empty');
           return j.data;
         })
-      ).catch(() => ({ items: [], pager: { totalCount: 0 } }));
+      ).catch(() => ({ items: [], pager: { totalCount: 0, hasMore: false, nextPage: '' } }));
       const rawItems = Array.isArray(data?.items) ? data.items : [];
       const comments = rawItems.map((it: any, idx: number) => ({
         id: String(it?.postId || it?.id || idx),
-        userName: String(it?.user?.nickName || it?.userName || 'MovieBox User'),
+        userName: String(it?.user?.nickname || it?.user?.nickName || it?.user?.username || 'MovieBox User'),
         avatar: String(it?.user?.avatar || ''),
-        content: String(it?.content || it?.text || ''),
-        rating: it?.score ?? it?.rating ?? null,
-        likes: Number(it?.likeCount || it?.stat?.likeCount || 0),
+        title: String(it?.title || ''),
+        content: String(it?.content || it?.text || it?.title || ''),
+        rating: it?.subjectRate ?? it?.score ?? it?.rating ?? null,
+        likes: Number(it?.stat?.likeCount ?? it?.likeCount ?? 0),
+        replies: Number(it?.stat?.commentCount ?? it?.commentCount ?? 0),
         createdAt: it?.createdAt || it?.createTime || null,
       }));
       sendPrettyDemoJson(res, 200, {
@@ -7558,7 +7572,10 @@ async function startServer() {
         source: 'official-moviebox-original',
         trial: buildTrialSummary(rec),
         subjectId,
-        page,
+        page: upstreamPage,
+        hasMore: Boolean(data?.pager?.hasMore),
+        nextPage: String(data?.pager?.nextPage || ''),
+        count: comments.length,
         totalCount: Number(data?.pager?.totalCount || comments.length),
         comments,
       });
