@@ -8965,22 +8965,32 @@ async function startServer() {
       `Live Tester Portal: ${base}/trial`,
       '',
       'Sample Endpoints (pass header X-API-Key or ?apiKey=):',
-      `- Home (Banners/Sports/All Sections): ${base}/api/trial/home?apiKey=${rec.key}`,
-      `- Categories (77): ${base}/api/trial/categories?apiKey=${rec.key}`,
+      `- Home: ${base}/api/trial/home?apiKey=${rec.key}`,
       `- Search: ${base}/api/trial/search?q=Squid+Game&apiKey=${rec.key}`,
-      `- Suggest (Autocomplete): ${base}/api/trial/suggest?q=Squid&apiKey=${rec.key}`,
-      `- Hot Search: ${base}/api/trial/hot-search?apiKey=${rec.key}`,
-      `- Catalog (18+ / Any Category): ${base}/api/trial/catalog?path=/adult18plus&page=1&apiKey=${rec.key}`,
-      `- Short Videos (Hot Short TV): ${base}/api/trial/shorts?page=1&apiKey=${rec.key}`,
-      `- Live Sports (Football/Cricket/NBA + .m3u8): ${base}/api/trial/sports?apiKey=${rec.key}`,
-      `- OTT Platform (Netflix/Hoichoi/Zee5): ${base}/api/trial/platform?name=Netflix&page=1&apiKey=${rec.key}`,
-      `- Upcoming Releases: ${base}/api/trial/upcoming?page=1&apiKey=${rec.key}`,
-      `- Filter Options: ${base}/api/trial/filter-options?apiKey=${rec.key}`,
-      `- Details (+ Dubs & Related): ${base}/api/trial/details?title=Squid+Game&apiKey=${rec.key}`,
-      `- Related Movies: ${base}/api/trial/related?title=Squid+Game&apiKey=${rec.key}`,
-      `- Comments: ${base}/api/trial/comments?subjectId=973041525783496480&page=1&apiKey=${rec.key}`,
-      `- Staff/Actor Movies: ${base}/api/trial/staff?staffId=1&page=1&apiKey=${rec.key}`,
+      `- Catalog (18+): ${base}/api/trial/catalog?path=/adult18plus&page=1&apiKey=${rec.key}`,
+      `- Short Videos: ${base}/api/trial/shorts?page=1&apiKey=${rec.key}`,
+      `- Live Sports (.m3u8): ${base}/api/trial/sports?apiKey=${rec.key}`,
+      `- Details (+ Dubs): ${base}/api/trial/details?title=Squid+Game&apiKey=${rec.key}`,
       `- Stream (Hindi Dub + Original + Subs): ${base}/api/trial/stream?title=Squid+Game&se=1&ep=1&apiKey=${rec.key}`,
+      '',
+      'All 16 Endpoints (use Base URL + Header X-API-Key or ?apiKey=YOUR_KEY):',
+      '- GET /home (Banners, Sports & All Home Shelves)',
+      '- GET /categories (All 77 Categories)',
+      '- GET /search?q=Squid+Game',
+      '- GET /suggest?q=Squid (Autocomplete)',
+      '- GET /hot-search (Trending Searches)',
+      '- GET /catalog?path=/bollywood&page=1 (or /adult18plus, /type/movies, /anime)',
+      '- GET /shorts?page=1 (Hot Short TV / Micro-Dramas)',
+      '- GET /sports (Live Football/Cricket/NBA + .m3u8)',
+      '- GET /platform?name=Netflix&page=1 (Netflix, Hoichoi, Zee5, PrimeVideo, Disney)',
+      '- GET /upcoming?page=1 (Coming Soon Releases)',
+      '- GET /filter-options (Genres, Years, Countries, Sort)',
+      '- GET /details?title=Squid+Game (+ Dubs & Related)',
+      '- GET /related?title=Squid+Game',
+      '- GET /comments?subjectId=973041525783496480&page=1',
+      '- GET /staff?staffId=1&page=1 (Actor/Director Movies)',
+      '- GET /stream?title=Squid+Game&se=1&ep=1 (1080p/720p/480p MP4 + Subtitles)',
+      '- GET /me (Check Key Quota & Expiry)',
     ].join('\n');
   };
 
@@ -9185,6 +9195,39 @@ async function startServer() {
       });
     };
 
+    const sendClientShareMessage = async (headerHtml: string, rec: StoredTrialKey) => {
+      const fullText = buildClientShareMessageText(rec);
+      const MAX_PRE_CHARS = 3500;
+      if (fullText.length <= MAX_PRE_CHARS) {
+        await dispatch('sendMessage', {
+          chat_id: chatId,
+          text: `${headerHtml}\n\n<pre>${escTgHtml(fullText)}</pre>`,
+          parse_mode: 'HTML',
+        });
+        return;
+      }
+      const lines = fullText.split('\n');
+      const chunks: string[] = [];
+      let buf = '';
+      for (const line of lines) {
+        if (buf.length + line.length + 1 > MAX_PRE_CHARS && buf) {
+          chunks.push(buf);
+          buf = line;
+        } else {
+          buf = buf ? `${buf}\n${line}` : line;
+        }
+      }
+      if (buf) chunks.push(buf);
+      for (let i = 0; i < chunks.length; i++) {
+        const prefix = i === 0 ? `${headerHtml}\n\n` : `📋 <b>অংশ ${i + 1}/${chunks.length}:</b>\n\n`;
+        await dispatch('sendMessage', {
+          chat_id: chatId,
+          text: `${prefix}<pre>${escTgHtml(chunks[i])}</pre>`,
+          parse_mode: 'HTML',
+        });
+      }
+    };
+
     const sendClientCreatedMessages = async (rec: StoredTrialKey) => {
       notifiedTrialAlerts.delete(rec.key);
       await dispatch('sendMessage', {
@@ -9193,13 +9236,7 @@ async function startServer() {
         parse_mode: 'HTML',
         reply_markup: buildClientInlineKeyboard(rec),
       });
-      await dispatch('sendMessage', {
-        chat_id: chatId,
-        text: `📋 <b>ক্লায়েন্টকে দেওয়ার জন্য কপি/ফরওয়ার্ড মেসেজ:</b>\n\n<pre>${escTgHtml(
-          buildClientShareMessageText(rec)
-        )}</pre>`,
-        parse_mode: 'HTML',
-      });
+      await sendClientShareMessage('📋 <b>ক্লায়েন্টকে দেওয়ার জন্য কপি/ফরওয়ার্ড মেসেজ:</b>', rec);
     };
 
     const sendSearchMatches = async (query: string) => {
@@ -9345,13 +9382,7 @@ async function startServer() {
         const { exact } = findTrialMatches(sid);
         if (exact) {
           toast = 'ক্লায়েন্ট মেসেজ পাঠানো হয়েছে';
-          await dispatch('sendMessage', {
-            chat_id: chatId,
-            text: `📋 <b>${escTgHtml(exact.clientName)} — কপি/ফরওয়ার্ড মেসেজ:</b>\n\n<pre>${escTgHtml(
-              buildClientShareMessageText(exact)
-            )}</pre>`,
-            parse_mode: 'HTML',
-          });
+          await sendClientShareMessage(`📋 <b>${escTgHtml(exact.clientName)} — কপি/ফরওয়ার্ড মেসেজ:</b>`, exact);
         }
       } else if (data.startsWith('tb:del:')) {
         const sid = data.slice(7);
@@ -9536,13 +9567,7 @@ async function startServer() {
             reply_markup: buildMainMenuKeyboard(),
           });
         } else if (cmd === 'msg') {
-          await dispatch('sendMessage', {
-            chat_id: chatId,
-            text: `📋 <b>${escTgHtml(exact.clientName)} — ক্লায়েন্ট মেসেজ:</b>\n\n<pre>${escTgHtml(
-              buildClientShareMessageText(exact)
-            )}</pre>`,
-            parse_mode: 'HTML',
-          });
+          await sendClientShareMessage(`📋 <b>${escTgHtml(exact.clientName)} — ক্লায়েন্ট মেসেজ:</b>`, exact);
         }
         return { handled: true, reason: `cmd:${cmd}:ok` };
       }
