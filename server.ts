@@ -4508,15 +4508,13 @@ async function startServer() {
     }
 
     const trialTkEarly = typeof req.query.tk === 'string' ? String(req.query.tk).trim() : '';
-    const isPublicApiOrTrialStream =
-      req.path.startsWith('/api/demo') ||
+    const isCommercialApiOrTrialStream =
       req.path.startsWith('/api/trial') ||
-      req.path.startsWith('/api/app') ||
       ((req.path.startsWith('/api/mb-stream') || req.path.startsWith('/api/mb-subtitle-srt')) &&
         Boolean(trialTkEarly && isActiveTrialStreamToken(trialTkEarly)));
 
     const origin = String(req.headers.origin || '');
-    if (isPublicApiOrTrialStream) {
+    if (isCommercialApiOrTrialStream) {
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
       res.setHeader(
@@ -4527,207 +4525,68 @@ async function startServer() {
         'Access-Control-Expose-Headers',
         'Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Trial-Plan, X-RateLimit-Limit, X-RateLimit-Remaining, X-Trial-Expires-At'
       );
-    } else {
-      if (
-        origin &&
-        (origin.includes('playlive.zeroo.click') ||
-          origin.includes('zeroo.click') ||
-          origin.includes('chinepulse.71i.site') ||
-          origin.includes('71i.site') ||
-          origin.includes('localhost') ||
-          origin.includes('127.0.0.1') ||
-          origin.includes('.run.app'))
-      ) {
-        res.setHeader('Access-Control-Allow-Origin', origin);
-      }
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.setHeader(
-        'Access-Control-Allow-Headers',
-        'Content-Type, Range, X-CP-Ts, X-CP-Sig, X-CP-Client'
-      );
+    } else if (origin && (origin.includes('localhost') || origin.includes('127.0.0.1') || origin.includes('.run.app'))) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, X-API-Key, Authorization');
     }
     if (req.method === 'OPTIONS') {
       res.status(204).end();
       return;
     }
 
-    // 0a. Cloaked Image Proxy (/_s/i.jpg?k=...) — Hides pbcdnw.aoneroom.com & upstream image domains from Network Log!
-    if ((req.path === '/_s/i.jpg' || req.path === '/api/i') && typeof req.query.k === 'string') {
-      const targetImgUrl = decodeCloakToken(String(req.query.k || ''));
-      if (!targetImgUrl || !/^https?:\/\//i.test(targetImgUrl)) {
-        res.status(404).end();
-        return;
-      }
-      const cachedImg = imageProxyCache.get(targetImgUrl);
-      if (cachedImg && cachedImg.expiresAt > Date.now()) {
-        res.setHeader('Content-Type', cachedImg.contentType);
-        res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
-        res.send(cachedImg.buf);
-        return;
-      }
-      fetch(targetImgUrl, {
-        headers: {
-          Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-          Referer: 'https://movie-box.co/',
-        },
-        signal: AbortSignal.timeout(7000),
-      })
-        .then(async (r) => {
-          if (!r.ok) {
-            res.status(r.status).end();
-            return;
-          }
-          const ct = r.headers.get('content-type') || 'image/jpeg';
-          const ab = await r.arrayBuffer();
-          const buf = Buffer.from(ab);
-          if (buf.length > 0 && buf.length < 700_000) {
-            pruneCacheMap(imageProxyCache, 180);
-            imageProxyCache.set(targetImgUrl, {
-              buf,
-              contentType: ct,
-              expiresAt: Date.now() + 30 * 60_000,
-            });
-          }
-          res.setHeader('Content-Type', ct);
-          res.setHeader('Cache-Control', 'public, max-age=604800, immutable');
-          res.send(buf);
-        })
-        .catch(() => {
-          if (!res.headersSent) res.status(502).end();
-        });
+    // Commercial API Only Mode: block removed APK, public website, demo, v1, keyless /api/app, and stealth proxy routes
+    const isRemovedPublicOrLegacyRoute =
+      req.path === '/demo-api' ||
+      req.path === '/download-apk' ||
+      req.path === '/MovieBox-HD.apk' ||
+      req.path === '/CinePulse.apk' ||
+      req.path === '/api/download-apk' ||
+      req.path.startsWith('/_s/') ||
+      req.path === '/api/app' ||
+      req.path.startsWith('/api/app/') ||
+      req.path === '/api/demo' ||
+      req.path.startsWith('/api/demo/') ||
+      req.path.startsWith('/api/v1/') ||
+      req.path === '/api/v1';
+
+    if (isRemovedPublicOrLegacyRoute) {
+      res.status(401).json({
+        ok: false,
+        error: 'Commercial API Key required. Use /api/trial/* with X-API-Key or ?apiKey=.',
+      });
       return;
     }
 
-    // 0b. Uncloak Stealth API (/_s/g?k=...) & Stealth Video Stream (/_s/v.mp4?k=...) Gateways
-    if (
-      (req.path === '/_s/g' ||
-        req.path === '/_s/v.mp4' ||
-        req.path === '/api/g' ||
-        req.path === '/api/v') &&
-      typeof req.query.k === 'string'
-    ) {
-      const unlockedUrl = decodeCloakToken(String(req.query.k || ''));
-      if (unlockedUrl && unlockedUrl.startsWith('/api/')) {
-        req.url = unlockedUrl;
-        req.originalUrl = unlockedUrl;
-        delete (req as any)._parsedUrl;
-        const parsedU = new URL(unlockedUrl, 'http://localhost');
-        const nextQuery: Record<string, string> = {};
-        parsedU.searchParams.forEach((v, k) => {
-          nextQuery[k] = v;
-        });
-        req.query = nextQuery;
-      } else {
-        res.status(403).json({ ok: false, error: 'Invalid cloaked token' });
-        return;
-      }
-    }
-
+    // Strictly allow only commercial API endpoints (/api/trial/*, /api/owner/*, /api/mb-stream*, /api/mb-subtitle-srt, /api/health)
     if (
       req.path.startsWith('/api/') &&
-      req.path !== '/api/download-apk' &&
-      !req.path.startsWith('/api/demo') &&
+      req.path !== '/api/health' &&
       !req.path.startsWith('/api/trial') &&
-      !req.path.startsWith('/api/app') &&
       !req.path.startsWith('/api/owner')
     ) {
-      const ua = String(req.headers['user-agent'] || '');
-      const clientIp = String(
-        req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'local'
-      )
-        .split(',')[0]
-        .trim();
-
       const isStreamOrSubRoute =
-        req.path.startsWith('/api/mb-stream') ||
-        req.path.startsWith('/api/mb-ep-stream') ||
-        req.path.startsWith('/api/mb-subtitle-srt') ||
-        req.path.startsWith('/api/go') ||
-        req.path.startsWith('/api/ios-hls');
+        req.path === '/api/mb-stream' ||
+        req.path === '/api/mb-stream.mp4' ||
+        req.path === '/api/mb-subtitle-srt';
 
-      // 1. Validate trial stream token (?tk=) first so authorized Android APKs (OkHttp/ExoPlayer) & third-party websites work smoothly
-      const referer = String(req.headers.referer || '').toLowerCase();
+      if (!isStreamOrSubRoute) {
+        res.status(401).json({
+          ok: false,
+          error: 'Commercial API Key required. Use /api/trial/* with X-API-Key or ?apiKey=.',
+        });
+        return;
+      }
+
+      // Strictly require an active paid/trial ?tk= API key on ALL video streams & subtitles (ZERO keyless bypass)
       const trialStreamTk = typeof req.query.tk === 'string' ? String(req.query.tk).trim() : '';
       const hasValidTrialTk = Boolean(trialStreamTk && isActiveTrialStreamToken(trialStreamTk));
-      if (isStreamOrSubRoute && trialStreamTk && !hasValidTrialTk) {
-        res.status(403).send('Trial stream key expired, paused, or invalid');
+      if (!hasValidTrialTk) {
+        res.status(403).json({
+          ok: false,
+          error: 'Valid active API key (?tk=) required for media streams and subtitles.',
+        });
         return;
-      }
-
-      // 2. Block automated CLI scrapers & bots across protected /api/* routes (exempting ?tk= authenticated streams & /api/app official Android APK)
-      const isOfficialAppRoute = req.path.startsWith('/api/app/') || req.path === '/api/app';
-      const scraperRegex = isOfficialAppRoute
-        ? /\b(curl|wget|python|requests|urllib|httpx|aiohttp|scrapy|postman|insomnia|libwww|go-http-client|headlesschrome|phantomjs)\b/i
-        : /\b(curl|wget|python|requests|urllib|httpx|aiohttp|scrapy|postman|insomnia|libwww|go-http-client|java\/|okhttp|apache-httpclient|headlesschrome|phantomjs)\b/i;
-      if (!(isStreamOrSubRoute && hasValidTrialTk) && scraperRegex.test(ua)) {
-        res.status(403).json({ ok: false, error: 'Access denied by CinePulse Security Shield' });
-        return;
-      }
-
-      // 3. Anti-hotlinking check on non-trial stream routes
-      if (
-        isStreamOrSubRoute &&
-        !hasValidTrialTk &&
-        referer &&
-        !referer.includes('playlive.zeroo.click') &&
-        !referer.includes('zeroo.click') &&
-        !referer.includes('chinepulse.71i.site') &&
-        !referer.includes('71i.site') &&
-        !referer.includes('localhost') &&
-        !referer.includes('127.0.0.1') &&
-        !referer.includes('.run.app') &&
-        !referer.includes('aistudio.google.com')
-      ) {
-        res.status(403).send('Hotlinking prohibited by CinePulse Security Shield');
-        return;
-      }
-
-      // 3. Per-IP Rate Limiting against automated scraping floods
-      if (!isStreamOrSubRoute) {
-        const now = Date.now();
-        const rl = apiRateMap.get(clientIp);
-        if (!rl || now > rl.resetAt) {
-          if (apiRateMap.size > 2000) apiRateMap.clear();
-          apiRateMap.set(clientIp, { count: 1, resetAt: now + 10_000 });
-        } else {
-          rl.count++;
-          if (rl.count > 140) {
-            res.status(429).json({ ok: false, error: 'Too many requests' });
-            return;
-          }
-        }
-      }
-
-      // 4. Require signed CinePulse Web Client headers on all JSON API endpoints
-      //    and encrypt 100% of JSON responses into {_s:1, n, d} ciphertext!
-      const cpSig = String(req.headers['x-cp-sig'] || '').trim();
-      const cpTs = String(req.headers['x-cp-ts'] || '').trim();
-      const cpClient = String(req.headers['x-cp-client'] || '').trim();
-
-      if (!isStreamOrSubRoute && req.path !== '/api/health') {
-        if (!cpSig && cpClient !== 'cp-web-v4') {
-          res
-            .status(403)
-            .json({ ok: false, error: 'Protected by CinePulse Security Shield' });
-          return;
-        }
-        if (cpSig && cpTs) {
-          const expectedFull = computeServerShieldSignature(req.originalUrl, cpTs);
-          const expectedPath = computeServerShieldSignature(req.path, cpTs);
-          if (cpSig !== expectedFull && cpSig !== expectedPath) {
-            res.status(403).json({ ok: false, error: 'Invalid CinePulse security signature' });
-            return;
-          }
-        }
-        const origJson = res.json.bind(res);
-        res.json = ((body: any) => {
-          if (body && typeof body === 'object' && body._s !== 1) {
-            return origJson(encryptServerApiPayload(body));
-          }
-          return origJson(body);
-        }) as any;
       }
     }
 
@@ -6720,7 +6579,6 @@ async function startServer() {
   };
 
   isActiveTrialStreamToken = (token: string) => {
-    if (token === 'cp_app_official') return true;
     const rec = resolveOrRecoverTrialKey(token);
     if (!rec || !rec.active || Date.now() >= rec.expiresAt) return false;
     const isUnlimited = Boolean(rec.unlimited || rec.maxRequests < 0);
@@ -7009,16 +6867,7 @@ async function startServer() {
     sendPrettyDemoJson(res, 200, { ok: true, count: list.length, keys: list });
   });
 
-  // Public Unlimited Official Android App (/api/app/*) — opens straight into MovieBox without requiring a client trial key
-  app.use((req, _res, next) => {
-    if (req.url === '/api/app' || req.url.startsWith('/api/app/') || req.url.startsWith('/api/app?')) {
-      req.url = req.url.replace(/^\/api\/app(?=\/|$|\?)/, '/api/trial');
-      (req as any)._officialPublicApp = true;
-    }
-    next();
-  });
-
-  // Trial Key Authentication + Quota Enforcement Middleware for MovieBox Data Endpoints
+  // Trial Key Authentication + Quota Enforcement Middleware for MovieBox Commercial API Endpoints
   const requireValidTrialKey = (
     req: express.Request,
     res: express.Response,
@@ -7026,21 +6875,6 @@ async function startServer() {
   ) => {
     if (req.method !== 'GET') {
       sendPrettyDemoJson(res, 405, { ok: false, error: 'Trial API endpoints are read-only (GET).' });
-      return;
-    }
-    if ((req as any)._officialPublicApp) {
-      (req as any)._trialKeyRec = {
-        key: 'cp_app_official',
-        clientName: 'MovieBox Official App',
-        plan: 'UNLIMITED',
-        createdAt: 0,
-        expiresAt: 4102444800000,
-        maxRequests: -1,
-        usedRequests: 0,
-        active: true,
-        unlimited: true,
-      } as StoredTrialKey;
-      next();
       return;
     }
     const base = getPublicOrigin(req);
@@ -7907,6 +7741,145 @@ async function startServer() {
     }
   });
 
+  // Official MovieBox Live Sports API (Football, Cricket, Basketball + direct .m3u8 playPath & channels via h5-sport-api.aoneroom.com)
+  app.get('/api/trial/sports', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const sportType = String(req.query.type || req.query.sportType || 'all').trim().toLowerCase();
+    const leagueId = String(req.query.leagueId || '').trim();
+    const page = Math.min(20, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
+    try {
+      const sportHeaders: Record<string, string> = {
+        'User-Agent':
+          'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36',
+        Accept: 'application/json',
+        'X-Client-Info': JSON.stringify({ timezone: 'Asia/Dhaka' }),
+      };
+      const qs = new URLSearchParams({ page: String(page), perPage: '30' });
+      if (sportType && sportType !== 'all') qs.set('sportType', sportType);
+      if (leagueId) qs.set('leagueId', leagueId);
+
+      const [matchesJson, leaguesJson] = await Promise.all([
+        fetch(`https://h5-sport-api.aoneroom.com/wefeed-h5api-bff/live/match-list-v5?${qs.toString()}`, {
+          headers: sportHeaders,
+          signal: AbortSignal.timeout(5000),
+        })
+          .then((r) => (r.ok ? r.json() : null))
+          .catch(() => null) as Promise<any>,
+        fetch('https://h5-sport-api.aoneroom.com/wefeed-h5api-bff/live/league-tab', {
+          headers: sportHeaders,
+          signal: AbortSignal.timeout(4000),
+        })
+          .then((r) => (r.ok ? r.json() : null))
+          .catch(() => null) as Promise<any>,
+      ]);
+
+      const rawList = Array.isArray(matchesJson?.data?.list) ? matchesJson.data.list : [];
+      const filtered =
+        sportType && sportType !== 'all'
+          ? rawList.filter((m: any) => String(m?.type || '').toLowerCase() === sportType)
+          : rawList;
+      const finalRaw = filtered.length > 0 ? filtered : rawList;
+
+      const matches = finalRaw.map((m: any) => ({
+        id: String(m?.id || ''),
+        sportType: String(m?.type || 'football'),
+        league: String(m?.league || ''),
+        leagueId: String(m?.leagueId || ''),
+        status: String(m?.status || ''),
+        isLive: String(m?.status || '') === 'MatchIng' || Number(m?.statusLive) === 2,
+        startTimeMs: Number(m?.startTime || 0) || null,
+        team1: {
+          name: String(m?.team1?.name || ''),
+          score: String(m?.team1?.score ?? m?.teamMatchInfo1?.score ?? ''),
+          avatar: String(m?.team1?.avatar || ''),
+          cricket: m?.teamMatchInfo1?.crtRunsScored
+            ? {
+                runs: m.teamMatchInfo1.crtRunsScored,
+                wickets: m.teamMatchInfo1.crtWicketsLost,
+                overs: m.teamMatchInfo1.crtOvers,
+              }
+            : undefined,
+        },
+        team2: {
+          name: String(m?.team2?.name || ''),
+          score: String(m?.team2?.score ?? m?.teamMatchInfo2?.score ?? ''),
+          avatar: String(m?.team2?.avatar || ''),
+          cricket: m?.teamMatchInfo2?.crtRunsScored
+            ? {
+                runs: m.teamMatchInfo2.crtRunsScored,
+                wickets: m.teamMatchInfo2.crtWicketsLost,
+                overs: m.teamMatchInfo2.crtOvers,
+              }
+            : undefined,
+        },
+        liveM3u8Url: String(m?.playPath || ''),
+        channels: Array.isArray(m?.playSource)
+          ? m.playSource
+              .filter((c: any) => c?.path)
+              .map((c: any) => ({ title: String(c.title || 'Live Channel'), url: String(c.path) }))
+          : [],
+        watchPageUrl: m?.id
+          ? `https://sportsnow.top/live/detail?id=${encodeURIComponent(String(m.id))}&sportType=${encodeURIComponent(
+              String(m?.type || 'football')
+            )}`
+          : '',
+        hasHighlights: Boolean(m?.highlights && (Array.isArray(m.highlights) ? m.highlights.length : true)),
+        hasReplay: Boolean(m?.replay && (Array.isArray(m.replay) ? m.replay.length : true)),
+      }));
+
+      const leagues = Array.isArray(leaguesJson?.data?.list)
+        ? leaguesJson.data.list.map((l: any) => ({
+            id: String(l?.id || ''),
+            name: String(l?.localName || l?.name || ''),
+          }))
+        : [];
+
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-sports-live',
+        trial: buildTrialSummary(rec),
+        sportType,
+        page,
+        hasMore: Boolean(matchesJson?.data?.hasMore),
+        count: matches.length,
+        liveNowCount: matches.filter((x: any) => x.isLive || x.liveM3u8Url).length,
+        leagues,
+        matches,
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Sports live fetch failed' });
+    }
+  });
+
+  // Official MovieBox Short Video / Hot Short TV API (channelId: 7)
+  app.get('/api/trial/shorts', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    const page = Math.min(50, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
+    try {
+      const mbRes = await fetchMovieBoxCatalog('/category/short-tv', page, '');
+      const items = normalizeMovieCardList(deduplicateMovieCards(mbRes.items))
+        .filter((it) => it.path?.startsWith('/mb/'))
+        .slice(0, 64);
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        channel: 'Hot Short TV (Short Drama Reels)',
+        page,
+        maxPage: Math.max(mbRes.maxPage || 1, 50),
+        count: items.length,
+        items: items.map((item) => ({
+          ...item,
+          detailsEndpoint: `${base}/api/trial/details?path=${encodeURIComponent(item.path)}`,
+          streamEndpoint: `${base}/api/trial/stream?path=${encodeURIComponent(item.path)}&se=1&ep=1&title=${encodeURIComponent(item.title)}`,
+        })),
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Shorts fetch failed' });
+    }
+  });
+
   app.get('/api/trial/stream', requireValidTrialKey, async (req, res) => {
     const rec = (req as any)._trialKeyRec as StoredTrialKey;
     const base = getPublicOrigin(req);
@@ -8363,7 +8336,11 @@ async function startServer() {
                 <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/hot-search')">Hot Search</button>
               </div>
               <div class="row" style="margin-top:6px;">
+                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/sports')">Live Sports</button>
+                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/shorts?page=1')">Shorts TV</button>
                 <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/upcoming?page=1')">Upcoming</button>
+              </div>
+              <div class="row" style="margin-top:6px;">
                 <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/filter-options')">Filters</button>
                 <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/platform?name=Netflix&page=1')">Netflix</button>
               </div>
@@ -8994,6 +8971,8 @@ async function startServer() {
       `- Suggest (Autocomplete): ${base}/api/trial/suggest?q=Squid&apiKey=${rec.key}`,
       `- Hot Search: ${base}/api/trial/hot-search?apiKey=${rec.key}`,
       `- Catalog (18+ / Any Category): ${base}/api/trial/catalog?path=/adult18plus&page=1&apiKey=${rec.key}`,
+      `- Short Videos (Hot Short TV): ${base}/api/trial/shorts?page=1&apiKey=${rec.key}`,
+      `- Live Sports (Football/Cricket/NBA + .m3u8): ${base}/api/trial/sports?apiKey=${rec.key}`,
       `- OTT Platform (Netflix/Hoichoi/Zee5): ${base}/api/trial/platform?name=Netflix&page=1&apiKey=${rec.key}`,
       `- Upcoming Releases: ${base}/api/trial/upcoming?page=1&apiKey=${rec.key}`,
       `- Filter Options: ${base}/api/trial/filter-options?apiKey=${rec.key}`,
@@ -11181,68 +11160,9 @@ async function startServer() {
     res.status(204).end();
   });
 
-  // Direct 1-click Native Android APK Download Endpoint
-  app.get(['/download-apk', '/MovieBox-HD.apk', '/CinePulse.apk', '/api/download-apk'], async (_req, res) => {
-    const candidates = [
-      path.join(__dirname, 'public', 'downloads', 'MovieBox-HD.apk'),
-      path.join(__dirname, 'dist', 'downloads', 'MovieBox-HD.apk'),
-      path.join(__dirname, 'public', 'downloads', 'CinePulse-v1.0.apk'),
-      path.join(__dirname, 'dist', 'downloads', 'CinePulse-v1.0.apk'),
-      '/tmp/MovieBox-HD.apk',
-    ];
-    const apkFile = candidates.find((p) => fs.existsSync(p));
-    if (apkFile) {
-      const stat = fs.statSync(apkFile);
-      res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-      res.setHeader('Content-Disposition', 'attachment; filename="MovieBox-HD.apk"');
-      res.setHeader('Content-Length', String(stat.size));
-      res.setHeader('Cache-Control', 'no-cache');
-      fs.createReadStream(apkFile).pipe(res);
-      return;
-    }
-    const releaseApkUrl = 'https://github.com/freefirejafor-wq/Hd/releases/download/latest/MovieBox-HD.apk';
-    try {
-      const check = await fetch(releaseApkUrl, {
-        method: 'HEAD',
-        redirect: 'manual',
-        signal: AbortSignal.timeout(3000),
-      });
-      if (check.status === 200 || check.status === 301 || check.status === 302) {
-        res.redirect(302, releaseApkUrl);
-        return;
-      }
-    } catch {
-      // Fall through to status page if GitHub release is not published yet
-    }
-    res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8').send(`
-      <!doctype html>
-      <html lang="bn">
-      <head>
-        <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width,initial-scale=1" />
-        <title>MovieBox HD APK Download</title>
-        <style>
-          body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#121318;color:#fff;font-family:system-ui,sans-serif;padding:20px}
-          .card{max-width:440px;width:100%;background:#1b1d24;border:1px solid #2e3240;border-radius:16px;padding:22px;text-align:center}
-          .btn{display:inline-block;margin-top:14px;background:#1ce783;color:#041d11;font-weight:700;padding:12px 20px;border-radius:10px;text-decoration:none}
-          p{color:#9aa1b2;font-size:14px;line-height:1.6}
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h2 style="margin:0 0 8px">MovieBox HD APK এখনো তৈরি হয়নি</h2>
-          <p>সোর্স কোড GitHub-এ Push করার ৩–৫ মিনিট পর GitHub Actions অটোমেটিক APK বানিয়ে এই লিংকে সরাসরি ডাউনলোড চালু করে দেবে।</p>
-          <a class="btn" href="https://github.com/freefirejafor-wq/Hd/actions">Build Status দেখুন</a>
-        </div>
-      </body>
-      </html>
-    `);
-  });
-
-  // Never serve expired static db-shards (HTTP 410 Gone URLs) — force clients to use live /api/details
-  app.get('/db-shards/:file', (_req, res) => {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-    res.json({ details: {} });
+  // Root route redirects directly to the Commercial Client API Tester & Docs Portal (/trial)
+  app.get('/', (_req, res) => {
+    res.redirect(302, '/trial');
   });
 
   // Self-healing Service Worker endpoint: immediately wipes any stale Workbox precaches on Render and reloads clients
@@ -11285,27 +11205,12 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(__dirname, 'dist');
-    app.use(
-      express.static(distPath, {
-        setHeaders: (res, filePath) => {
-          if (
-            filePath.endsWith('.html') ||
-            filePath.endsWith('.json') ||
-            filePath.endsWith('.webmanifest') ||
-            filePath.endsWith('sw.js') ||
-            filePath.endsWith('registerSW.js')
-          ) {
-            res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-          } else {
-            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-          }
-        },
-      })
-    );
-    app.get('*', (_req, res) => {
-      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-      res.sendFile(path.join(distPath, 'index.html'));
+    app.get('*', (req, res) => {
+      if (req.path.startsWith('/api/')) {
+        res.status(404).json({ ok: false, error: 'Endpoint not found. Use /api/trial/* with an active API key.' });
+        return;
+      }
+      res.redirect(302, '/trial');
     });
   }
 
