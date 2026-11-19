@@ -7323,17 +7323,65 @@ async function startServer() {
     }
   });
 
+  const getMovieBoxAuthHeaders = async (_origin?: string): Promise<Record<string, string>> => {
+    if (!cachedMovieBoxToken || cachedMovieBoxTokenExpiresAt <= Date.now()) {
+      await getMovieBoxBearerToken(false).catch(() => {});
+    }
+    const hdrs: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      'X-Client-Info': JSON.stringify({ timezone: 'Asia/Dhaka' }),
+      'X-Vip-Restrict': '0',
+      'X-No-High-Risk-Restrict': '1',
+      'X-Request-Lang': 'en',
+      Referer: 'https://movie-box.co/?utm_source=mb_app_inner_btmtip',
+    };
+    if (cachedMovieBoxToken) {
+      hdrs.Authorization = `Bearer ${cachedMovieBoxToken}`;
+    } else {
+      hdrs['X-Client-Token'] = generateMovieBoxClientToken();
+    }
+    return hdrs;
+  };
+
   app.get('/api/trial/suggest', requireValidTrialKey, async (req, res) => {
     const rec = (req as any)._trialKeyRec as StoredTrialKey;
     const base = getPublicOrigin(req);
     const q = String(req.query.q || '').trim();
     if (!q) {
-      sendPrettyDemoJson(res, 200, { ok: true, source: 'official-moviebox-original', trial: buildTrialSummary(rec), items: [] });
+      sendPrettyDemoJson(res, 200, { ok: true, source: 'official-moviebox-original', trial: buildTrialSummary(rec), keywords: [], items: [] });
       return;
     }
     try {
-      const mbRes = await fetchMovieBoxCatalog('/', 1, q);
-      const combined = normalizeMovieCardList(deduplicateMovieCards(mbRes.items))
+      const mbHeaders = await getMovieBoxAuthHeaders(MOVIEBOX_ORIGIN);
+      const [suggestJson, mbRes] = await Promise.all([
+        Promise.any(
+          [MOVIEBOX_FALLBACK_API_ORIGIN, 'https://moviebox01.com', MOVIEBOX_API_ORIGIN].map(async (origin) => {
+            const r = await fetch(`${origin}/wefeed-h5api-bff/subject/search-suggest`, {
+              method: 'POST',
+              headers: mbHeaders,
+              body: JSON.stringify({ keyword: q, perPage: 16 }),
+              signal: AbortSignal.timeout(3500),
+            });
+            if (!r.ok) throw new Error('Bad status');
+            const j = (await r.json()) as any;
+            if (!Array.isArray(j?.data?.items)) throw new Error('Empty');
+            return j.data;
+          })
+        ).catch(() => null),
+        fetchMovieBoxCatalog('/', 1, q),
+      ]);
+      const keywords: string[] = Array.isArray(suggestJson?.items)
+        ? Array.from(new Set(suggestJson.items.map((x: any) => String(x?.word || '').trim()).filter(Boolean)))
+        : [];
+      const suggestCards: MovieCardItem[] = Array.isArray(suggestJson?.items)
+        ? suggestJson.items
+            .map((x: any, i: number) => (x?.subject ? mapMovieBoxItemToCard(x.subject, i) : null))
+            .filter(Boolean) as MovieCardItem[]
+        : [];
+      const combined = normalizeMovieCardList(deduplicateMovieCards([...suggestCards, ...mbRes.items]))
         .filter((it) => it.path?.startsWith('/mb/'))
         .slice(0, 40);
       sendPrettyDemoJson(res, 200, {
@@ -7341,6 +7389,7 @@ async function startServer() {
         source: 'official-moviebox-original',
         trial: buildTrialSummary(rec),
         query: q,
+        keywords,
         count: combined.length,
         items: combined.map((item) => ({
           ...item,
@@ -7588,6 +7637,7 @@ async function startServer() {
           ...item,
           detailsEndpoint: `${base}/api/trial/details?path=${encodeURIComponent(item.path)}`,
         })),
+        commentsEndpoint: `${base}/api/trial/comments?subjectId=${encodeURIComponent(resolvedId)}&page=1`,
       });
     } catch (err: any) {
       sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Trial details failed' });
@@ -7629,6 +7679,231 @@ async function startServer() {
       });
     } catch (err: any) {
       sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Related movies fetch failed' });
+    }
+  });
+
+  // Official MovieBox Comments / Reviews (/wefeed-h5api-bff/post/list/subject)
+  app.get('/api/trial/comments', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const rawPath = String(req.query.path || '').trim();
+    let subjectId = String(req.query.subjectId || req.query.id || '').trim();
+    const page = Math.min(20, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
+    if (!subjectId && rawPath.startsWith('/mb/')) {
+      subjectId = rawPath.replace(/^\/mb\//, '').split('/')[0] || '';
+    }
+    if (!subjectId) {
+      sendPrettyDemoJson(res, 400, { ok: false, error: 'Provide ?subjectId= or ?path=/mb/...' });
+      return;
+    }
+    try {
+      const headers = await getMovieBoxAuthHeaders(MOVIEBOX_ORIGIN);
+      const data = await Promise.any(
+        ['https://moviebox01.com', MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
+          const r = await fetch(
+            `${origin}/wefeed-h5api-bff/post/list/subject?id=${encodeURIComponent(subjectId)}&page=${page}&perPage=20`,
+            { headers, signal: AbortSignal.timeout(4500) }
+          );
+          if (!r.ok) throw new Error('Bad status');
+          const j = (await r.json()) as any;
+          if (!j?.data) throw new Error('Empty');
+          return j.data;
+        })
+      ).catch(() => ({ items: [], pager: { totalCount: 0 } }));
+      const rawItems = Array.isArray(data?.items) ? data.items : [];
+      const comments = rawItems.map((it: any, idx: number) => ({
+        id: String(it?.postId || it?.id || idx),
+        userName: String(it?.user?.nickName || it?.userName || 'MovieBox User'),
+        avatar: String(it?.user?.avatar || ''),
+        content: String(it?.content || it?.text || ''),
+        rating: it?.score ?? it?.rating ?? null,
+        likes: Number(it?.likeCount || it?.stat?.likeCount || 0),
+        createdAt: it?.createdAt || it?.createTime || null,
+      }));
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        subjectId,
+        page,
+        totalCount: Number(data?.pager?.totalCount || comments.length),
+        comments,
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Comments fetch failed' });
+    }
+  });
+
+  // Official Actor / Director Filmography (/wefeed-h5api-bff/staff/subject-list + staff-related)
+  app.get('/api/trial/staff', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    const staffId = String(req.query.staffId || req.query.id || '').trim();
+    const page = Math.min(20, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
+    if (!staffId) {
+      sendPrettyDemoJson(res, 400, { ok: false, error: 'Provide ?staffId=<id>' });
+      return;
+    }
+    try {
+      const headers = await getMovieBoxAuthHeaders(MOVIEBOX_ORIGIN);
+      const [subjectsJson, relatedJson] = await Promise.all([
+        Promise.any(
+          ['https://moviebox01.com', MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
+            const r = await fetch(
+              `${origin}/wefeed-h5api-bff/staff/subject-list?perPage=24&page=${page}&staffId=${encodeURIComponent(staffId)}`,
+              { headers, signal: AbortSignal.timeout(4500) }
+            );
+            if (!r.ok) throw new Error('Bad status');
+            return (await r.json()) as any;
+          })
+        ).catch(() => null),
+        Promise.any(
+          ['https://moviebox01.com', MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
+            const r = await fetch(
+              `${origin}/wefeed-h5api-bff/staff/staff-related?staffId=${encodeURIComponent(staffId)}`,
+              { headers, signal: AbortSignal.timeout(3500) }
+            );
+            if (!r.ok) throw new Error('Bad status');
+            return (await r.json()) as any;
+          })
+        ).catch(() => null),
+      ]);
+      const rawList = subjectsJson?.data?.subjectList || subjectsJson?.data?.items || [];
+      const items = normalizeMovieCardList(
+        (Array.isArray(rawList) ? rawList : []).map((raw: any, i: number) => mapMovieBoxItemToCard(raw, i)).filter(Boolean) as MovieCardItem[]
+      );
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        staffId,
+        page,
+        staffInfo: subjectsJson?.data?.staff || null,
+        relatedStaff: relatedJson?.data?.items || relatedJson?.data || [],
+        count: items.length,
+        items: items.map((item) => ({
+          ...item,
+          detailsEndpoint: `${base}/api/trial/details?path=${encodeURIComponent(item.path)}`,
+        })),
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Staff fetch failed' });
+    }
+  });
+
+  // Official MovieBox Filter Tree (/wefeed-h5api-bff/filter)
+  app.get('/api/trial/filter-options', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    try {
+      const headers = await getMovieBoxAuthHeaders(MOVIEBOX_ORIGIN);
+      const data = await Promise.any(
+        ['https://moviebox01.com', MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
+          const r = await fetch(`${origin}/wefeed-h5api-bff/filter`, {
+            headers,
+            signal: AbortSignal.timeout(4500),
+          });
+          if (!r.ok) throw new Error('Bad status');
+          const j = (await r.json()) as any;
+          if (!j?.data?.filterItemsData) throw new Error('Missing filterItemsData');
+          return j.data.filterItemsData;
+        })
+      );
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        filterOptions: data,
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Filter options fetch failed' });
+    }
+  });
+
+  // Official OTT Platforms (Netflix, PrimeVideo, Disney, AppleTV, Viu, Hulu, Zee5, Vivamax, Hoichoi, Showmax)
+  app.get('/api/trial/platform', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    const platform = String(req.query.name || req.query.platform || 'Netflix').trim() || 'Netflix';
+    const page = Math.min(50, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
+    try {
+      const headers = await getMovieBoxAuthHeaders(MOVIEBOX_ORIGIN);
+      const platJson = await Promise.any(
+        ['https://moviebox01.com', MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
+          const r = await fetch(
+            `${origin}/wefeed-h5api-bff/platform/play-list?page=${page}&perPage=24&platform=${encodeURIComponent(platform)}`,
+            { headers, signal: AbortSignal.timeout(4500) }
+          );
+          if (!r.ok) throw new Error('Bad status');
+          const j = (await r.json()) as any;
+          const list = j?.data?.subjectList || j?.data?.items || [];
+          if (!Array.isArray(list) || list.length === 0) throw new Error('Empty');
+          return list;
+        })
+      ).catch(() => null);
+      let items: MovieCardItem[] = [];
+      if (Array.isArray(platJson) && platJson.length > 0) {
+        items = normalizeMovieCardList(
+          platJson.map((raw: any, i: number) => mapMovieBoxItemToCard(raw, i)).filter(Boolean) as MovieCardItem[]
+        );
+      } else {
+        const fb = await fetchMovieBoxCatalog('/', page, platform);
+        items = normalizeMovieCardList(fb.items);
+      }
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        platform,
+        availablePlatforms: ['Netflix', 'PrimeVideo', 'Disney', 'AppleTV', 'Viu', 'Hulu', 'Zee5', 'Vivamax', 'Hoichoi', 'Showmax'],
+        page,
+        count: items.length,
+        items: items.map((item) => ({
+          ...item,
+          detailsEndpoint: `${base}/api/trial/details?path=${encodeURIComponent(item.path)}`,
+        })),
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Platform feed failed' });
+    }
+  });
+
+  // Official Upcoming Calendar (/wefeed-h5api-bff/upcoming-subject-list + APPOINTMENT_LIST)
+  app.get('/api/trial/upcoming', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    const page = Math.min(20, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
+    try {
+      const headers = await getMovieBoxAuthHeaders(MOVIEBOX_ORIGIN);
+      const [upJson, homePayload] = await Promise.all([
+        Promise.any(
+          ['https://moviebox01.com', MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
+            const r = await fetch(
+              `${origin}/wefeed-h5api-bff/upcoming-subject-list?page=${page}&perPage=24`,
+              { headers, signal: AbortSignal.timeout(4000) }
+            );
+            if (!r.ok) throw new Error('Bad status');
+            return (await r.json()) as any;
+          })
+        ).catch(() => null),
+        fetchMovieBoxHomePayload(),
+      ]);
+      const upRaw = upJson?.data?.subjects || upJson?.data?.items || [];
+      const upCards = (Array.isArray(upRaw) ? upRaw : [])
+        .map((raw: any, i: number) => mapMovieBoxItemToCard(raw, i))
+        .filter(Boolean) as MovieCardItem[];
+      const combined = upCards.length > 0 ? upCards : (homePayload.comingSoon || []);
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        page,
+        count: combined.length,
+        items: combined.map((item: any) => ({
+          ...item,
+          detailsEndpoint: item.path ? `${base}/api/trial/details?path=${encodeURIComponent(item.path)}` : undefined,
+        })),
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Upcoming fetch failed' });
     }
   });
 
@@ -8080,43 +8355,55 @@ async function startServer() {
           <h2>2. Live API &amp; Video Tester <span style="font-size:11.5px;color:var(--muted);font-weight:400;">Auth: X-API-Key or ?apiKey=</span></h2>
           <div class="ep-grid">
             <div class="ep-box">
-              <strong style="font-size:13px;">Home &amp; Categories</strong>
-              <span style="font-size:11px;color:var(--muted);">GET /api/trial/home</span>
+              <strong style="font-size:13px;">Home, Categories &amp; Discovery</strong>
+              <span style="font-size:11px;color:var(--muted);">Official MovieBox Feeds</span>
               <div class="row">
                 <button class="sm" style="flex:1" onclick="callTrial('/api/trial/home')">Home</button>
-                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/categories')">Categories</button>
+                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/categories')">77 Cats</button>
                 <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/hot-search')">Hot Search</button>
+              </div>
+              <div class="row" style="margin-top:6px;">
+                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/upcoming?page=1')">Upcoming</button>
+                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/filter-options')">Filters</button>
+                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/platform?name=Netflix&page=1')">Netflix</button>
               </div>
             </div>
             <div class="ep-box">
-              <strong style="font-size:13px;">Search Movies / Series</strong>
+              <strong style="font-size:13px;">Search &amp; Autocomplete</strong>
               <input id="searchQ" value="Squid Game" />
-              <button class="sm" onclick="callTrial('/api/trial/search?q=' + encodeURIComponent(val('searchQ') || 'Squid Game'))">Test Search</button>
+              <div class="row">
+                <button class="sm" style="flex:1" onclick="callTrial('/api/trial/search?q=' + encodeURIComponent(val('searchQ') || 'Squid Game'))">Test Search</button>
+                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/suggest?q=' + encodeURIComponent(val('searchQ') || 'Squid'))">Suggest</button>
+              </div>
             </div>
             <div class="ep-box">
               <strong style="font-size:13px;">Category Catalog</strong>
               <select id="catSel">
                 <option value="/">Trending (All)</option>
-                <option value="/new-uploads">New Uploads</option>
-                <option value="/new-releases">New Releases</option>
-                <option value="/hot-dhamaka">Hot Dhamaka</option>
+                <option value="/web/movie">Movies (/web/movie)</option>
+                <option value="/web/tv-series">TV Series (/web/tv-series)</option>
+                <option value="/category/short-tv">Hot Short TV</option>
                 <option value="/language/bangla">Bangla</option>
                 <option value="/bollywood">Bollywood</option>
                 <option value="/hollywood">Hollywood</option>
                 <option value="/language/hindi-dubbed">Hindi Dubbed</option>
                 <option value="/korean">Korean</option>
                 <option value="/anime">Anime</option>
-                <option value="/adult18plus">Adult 18+ (MovieBox Original)</option>
+                <option value="/adult18plus">Adult 18+ (/adult18plus)</option>
+                <option value="/web/midnight">Midnight 18+ (/web/midnight)</option>
               </select>
               <button class="sm" onclick="callTrial('/api/trial/catalog?path=' + encodeURIComponent(val('catSel')) + '&page=1')">Test Catalog</button>
             </div>
             <div class="ep-box">
-              <strong style="font-size:13px;">Details &amp; Live Video</strong>
+              <strong style="font-size:13px;">Details, Comments &amp; Live Video</strong>
               <input id="titleInput" value="Squid Game" />
               <div class="row">
                 <button class="sm" style="flex:1" onclick="callTrial('/api/trial/details?title=' + encodeURIComponent(val('titleInput') || 'Squid Game'))">Details</button>
                 <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/related?title=' + encodeURIComponent(val('titleInput') || 'Squid Game'))">Related</button>
-                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/stream?title=' + encodeURIComponent(val('titleInput') || 'Squid Game') + '&se=1&ep=1', false)">Stream</button>
+                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/comments?subjectId=973041525783496480&page=1')">Comments</button>
+              </div>
+              <div class="row" style="margin-top:6px;">
+                <button class="sec sm" style="flex:1" onclick="callTrial('/api/trial/stream?title=' + encodeURIComponent(val('titleInput') || 'Squid Game') + '&se=1&ep=1', false)">Stream (Hindi+Orig)</button>
                 <button class="sm" style="flex:1;background:#16a34a" onclick="callTrial('/api/trial/stream?title=' + encodeURIComponent(val('titleInput') || 'Squid Game') + '&se=1&ep=1', true)">Play Video</button>
               </div>
             </div>
@@ -8701,11 +8988,20 @@ async function startServer() {
       `Live Tester Portal: ${base}/trial`,
       '',
       'Sample Endpoints (pass header X-API-Key or ?apiKey=):',
-      `- Home: ${base}/api/trial/home?apiKey=${rec.key}`,
+      `- Home (Banners/Sports/All Sections): ${base}/api/trial/home?apiKey=${rec.key}`,
+      `- Categories (77): ${base}/api/trial/categories?apiKey=${rec.key}`,
       `- Search: ${base}/api/trial/search?q=Squid+Game&apiKey=${rec.key}`,
-      `- Catalog (18+): ${base}/api/trial/catalog?path=/adult18plus&page=1&apiKey=${rec.key}`,
-      `- Details: ${base}/api/trial/details?title=Squid+Game&apiKey=${rec.key}`,
-      `- Stream: ${base}/api/trial/stream?title=Squid+Game&se=1&ep=1&apiKey=${rec.key}`,
+      `- Suggest (Autocomplete): ${base}/api/trial/suggest?q=Squid&apiKey=${rec.key}`,
+      `- Hot Search: ${base}/api/trial/hot-search?apiKey=${rec.key}`,
+      `- Catalog (18+ / Any Category): ${base}/api/trial/catalog?path=/adult18plus&page=1&apiKey=${rec.key}`,
+      `- OTT Platform (Netflix/Hoichoi/Zee5): ${base}/api/trial/platform?name=Netflix&page=1&apiKey=${rec.key}`,
+      `- Upcoming Releases: ${base}/api/trial/upcoming?page=1&apiKey=${rec.key}`,
+      `- Filter Options: ${base}/api/trial/filter-options?apiKey=${rec.key}`,
+      `- Details (+ Dubs & Related): ${base}/api/trial/details?title=Squid+Game&apiKey=${rec.key}`,
+      `- Related Movies: ${base}/api/trial/related?title=Squid+Game&apiKey=${rec.key}`,
+      `- Comments: ${base}/api/trial/comments?subjectId=973041525783496480&page=1&apiKey=${rec.key}`,
+      `- Staff/Actor Movies: ${base}/api/trial/staff?staffId=1&page=1&apiKey=${rec.key}`,
+      `- Stream (Hindi Dub + Original + Subs): ${base}/api/trial/stream?title=Squid+Game&se=1&ep=1&apiKey=${rec.key}`,
     ].join('\n');
   };
 
