@@ -6631,6 +6631,14 @@ async function startServer() {
   let notifyTelegramTrialAlert: (rec: StoredTrialKey, reason: 'EXPIRED' | 'QUOTA_EXHAUSTED') => void = () => {};
   let capturePublicOriginForBot: (req: express.Request) => void = () => {};
   let startTelegramBotPoller: () => void = () => {};
+  let resolveStreamProxyOrigin = (fallbackBase: string): string => {
+    const envWorker = String(
+      process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || process.env.CF_WORKER_STREAM_URL || ''
+    )
+      .trim()
+      .replace(/\/+$/, '');
+    return envWorker && /^https?:\/\//i.test(envWorker) ? envWorker : fallbackBase;
+  };
 
   const loadTrialKeysStore = () => {
     try {
@@ -7430,11 +7438,14 @@ async function startServer() {
       targetPath = `/mb/${subjectId}/${slug}`;
     }
 
+    const streamBase = resolveStreamProxyOrigin(base);
+
     const toTrialUrl = (u: string) => {
       if (!u || !u.startsWith('/')) return u;
       const sep = u.includes('?') ? '&' : '?';
       const needsTk = u.startsWith('/api/mb-stream') || u.startsWith('/api/mb-subtitle-srt');
-      return `${base}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ''}`;
+      const hostBase = needsTk ? streamBase : base;
+      return `${hostBase}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ''}`;
     };
 
     try {
@@ -8139,11 +8150,13 @@ async function startServer() {
       ]).catch(() => []);
 
       const embedBackups = buildEmbedBackupSources(imdbId, effectiveSe, effectiveEp, title, activeAudioLabel);
+      const streamBase = resolveStreamProxyOrigin(base);
       const toAbsoluteWithTrialTk = (u: string) => {
         if (!u.startsWith('/')) return u;
         const sep = u.includes('?') ? '&' : '?';
         const needsTk = u.startsWith('/api/mb-stream') || u.startsWith('/api/mb-subtitle-srt');
-        return `${base}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ''}`;
+        const hostBase = needsTk ? streamBase : base;
+        return `${hostBase}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ''}`;
       };
       const embedPlayerUrl = `${base}/trial-embed?apiKey=${encodeURIComponent(rec.key)}&subjectId=${encodeURIComponent(
         subjectId
@@ -8258,11 +8271,12 @@ async function startServer() {
         const fbSeries = await fetchMovieBoxPlayStreams(subjectId, detailPath, 1, 1, title, lang, '');
         if (fbSeries.sources.length > 0) playRes = fbSeries;
       }
+      const embedStreamBase = resolveStreamProxyOrigin(base);
       const mp4Sources = (playRes.sources || [])
         .filter((s) => s.url && s.url.startsWith('/api/mb-stream'))
         .map((s) => ({
           label: `${s.quality}p`,
-          url: `${base}${s.url}${s.url.includes('?') ? '&' : '?'}tk=${encodeURIComponent(rec.key)}`,
+          url: `${embedStreamBase}${s.url}${s.url.includes('?') ? '&' : '?'}tk=${encodeURIComponent(rec.key)}`,
         }));
       const firstSrc = mp4Sources[0]?.url || '';
       const safeTitle = title.replace(/[<>&"']/g, '');
@@ -8724,6 +8738,7 @@ async function startServer() {
   const botConfigPath = path.join(trialDataDir, 'cinepulse-bot-config.json');
   interface BotConfigState {
     publicUrl?: string;
+    workerUrl?: string;
     ownerPinHash?: string;
     ownerPinSalt?: string;
   }
@@ -8749,6 +8764,19 @@ async function startServer() {
 
   let botConfigState: BotConfigState = loadBotConfig();
   let capturedPublicBaseUrl = '';
+
+  resolveStreamProxyOrigin = (fallbackBase: string): string => {
+    const envWorker = String(
+      process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || process.env.CF_WORKER_STREAM_URL || ''
+    )
+      .trim()
+      .replace(/\/+$/, '');
+    if (envWorker && /^https?:\/\//i.test(envWorker)) return envWorker;
+    if (botConfigState.workerUrl && /^https?:\/\//i.test(botConfigState.workerUrl)) {
+      return botConfigState.workerUrl.replace(/\/+$/, '');
+    }
+    return fallbackBase;
+  };
 
   capturePublicOriginForBot = (req: express.Request) => {
     const rawOrigin = getPublicOrigin(req).replace(/\/+$/, '');
@@ -9703,6 +9731,47 @@ async function startServer() {
         return { handled: true, reason: 'cmd:seturl:ok' };
       }
 
+      if (cmd === 'setworker') {
+        const cleanUrl = arg.trim().replace(/\/+$/, '');
+        if (!cleanUrl) {
+          const cur = resolveStreamProxyOrigin('');
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: `⚡ <b>Cloudflare Worker Video Proxy</b>\nবর্তমান Worker: <code>${escTgHtml(
+              cur || 'OFF (Direct Server)'
+            )}</code>\n\nচালু করতে লিখুন:\n<code>/setworker https://your-worker.workers.dev</code>\nবন্ধ করতে লিখুন:\n<code>/setworker off</code>`,
+            parse_mode: 'HTML',
+          });
+          return { handled: true, reason: 'cmd:setworker:info' };
+        }
+        if (/^(off|none|reset|disable)$/i.test(cleanUrl)) {
+          delete botConfigState.workerUrl;
+          saveBotConfig(botConfigState);
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: '✅ Cloudflare Worker Video Proxy বন্ধ করা হয়েছে (এখন সার্ভার থেকে সরাসরি স্ট্রিম হবে)।',
+            parse_mode: 'HTML',
+          });
+          return { handled: true, reason: 'cmd:setworker:off' };
+        }
+        if (!/^https?:\/\/.+/i.test(cleanUrl)) {
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: '❌ সঠিক https:// URL দিন। যেমন: <code>/setworker https://mb-stream.yourname.workers.dev</code>',
+            parse_mode: 'HTML',
+          });
+          return { handled: true, reason: 'cmd:setworker:invalid' };
+        }
+        botConfigState.workerUrl = cleanUrl;
+        saveBotConfig(botConfigState);
+        await dispatch('sendMessage', {
+          chat_id: chatId,
+          text: `✅ <b>Cloudflare Worker Video Proxy চালু হয়েছে!</b>\nএখন সব ভিডিও স্ট্রিম, ডাউনলোড ও সাবটাইটেল এই Worker দিয়ে যাবে (সার্ভার ব্যান্ডউইথ ০% খরচ হবে):\n<code>${escTgHtml(cleanUrl)}</code>`,
+          parse_mode: 'HTML',
+        });
+        return { handled: true, reason: 'cmd:setworker:ok' };
+      }
+
       await dispatch('sendMessage', {
         chat_id: chatId,
         text: '❓ অজানা কমান্ড। <code>/menu</code> বা <code>/help</code> লিখে দেখুন।',
@@ -9814,6 +9883,7 @@ async function startServer() {
             { command: 'unlimited', description: 'রিকোয়েস্ট আনলিমিটেড করুন' },
             { command: 'delete', description: 'ক্লায়েন্ট Key স্থায়ীভাবে ডিলিট' },
             { command: 'seturl', description: 'লাইভ API ডোমেইন সেট করুন' },
+            { command: 'setworker', description: 'Cloudflare Worker ভিডিও প্রক্সি সেট করুন' },
           ],
         });
         console.log('[Telegram Admin Bot] Connected & polling for owner commands.');
@@ -11248,9 +11318,11 @@ async function startServer() {
   });
 
   app.get('/api/health', (_req, res) => {
+    const videoProxy = (process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || '').trim();
     res.status(200).json({
       ok: true,
       service: 'CinePulse HD',
+      videoProxyActive: Boolean(videoProxy),
       uptimeSeconds: Math.round(process.uptime()),
       timestamp: Date.now(),
     });

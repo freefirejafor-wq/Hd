@@ -6066,6 +6066,12 @@ async function startServer() {
   };
   let startTelegramBotPoller = () => {
   };
+  let resolveStreamProxyOrigin = (fallbackBase) => {
+    const envWorker = String(
+      process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || process.env.CF_WORKER_STREAM_URL || ""
+    ).trim().replace(/\/+$/, "");
+    return envWorker && /^https?:\/\//i.test(envWorker) ? envWorker : fallbackBase;
+  };
   const loadTrialKeysStore = () => {
     try {
       if (!fs.existsSync(trialStorePath)) return;
@@ -6755,11 +6761,13 @@ async function startServer() {
     if (!targetPath && subjectId) {
       targetPath = `/mb/${subjectId}/${slug}`;
     }
+    const streamBase = resolveStreamProxyOrigin(base);
     const toTrialUrl = (u) => {
       if (!u || !u.startsWith("/")) return u;
       const sep = u.includes("?") ? "&" : "?";
       const needsTk = u.startsWith("/api/mb-stream") || u.startsWith("/api/mb-subtitle-srt");
-      return `${base}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ""}`;
+      const hostBase = needsTk ? streamBase : base;
+      return `${hostBase}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ""}`;
     };
     try {
       let mbPath = targetPath;
@@ -7366,11 +7374,13 @@ async function startServer() {
         )
       ]).catch(() => []);
       const embedBackups = buildEmbedBackupSources(imdbId, effectiveSe, effectiveEp, title, activeAudioLabel);
+      const streamBase = resolveStreamProxyOrigin(base);
       const toAbsoluteWithTrialTk = (u) => {
         if (!u.startsWith("/")) return u;
         const sep = u.includes("?") ? "&" : "?";
         const needsTk = u.startsWith("/api/mb-stream") || u.startsWith("/api/mb-subtitle-srt");
-        return `${base}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ""}`;
+        const hostBase = needsTk ? streamBase : base;
+        return `${hostBase}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ""}`;
       };
       const embedPlayerUrl = `${base}/trial-embed?apiKey=${encodeURIComponent(rec.key)}&subjectId=${encodeURIComponent(
         subjectId
@@ -7469,9 +7479,10 @@ async function startServer() {
         const fbSeries = await fetchMovieBoxPlayStreams(subjectId, detailPath, 1, 1, title, lang, "");
         if (fbSeries.sources.length > 0) playRes = fbSeries;
       }
+      const embedStreamBase = resolveStreamProxyOrigin(base);
       const mp4Sources = (playRes.sources || []).filter((s) => s.url && s.url.startsWith("/api/mb-stream")).map((s) => ({
         label: `${s.quality}p`,
-        url: `${base}${s.url}${s.url.includes("?") ? "&" : "?"}tk=${encodeURIComponent(rec.key)}`
+        url: `${embedStreamBase}${s.url}${s.url.includes("?") ? "&" : "?"}tk=${encodeURIComponent(rec.key)}`
       }));
       const firstSrc = mp4Sources[0]?.url || "";
       const safeTitle = title.replace(/[<>&"']/g, "");
@@ -7941,6 +7952,16 @@ async function startServer() {
   };
   let botConfigState = loadBotConfig();
   let capturedPublicBaseUrl = "";
+  resolveStreamProxyOrigin = (fallbackBase) => {
+    const envWorker = String(
+      process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || process.env.CF_WORKER_STREAM_URL || ""
+    ).trim().replace(/\/+$/, "");
+    if (envWorker && /^https?:\/\//i.test(envWorker)) return envWorker;
+    if (botConfigState.workerUrl && /^https?:\/\//i.test(botConfigState.workerUrl)) {
+      return botConfigState.workerUrl.replace(/\/+$/, "");
+    }
+    return fallbackBase;
+  };
   capturePublicOriginForBot = (req) => {
     const rawOrigin = getPublicOrigin(req).replace(/\/+$/, "");
     if (!rawOrigin) return;
@@ -8786,6 +8807,54 @@ ${buildClientCardHtml(exact)}`,
         });
         return { handled: true, reason: "cmd:seturl:ok" };
       }
+      if (cmd === "setworker") {
+        const cleanUrl = arg.trim().replace(/\/+$/, "");
+        if (!cleanUrl) {
+          const cur = resolveStreamProxyOrigin("");
+          await dispatch("sendMessage", {
+            chat_id: chatId,
+            text: `\u26A1 <b>Cloudflare Worker Video Proxy</b>
+\u09AC\u09B0\u09CD\u09A4\u09AE\u09BE\u09A8 Worker: <code>${escTgHtml(
+              cur || "OFF (Direct Server)"
+            )}</code>
+
+\u099A\u09BE\u09B2\u09C1 \u0995\u09B0\u09A4\u09C7 \u09B2\u09BF\u0996\u09C1\u09A8:
+<code>/setworker https://your-worker.workers.dev</code>
+\u09AC\u09A8\u09CD\u09A7 \u0995\u09B0\u09A4\u09C7 \u09B2\u09BF\u0996\u09C1\u09A8:
+<code>/setworker off</code>`,
+            parse_mode: "HTML"
+          });
+          return { handled: true, reason: "cmd:setworker:info" };
+        }
+        if (/^(off|none|reset|disable)$/i.test(cleanUrl)) {
+          delete botConfigState.workerUrl;
+          saveBotConfig(botConfigState);
+          await dispatch("sendMessage", {
+            chat_id: chatId,
+            text: "\u2705 Cloudflare Worker Video Proxy \u09AC\u09A8\u09CD\u09A7 \u0995\u09B0\u09BE \u09B9\u09DF\u09C7\u099B\u09C7 (\u098F\u0996\u09A8 \u09B8\u09BE\u09B0\u09CD\u09AD\u09BE\u09B0 \u09A5\u09C7\u0995\u09C7 \u09B8\u09B0\u09BE\u09B8\u09B0\u09BF \u09B8\u09CD\u099F\u09CD\u09B0\u09BF\u09AE \u09B9\u09AC\u09C7)\u0964",
+            parse_mode: "HTML"
+          });
+          return { handled: true, reason: "cmd:setworker:off" };
+        }
+        if (!/^https?:\/\/.+/i.test(cleanUrl)) {
+          await dispatch("sendMessage", {
+            chat_id: chatId,
+            text: "\u274C \u09B8\u09A0\u09BF\u0995 https:// URL \u09A6\u09BF\u09A8\u0964 \u09AF\u09C7\u09AE\u09A8: <code>/setworker https://mb-stream.yourname.workers.dev</code>",
+            parse_mode: "HTML"
+          });
+          return { handled: true, reason: "cmd:setworker:invalid" };
+        }
+        botConfigState.workerUrl = cleanUrl;
+        saveBotConfig(botConfigState);
+        await dispatch("sendMessage", {
+          chat_id: chatId,
+          text: `\u2705 <b>Cloudflare Worker Video Proxy \u099A\u09BE\u09B2\u09C1 \u09B9\u09DF\u09C7\u099B\u09C7!</b>
+\u098F\u0996\u09A8 \u09B8\u09AC \u09AD\u09BF\u09A1\u09BF\u0993 \u09B8\u09CD\u099F\u09CD\u09B0\u09BF\u09AE, \u09A1\u09BE\u0989\u09A8\u09B2\u09CB\u09A1 \u0993 \u09B8\u09BE\u09AC\u099F\u09BE\u0987\u099F\u09C7\u09B2 \u098F\u0987 Worker \u09A6\u09BF\u09DF\u09C7 \u09AF\u09BE\u09AC\u09C7 (\u09B8\u09BE\u09B0\u09CD\u09AD\u09BE\u09B0 \u09AC\u09CD\u09AF\u09BE\u09A8\u09CD\u09A1\u0989\u0987\u09A5 \u09E6% \u0996\u09B0\u099A \u09B9\u09AC\u09C7):
+<code>${escTgHtml(cleanUrl)}</code>`,
+          parse_mode: "HTML"
+        });
+        return { handled: true, reason: "cmd:setworker:ok" };
+      }
       await dispatch("sendMessage", {
         chat_id: chatId,
         text: "\u2753 \u0985\u099C\u09BE\u09A8\u09BE \u0995\u09AE\u09BE\u09A8\u09CD\u09A1\u0964 <code>/menu</code> \u09AC\u09BE <code>/help</code> \u09B2\u09BF\u0996\u09C7 \u09A6\u09C7\u0996\u09C1\u09A8\u0964",
@@ -8883,7 +8952,8 @@ ${buildClientCardHtml(exact)}`,
             { command: "renew", description: "\u09AE\u09C7\u09DF\u09BE\u09A6 \u09AC\u09BE\u09DC\u09BE\u09A8 (/renew Name 30)" },
             { command: "unlimited", description: "\u09B0\u09BF\u0995\u09CB\u09DF\u09C7\u09B8\u09CD\u099F \u0986\u09A8\u09B2\u09BF\u09AE\u09BF\u099F\u09C7\u09A1 \u0995\u09B0\u09C1\u09A8" },
             { command: "delete", description: "\u0995\u09CD\u09B2\u09BE\u09DF\u09C7\u09A8\u09CD\u099F Key \u09B8\u09CD\u09A5\u09BE\u09DF\u09C0\u09AD\u09BE\u09AC\u09C7 \u09A1\u09BF\u09B2\u09BF\u099F" },
-            { command: "seturl", description: "\u09B2\u09BE\u0987\u09AD API \u09A1\u09CB\u09AE\u09C7\u0987\u09A8 \u09B8\u09C7\u099F \u0995\u09B0\u09C1\u09A8" }
+            { command: "seturl", description: "\u09B2\u09BE\u0987\u09AD API \u09A1\u09CB\u09AE\u09C7\u0987\u09A8 \u09B8\u09C7\u099F \u0995\u09B0\u09C1\u09A8" },
+            { command: "setworker", description: "Cloudflare Worker \u09AD\u09BF\u09A1\u09BF\u0993 \u09AA\u09CD\u09B0\u0995\u09CD\u09B8\u09BF \u09B8\u09C7\u099F \u0995\u09B0\u09C1\u09A8" }
           ]
         });
         console.log("[Telegram Admin Bot] Connected & polling for owner commands.");
@@ -10160,9 +10230,11 @@ ${buildClientCardHtml(exact)}`,
     }
   });
   app.get("/api/health", (_req, res) => {
+    const videoProxy = (process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || "").trim();
     res.status(200).json({
       ok: true,
       service: "CinePulse HD",
+      videoProxyActive: Boolean(videoProxy),
       uptimeSeconds: Math.round(process.uptime()),
       timestamp: Date.now()
     });
