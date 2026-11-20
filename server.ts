@@ -1435,6 +1435,10 @@ async function getMovieBoxBearerToken(needHomeSections = false): Promise<string>
               Accept: 'application/json',
               Referer: 'https://movie-box.co/?utm_source=mb_app_inner_btmtip',
               'X-Client-Info': JSON.stringify({ timezone: 'Asia/Dhaka' }),
+              'X-Forwarded-For': '103.106.238.10',
+              'X-Real-IP': '103.106.238.10',
+              'CF-IPCountry': 'BD',
+              'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8,hi;q=0.7',
               'X-Vip-Restrict': '0',
               'X-No-High-Risk-Restrict': '1',
               'X-Request-Lang': 'en',
@@ -1543,22 +1547,57 @@ async function fetchMovieBoxHomePayloadFresh(): Promise<MovieBoxHomePayload> {
 
   const task = (async (): Promise<MovieBoxHomePayload> => {
     try {
-      const [ssrHtml] = await Promise.all([
-        fetch(`${MOVIEBOX_ORIGIN}/`, {
+      const bdHomeHeaders: Record<string, string> = {
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        Accept: 'application/json',
+        Origin: 'https://moviebox.ph',
+        Referer: 'https://moviebox.ph/',
+        'X-Client-Info': JSON.stringify({ timezone: 'Asia/Dhaka' }),
+        'X-Forwarded-For': '103.106.238.10',
+        'X-Real-IP': '103.106.238.10',
+        'CF-IPCountry': 'BD',
+        'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8,hi;q=0.7',
+        'X-Vip-Restrict': '0',
+        'X-No-High-Risk-Restrict': '1',
+        'X-Request-Lang': 'en',
+      };
+
+      const [bdHomeOps] = await Promise.all([
+        Promise.any(
+          [
+            `${MOVIEBOX_FALLBACK_API_ORIGIN}/wefeed-h5api-bff/home`,
+            `${MOVIEBOX_API_ORIGIN}/wefeed-h5api-bff/home`,
+            `https://moviebox.ph/wefeed-h5api-bff/home`,
+          ].map(async (url) => {
+            const r = await fetch(url, { headers: bdHomeHeaders, signal: AbortSignal.timeout(5000) });
+            if (!r.ok) throw new Error('Bad status');
+            const j = (await r.json()) as any;
+            const ops = Array.isArray(j?.data?.operatingList) ? j.data.operatingList : [];
+            if (ops.length === 0) throw new Error('Empty ops');
+            return ops;
+          })
+        ).catch(() => [] as any[]),
+        getMovieBoxBearerToken().catch(() => ''),
+      ]);
+
+      let ssrOps: any[] = bdHomeOps;
+      if (ssrOps.length === 0) {
+        const ssrHtml = await fetch(`${MOVIEBOX_ORIGIN}/`, {
           headers: {
             'User-Agent':
               'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
             Accept: 'text/html,application/xhtml+xml',
             'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8,hi;q=0.7',
+            'X-Forwarded-For': '103.106.238.10',
+            'CF-IPCountry': 'BD',
           },
           signal: AbortSignal.timeout(5500),
         })
           .then((r) => (r.ok ? r.text() : ''))
-          .catch(() => ''),
-        getMovieBoxBearerToken().catch(() => ''),
-      ]);
-
-      const ssrOps = ssrHtml ? extractMovieBoxNuxtOperatingList(ssrHtml) : [];
+          .catch(() => '');
+        ssrOps = ssrHtml ? extractMovieBoxNuxtOperatingList(ssrHtml) : [];
+      }
       const banners: MovieCardItem[] = [];
       const seenBannerIds = new Set<string>();
       const comingSoon: MovieBoxComingSoonItem[] = [];
@@ -2368,6 +2407,10 @@ async function fetchMovieBoxCatalog(
     'User-Agent':
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
     'X-Client-Info': JSON.stringify({ timezone: 'Asia/Dhaka' }),
+    'X-Forwarded-For': '103.106.238.10',
+    'X-Real-IP': '103.106.238.10',
+    'CF-IPCountry': 'BD',
+    'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8,hi;q=0.7',
     'X-Vip-Restrict': '0',
     'X-No-High-Risk-Restrict': '1',
     'X-Request-Lang': 'en',
@@ -6965,6 +7008,9 @@ async function startServer() {
       Accept: 'application/json',
       Referer: `${MOVIEBOX_ORIGIN}/`,
       'X-Client-Info': JSON.stringify({ timezone: 'Asia/Dhaka' }),
+      'X-Forwarded-For': '103.106.238.10',
+      'X-Real-IP': '103.106.238.10',
+      'CF-IPCountry': 'BD',
     };
     const json = await Promise.any(
       [MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
@@ -7012,6 +7058,9 @@ async function startServer() {
       Accept: 'application/json',
       Referer: `${MOVIEBOX_ORIGIN}/`,
       'X-Client-Info': JSON.stringify({ timezone: 'Asia/Dhaka' }),
+      'X-Forwarded-For': '103.106.238.10',
+      'X-Real-IP': '103.106.238.10',
+      'CF-IPCountry': 'BD',
     };
     const json = await Promise.any(
       [MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
@@ -7048,12 +7097,17 @@ async function startServer() {
       'User-Agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
       Accept: 'application/json',
-      Referer: `${MOVIEBOX_ORIGIN}/`,
+      Origin: 'https://moviebox.ph',
+      Referer: 'https://moviebox.ph/',
       'X-Client-Info': JSON.stringify({ timezone: 'Asia/Dhaka' }),
+      'X-Forwarded-For': '103.106.238.10',
+      'X-Real-IP': '103.106.238.10',
+      'CF-IPCountry': 'BD',
+      'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8,hi;q=0.7',
     };
     const json = await Promise.any(
-      [MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
-        const r = await fetch(`${origin}/wefeed-h5api-bff/home?host=movie-box.co`, {
+      [MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN, 'https://moviebox.ph'].map(async (origin) => {
+        const r = await fetch(`${origin}/wefeed-h5api-bff/home`, {
           headers: hdrs,
           signal: AbortSignal.timeout(5000),
         });
@@ -7167,6 +7221,10 @@ async function startServer() {
       'User-Agent':
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
       'X-Client-Info': JSON.stringify({ timezone: 'Asia/Dhaka' }),
+      'X-Forwarded-For': '103.106.238.10',
+      'X-Real-IP': '103.106.238.10',
+      'CF-IPCountry': 'BD',
+      'Accept-Language': 'en-US,en;q=0.9,bn;q=0.8,hi;q=0.7',
       'X-Vip-Restrict': '0',
       'X-No-High-Risk-Restrict': '1',
       'X-Request-Lang': 'en',
