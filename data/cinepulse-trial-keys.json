@@ -38,6 +38,19 @@
       "lastUsedAt": 1795055130362,
       "active": true,
       "createdIp": "synced"
+    },
+    {
+      "key": "cp_tr1_eyJuIjoiX3NlYyIsInAiOiIySCIsImMiOjE3OTUxNjI3MDUwODUsImUiOjE3OTUxNjMwMDUwODUsIm0iOjUwLCJyIjoic2VjMDAwMDAwMSJ9.SdiycQ9UL7H-hcfISOnDV7",
+      "clientName": "_sec",
+      "plan": "2H",
+      "createdAt": 1795162705085,
+      "expiresAt": 1795163005085,
+      "maxRequests": 50,
+      "unlimited": false,
+      "usedRequests": 2,
+      "lastUsedAt": 1795162706053,
+      "active": true,
+      "createdIp": "synced"
     }
   ]
 }

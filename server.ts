@@ -11296,15 +11296,28 @@ async function startServer() {
     `);
   });
 
-  if (process.env.NODE_ENV !== 'production') {
-    const vitePkg = 'vite';
-    const { createServer: createViteServer } = await import(vitePkg);
-    const vite = await createViteServer({
-      server: { middlewareMode: true, hmr: false },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
+  const isProductionOrCpanel =
+    process.env.NODE_ENV === 'production' ||
+    Boolean(process.env.PASSENGER_APP_ENV) ||
+    Boolean(process.env.CPANEL_MODE) ||
+    Boolean(process.env.IN_PASSENGER);
+
+  let viteMounted = false;
+  if (!isProductionOrCpanel) {
+    try {
+      const vitePkg = 'vite';
+      const { createServer: createViteServer } = await import(vitePkg);
+      const vite = await createViteServer({
+        server: { middlewareMode: true, hmr: false },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+      viteMounted = true;
+    } catch {
+      viteMounted = false;
+    }
+  }
+  if (!viteMounted) {
     app.get('*', (req, res) => {
       if (req.path.startsWith('/api/')) {
         res.status(404).json({ ok: false, error: 'Endpoint not found. Use /api/trial/* with an active API key.' });
