@@ -6528,6 +6528,8 @@ async function startServer() {
   const trialKeysMap = new Map<string, StoredTrialKey>();
   const trialCreateIpRate = new Map<string, { count: number; resetAt: number }>();
 
+  let scheduleCloudBackupToTelegram: (immediate?: boolean) => void = () => {};
+
   const flushTrialStoreSync = () => {
     try {
       if (!fs.existsSync(trialDataDir)) {
@@ -6540,6 +6542,7 @@ async function startServer() {
     } catch {
       // ignore write failure on read-only fs
     }
+    scheduleCloudBackupToTelegram(false);
   };
 
   let trialFlushTimer: NodeJS.Timeout | null = null;
@@ -6615,6 +6618,7 @@ async function startServer() {
       };
       trialKeysMap.set(rawKey, recovered);
       flushTrialStoreSync();
+      scheduleCloudBackupToTelegram(true);
       return recovered;
     } catch {
       return undefined;
@@ -8744,6 +8748,7 @@ async function startServer() {
     workerUrl?: string;
     ownerPinHash?: string;
     ownerPinSalt?: string;
+    backupMessageId?: number;
   }
   const loadBotConfig = (): BotConfigState => {
     try {
@@ -8754,7 +8759,7 @@ async function startServer() {
       return {};
     }
   };
-  const saveBotConfig = (cfg: BotConfigState) => {
+  const saveBotConfig = (cfg: BotConfigState, skipCloudSync = false) => {
     try {
       if (!fs.existsSync(trialDataDir)) fs.mkdirSync(trialDataDir, { recursive: true });
       const tmpFile = `${botConfigPath}.tmp`;
@@ -8762,6 +8767,9 @@ async function startServer() {
       fs.renameSync(tmpFile, botConfigPath);
     } catch {
       // ignore write failure on read-only fs
+    }
+    if (!skipCloudSync) {
+      scheduleCloudBackupToTelegram(true);
     }
   };
 
@@ -9786,6 +9794,57 @@ async function startServer() {
         return { handled: true, reason: 'cmd:setworker:ok' };
       }
 
+      if (cmd === 'import' || cmd === 'recover') {
+        const matches = arg.match(/cp_tr1_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g) || [];
+        const uniqueKeys = Array.from(new Set(matches));
+        if (uniqueKeys.length === 0) {
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: '📥 <b>পুরনো ক্লায়েন্ট রিকভার (/import)</b>\n\nপুরনো যেকোনো ক্লায়েন্টের মেসেজ বা <code>cp_tr1_...</code> Key কপি করে এভাবে পাঠান:\n<code>/import cp_tr1_...</code>\n\nঅথবা পুরো পুরনো মেসেজটা সরাসরি এই চ্যাটে পেস্ট/ফরওয়ার্ড করলেই অটোমেটিক রিকভার হয়ে যাবে!',
+            parse_mode: 'HTML',
+          });
+          return { handled: true, reason: 'cmd:import:help' };
+        }
+        const recoveredNames: string[] = [];
+        for (const k of uniqueKeys) {
+          const rec = resolveOrRecoverTrialKey(k);
+          if (rec) {
+            recoveredNames.push(`• <b>${escTgHtml(rec.clientName)}</b> (${escTgHtml(rec.plan)})`);
+          }
+        }
+        if (recoveredNames.length === 0) {
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: '❌ কোনো বৈধ <code>cp_tr1_...</code> Key পাওয়া যায়নি।',
+            parse_mode: 'HTML',
+          });
+          return { handled: true, reason: 'cmd:import:none' };
+        }
+        flushTrialStoreSync();
+        await syncCloudBackupToTelegramNow(true);
+        await dispatch('sendMessage', {
+          chat_id: chatId,
+          text: `✅ <b>${recoveredNames.length} জন ক্লায়েন্ট রিকভার ও ক্লাউডে সেভ হয়েছে!</b>\n\n${recoveredNames.slice(0, 30).join('\n')}\n\nএখন <code>/list</code> লিখে দেখে নিন।`,
+          parse_mode: 'HTML',
+          reply_markup: buildMainMenuKeyboard(),
+        });
+        return { handled: true, reason: 'cmd:import:ok' };
+      }
+
+      if (cmd === 'backup') {
+        const result = await syncCloudBackupToTelegramNow(true);
+        const totalClients = listAllNonRevokedTrials().length;
+        await dispatch('sendMessage', {
+          chat_id: chatId,
+          text: result.ok
+            ? `☁️ <b>Auto Cloud Backup সফল হয়েছে!</b>\n\n👥 মোট ক্লায়েন্ট সেভ: <b>${totalClients} জন</b>\n📌 পিন্ড ব্যাকআপ মেসেজ ID: <code>${result.messageId || botConfigState.backupMessageId || '-'}</code>\n\n✅ এখন Render যতবারই রিস্টার্ট বা নতুন Deploy হোক, সব ডাটা অটোমেটিক ফিরে আসবে। (পিন করা ব্যাকআপ ফাইলটি ডিলিট বা আনপিন করবেন না।)`
+            : `⚠️ Cloud Backup ব্যর্থ: <code>${escTgHtml(result.error || 'Unknown error')}</code>`,
+          parse_mode: 'HTML',
+          reply_markup: buildMainMenuKeyboard(),
+        });
+        return { handled: true, reason: 'cmd:backup' };
+      }
+
       await dispatch('sendMessage', {
         chat_id: chatId,
         text: '❓ অজানা কমান্ড। <code>/menu</code> বা <code>/help</code> লিখে দেখুন।',
@@ -9793,6 +9852,29 @@ async function startServer() {
         reply_markup: buildMainMenuKeyboard(),
       });
       return { handled: true, reason: `cmd:unknown:${cmd}` };
+    }
+
+    // Auto-recover if admin forwards or pastes any message containing old cp_tr1_... keys
+    if (!botPendingState.has(chatId) && /cp_tr1_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/.test(text)) {
+      const uniqueKeys = Array.from(new Set(text.match(/cp_tr1_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g) || []));
+      const recoveredNames: string[] = [];
+      for (const k of uniqueKeys) {
+        const rec = resolveOrRecoverTrialKey(k);
+        if (rec) {
+          recoveredNames.push(`• <b>${escTgHtml(rec.clientName)}</b> (${escTgHtml(rec.plan)})`);
+        }
+      }
+      if (recoveredNames.length > 0) {
+        flushTrialStoreSync();
+        await syncCloudBackupToTelegramNow(true);
+        await dispatch('sendMessage', {
+          chat_id: chatId,
+          text: `✅ <b>অটো-রিকভার সম্পন্ন! (${recoveredNames.length} জন)</b>\n\n${recoveredNames.slice(0, 30).join('\n')}\n\n☁️ ক্লাউড ব্যাকআপেও সেভ হয়ে গেছে। <code>/list</code> লিখে দেখুন।`,
+          parse_mode: 'HTML',
+          reply_markup: buildMainMenuKeyboard(),
+        });
+        return { handled: true, reason: 'auto:import:ok' };
+      }
     }
 
     // 3. Pending interactive text input (from inline button prompts)
@@ -9875,6 +9957,268 @@ async function startServer() {
     }
   });
 
+  // ==========================================================================================
+  // 6a-7. FREE TELEGRAM PINNED CLOUD BACKUP & AUTO-RESTORE (SURVIVES RENDER RESTARTS/REDEPLOYS)
+  // ==========================================================================================
+  let cloudBackupTimer: NodeJS.Timeout | null = null;
+  let cloudBackupInFlight = false;
+  let lastCloudStructuralHash = '';
+  let lastCloudSyncAt = 0;
+  let cloudRestoreCompleted = false;
+
+  const getPrimaryTelegramAdminChatId = (): string => {
+    const ids = Array.from(getAllowedTelegramAdminIds());
+    return ids[0] || '';
+  };
+
+  const buildCloudBackupSnapshot = () => {
+    const keys = Array.from(trialKeysMap.values()).slice(-1000);
+    const config = {
+      publicUrl: botConfigState.publicUrl || undefined,
+      workerUrl: botConfigState.workerUrl || undefined,
+      ownerPinHash: botConfigState.ownerPinHash || undefined,
+      ownerPinSalt: botConfigState.ownerPinSalt || undefined,
+    };
+    const structuralFingerprint = crypto
+      .createHash('sha1')
+      .update(
+        JSON.stringify({
+          config,
+          keys: keys.map((k) => ({
+            key: k.key,
+            clientName: k.clientName,
+            plan: k.plan,
+            expiresAt: k.expiresAt,
+            maxRequests: k.maxRequests,
+            unlimited: Boolean(k.unlimited),
+            active: k.active,
+            revoked: Boolean(k.revoked),
+          })),
+        })
+      )
+      .digest('hex');
+    return {
+      version: 1,
+      updatedAt: Date.now(),
+      config,
+      keys,
+      structuralFingerprint,
+    };
+  };
+
+  const syncCloudBackupToTelegramNow = async (
+    force = false
+  ): Promise<{ ok: boolean; messageId?: number; error?: string }> => {
+    const token = getTelegramBotToken();
+    const adminChatId = getPrimaryTelegramAdminChatId();
+    if (!token || !adminChatId) return { ok: false, error: 'Bot token or admin chat ID missing' };
+    if (cloudBackupInFlight) return { ok: true, messageId: botConfigState.backupMessageId };
+
+    const snap = buildCloudBackupSnapshot();
+    const now = Date.now();
+    const structuralChanged = snap.structuralFingerprint !== lastCloudStructuralHash;
+    if (!force && !structuralChanged && now - lastCloudSyncAt < 3 * 60_000) {
+      return { ok: true, messageId: botConfigState.backupMessageId };
+    }
+    if (!force && snap.keys.length === 0 && !snap.config.publicUrl && !snap.config.workerUrl) {
+      return { ok: true, messageId: botConfigState.backupMessageId };
+    }
+
+    cloudBackupInFlight = true;
+    try {
+      const payloadJson = JSON.stringify(
+        {
+          version: snap.version,
+          updatedAt: snap.updatedAt,
+          config: snap.config,
+          keys: snap.keys,
+        },
+        null,
+        2
+      );
+      const activeCount = snap.keys.filter((k) => !k.revoked).length;
+      const timeStr = new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+      const caption = `☁️ MovieBox Auto Cloud Backup (ডিলিট বা আনপিন করবেন না)\n👥 ক্লায়েন্ট: ${activeCount} জন | 🕒 ${timeStr}`;
+
+      const existingMsgId = botConfigState.backupMessageId;
+      if (existingMsgId) {
+        const fdEdit = new FormData();
+        fdEdit.append('chat_id', adminChatId);
+        fdEdit.append('message_id', String(existingMsgId));
+        fdEdit.append(
+          'media',
+          JSON.stringify({
+            type: 'document',
+            media: 'attach://backup_file',
+            caption,
+          })
+        );
+        fdEdit.append('backup_file', new Blob([payloadJson], { type: 'application/json' }), 'moviebox-clients-backup.json');
+        const editResp = await fetch(`https://api.telegram.org/bot${token}/editMessageMedia`, {
+          method: 'POST',
+          body: fdEdit,
+          signal: AbortSignal.timeout(20_000),
+        });
+        const editJson = (await editResp.json().catch(() => null)) as { ok?: boolean; description?: string } | null;
+        if (editJson?.ok || /message is not modified/i.test(String(editJson?.description || ''))) {
+          lastCloudStructuralHash = snap.structuralFingerprint;
+          lastCloudSyncAt = Date.now();
+          return { ok: true, messageId: existingMsgId };
+        }
+        // If old pinned message was deleted, fall through to create a fresh pinned backup message
+      }
+
+      const fdSend = new FormData();
+      fdSend.append('chat_id', adminChatId);
+      fdSend.append('caption', caption);
+      fdSend.append('disable_notification', 'true');
+      fdSend.append('document', new Blob([payloadJson], { type: 'application/json' }), 'moviebox-clients-backup.json');
+      const sendResp = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+        method: 'POST',
+        body: fdSend,
+        signal: AbortSignal.timeout(20_000),
+      });
+      const sendJson = (await sendResp.json().catch(() => null)) as {
+        ok?: boolean;
+        result?: { message_id?: number };
+        description?: string;
+      } | null;
+      if (!sendJson?.ok || !sendJson.result?.message_id) {
+        return { ok: false, error: sendJson?.description || 'sendDocument failed' };
+      }
+
+      const newMsgId = sendJson.result.message_id;
+      botConfigState.backupMessageId = newMsgId;
+      saveBotConfig(botConfigState, true);
+      await callTelegramBotApi('pinChatMessage', {
+        chat_id: adminChatId,
+        message_id: newMsgId,
+        disable_notification: true,
+      }).catch(() => {});
+
+      lastCloudStructuralHash = snap.structuralFingerprint;
+      lastCloudSyncAt = Date.now();
+      return { ok: true, messageId: newMsgId };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'Cloud backup error' };
+    } finally {
+      cloudBackupInFlight = false;
+    }
+  };
+
+  scheduleCloudBackupToTelegram = (immediate = false) => {
+    if (!cloudRestoreCompleted && !immediate) return;
+    const token = getTelegramBotToken();
+    const adminChatId = getPrimaryTelegramAdminChatId();
+    if (!token || !adminChatId) return;
+    if (cloudBackupTimer) {
+      if (!immediate) return;
+      clearTimeout(cloudBackupTimer);
+      cloudBackupTimer = null;
+    }
+    const snap = buildCloudBackupSnapshot();
+    const structuralChanged = snap.structuralFingerprint !== lastCloudStructuralHash;
+    const delayMs = immediate || structuralChanged ? 2000 : 120_000;
+    cloudBackupTimer = setTimeout(() => {
+      cloudBackupTimer = null;
+      void syncCloudBackupToTelegramNow(false);
+    }, delayMs);
+  };
+
+  const restoreCloudBackupFromTelegram = async (): Promise<number> => {
+    const token = getTelegramBotToken();
+    const adminChatId = getPrimaryTelegramAdminChatId();
+    if (!token || !adminChatId) {
+      cloudRestoreCompleted = true;
+      return 0;
+    }
+    try {
+      const chatRes = await callTelegramBotApi('getChat', { chat_id: adminChatId });
+      const pinned = chatRes?.result?.pinned_message;
+      const doc = pinned?.document;
+      if (!pinned?.message_id || !doc?.file_id) {
+        cloudRestoreCompleted = true;
+        return 0;
+      }
+      const fname = String(doc.file_name || '');
+      if (!/moviebox-clients-backup|\.json$/i.test(fname)) {
+        cloudRestoreCompleted = true;
+        return 0;
+      }
+
+      const fileRes = await callTelegramBotApi('getFile', { file_id: doc.file_id });
+      const filePath = String(fileRes?.result?.file_path || '');
+      if (!filePath) {
+        cloudRestoreCompleted = true;
+        return 0;
+      }
+
+      const dlResp = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`, {
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (!dlResp.ok) {
+        cloudRestoreCompleted = true;
+        return 0;
+      }
+      const parsed = (await dlResp.json().catch(() => null)) as {
+        config?: Partial<BotConfigState>;
+        keys?: StoredTrialKey[];
+      } | null;
+      if (!parsed || typeof parsed !== 'object') {
+        cloudRestoreCompleted = true;
+        return 0;
+      }
+
+      let restoredKeys = 0;
+      if (Array.isArray(parsed.keys)) {
+        for (const item of parsed.keys) {
+          if (item && typeof item.key === 'string') {
+            const existing = trialKeysMap.get(item.key);
+            if (!existing || (item.usedRequests || 0) > (existing.usedRequests || 0) || item.revoked) {
+              trialKeysMap.set(item.key, item);
+              restoredKeys += 1;
+            }
+          }
+        }
+      }
+
+      botConfigState.backupMessageId = pinned.message_id;
+      if (parsed.config && typeof parsed.config === 'object') {
+        if (!botConfigState.publicUrl && parsed.config.publicUrl) {
+          botConfigState.publicUrl = parsed.config.publicUrl;
+        }
+        if (!botConfigState.workerUrl && parsed.config.workerUrl) {
+          botConfigState.workerUrl = parsed.config.workerUrl;
+        }
+        if (!botConfigState.ownerPinHash && parsed.config.ownerPinHash) {
+          botConfigState.ownerPinHash = parsed.config.ownerPinHash;
+          botConfigState.ownerPinSalt = parsed.config.ownerPinSalt;
+        }
+      }
+      saveBotConfig(botConfigState, true);
+      if (restoredKeys > 0) {
+        try {
+          if (!fs.existsSync(trialDataDir)) fs.mkdirSync(trialDataDir, { recursive: true });
+          const keys = Array.from(trialKeysMap.values()).slice(-1000);
+          const tmpFile = `${trialStorePath}.tmp`;
+          fs.writeFileSync(tmpFile, JSON.stringify({ keys }, null, 2), 'utf8');
+          fs.renameSync(tmpFile, trialStorePath);
+        } catch {
+          // ignore local write failure
+        }
+      }
+
+      lastCloudStructuralHash = buildCloudBackupSnapshot().structuralFingerprint;
+      lastCloudSyncAt = Date.now();
+      cloudRestoreCompleted = true;
+      console.log(`[Telegram Cloud Backup] Restored ${restoredKeys} client key(s) from pinned backup #${pinned.message_id}.`);
+      return restoredKeys;
+    } catch {
+      cloudRestoreCompleted = true;
+      return 0;
+    }
+  };
+
   let telegramPollerStarted = false;
   startTelegramBotPoller = () => {
     if (telegramPollerStarted) return;
@@ -9884,6 +10228,7 @@ async function startServer() {
 
     const runLoop = async () => {
       try {
+        await restoreCloudBackupFromTelegram();
         await callTelegramBotApi('deleteWebhook', { drop_pending_updates: false });
         await callTelegramBotApi('setMyCommands', {
           commands: [
@@ -9896,6 +10241,8 @@ async function startServer() {
             { command: 'renew', description: 'মেয়াদ বাড়ান (/renew Name 30)' },
             { command: 'unlimited', description: 'রিকোয়েস্ট আনলিমিটেড করুন' },
             { command: 'delete', description: 'ক্লায়েন্ট Key স্থায়ীভাবে ডিলিট' },
+            { command: 'import', description: 'পুরনো ক্লায়েন্ট Key রিকভার করুন' },
+            { command: 'backup', description: 'ক্লাউড ব্যাকআপ সেভ ও স্ট্যাটাস দেখুন' },
             { command: 'seturl', description: 'লাইভ API ডোমেইন সেট করুন' },
             { command: 'setworker', description: 'Cloudflare Worker ভিডিও প্রক্সি সেট করুন' },
           ],

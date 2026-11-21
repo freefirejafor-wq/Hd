@@ -5979,6 +5979,8 @@ async function startServer() {
   const trialStorePath = path.join(trialDataDir, "cinepulse-trial-keys.json");
   const trialKeysMap = /* @__PURE__ */ new Map();
   const trialCreateIpRate = /* @__PURE__ */ new Map();
+  let scheduleCloudBackupToTelegram = () => {
+  };
   const flushTrialStoreSync = () => {
     try {
       if (!fs.existsSync(trialDataDir)) {
@@ -5990,6 +5992,7 @@ async function startServer() {
       fs.renameSync(tmpFile, trialStorePath);
     } catch {
     }
+    scheduleCloudBackupToTelegram(false);
   };
   let trialFlushTimer = null;
   const scheduleFlushTrialStore = () => {
@@ -6049,6 +6052,7 @@ async function startServer() {
       };
       trialKeysMap.set(rawKey, recovered);
       flushTrialStoreSync();
+      scheduleCloudBackupToTelegram(true);
       return recovered;
     } catch {
       return void 0;
@@ -7944,13 +7948,16 @@ async function startServer() {
       return {};
     }
   };
-  const saveBotConfig = (cfg) => {
+  const saveBotConfig = (cfg, skipCloudSync = false) => {
     try {
       if (!fs.existsSync(trialDataDir)) fs.mkdirSync(trialDataDir, { recursive: true });
       const tmpFile = `${botConfigPath}.tmp`;
       fs.writeFileSync(tmpFile, JSON.stringify(cfg, null, 2), "utf8");
       fs.renameSync(tmpFile, botConfigPath);
     } catch {
+    }
+    if (!skipCloudSync) {
+      scheduleCloudBackupToTelegram(true);
     }
   };
   let botConfigState = loadBotConfig();
@@ -8870,6 +8877,62 @@ ${buildClientCardHtml(exact)}`,
         });
         return { handled: true, reason: "cmd:setworker:ok" };
       }
+      if (cmd === "import" || cmd === "recover") {
+        const matches = arg.match(/cp_tr1_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g) || [];
+        const uniqueKeys = Array.from(new Set(matches));
+        if (uniqueKeys.length === 0) {
+          await dispatch("sendMessage", {
+            chat_id: chatId,
+            text: "\u{1F4E5} <b>\u09AA\u09C1\u09B0\u09A8\u09CB \u0995\u09CD\u09B2\u09BE\u09DF\u09C7\u09A8\u09CD\u099F \u09B0\u09BF\u0995\u09AD\u09BE\u09B0 (/import)</b>\n\n\u09AA\u09C1\u09B0\u09A8\u09CB \u09AF\u09C7\u0995\u09CB\u09A8\u09CB \u0995\u09CD\u09B2\u09BE\u09DF\u09C7\u09A8\u09CD\u099F\u09C7\u09B0 \u09AE\u09C7\u09B8\u09C7\u099C \u09AC\u09BE <code>cp_tr1_...</code> Key \u0995\u09AA\u09BF \u0995\u09B0\u09C7 \u098F\u09AD\u09BE\u09AC\u09C7 \u09AA\u09BE\u09A0\u09BE\u09A8:\n<code>/import cp_tr1_...</code>\n\n\u0985\u09A5\u09AC\u09BE \u09AA\u09C1\u09B0\u09CB \u09AA\u09C1\u09B0\u09A8\u09CB \u09AE\u09C7\u09B8\u09C7\u099C\u099F\u09BE \u09B8\u09B0\u09BE\u09B8\u09B0\u09BF \u098F\u0987 \u099A\u09CD\u09AF\u09BE\u099F\u09C7 \u09AA\u09C7\u09B8\u09CD\u099F/\u09AB\u09B0\u0993\u09DF\u09BE\u09B0\u09CD\u09A1 \u0995\u09B0\u09B2\u09C7\u0987 \u0985\u099F\u09CB\u09AE\u09C7\u099F\u09BF\u0995 \u09B0\u09BF\u0995\u09AD\u09BE\u09B0 \u09B9\u09DF\u09C7 \u09AF\u09BE\u09AC\u09C7!",
+            parse_mode: "HTML"
+          });
+          return { handled: true, reason: "cmd:import:help" };
+        }
+        const recoveredNames = [];
+        for (const k of uniqueKeys) {
+          const rec = resolveOrRecoverTrialKey(k);
+          if (rec) {
+            recoveredNames.push(`\u2022 <b>${escTgHtml(rec.clientName)}</b> (${escTgHtml(rec.plan)})`);
+          }
+        }
+        if (recoveredNames.length === 0) {
+          await dispatch("sendMessage", {
+            chat_id: chatId,
+            text: "\u274C \u0995\u09CB\u09A8\u09CB \u09AC\u09C8\u09A7 <code>cp_tr1_...</code> Key \u09AA\u09BE\u0993\u09DF\u09BE \u09AF\u09BE\u09DF\u09A8\u09BF\u0964",
+            parse_mode: "HTML"
+          });
+          return { handled: true, reason: "cmd:import:none" };
+        }
+        flushTrialStoreSync();
+        await syncCloudBackupToTelegramNow(true);
+        await dispatch("sendMessage", {
+          chat_id: chatId,
+          text: `\u2705 <b>${recoveredNames.length} \u099C\u09A8 \u0995\u09CD\u09B2\u09BE\u09DF\u09C7\u09A8\u09CD\u099F \u09B0\u09BF\u0995\u09AD\u09BE\u09B0 \u0993 \u0995\u09CD\u09B2\u09BE\u0989\u09A1\u09C7 \u09B8\u09C7\u09AD \u09B9\u09DF\u09C7\u099B\u09C7!</b>
+
+${recoveredNames.slice(0, 30).join("\n")}
+
+\u098F\u0996\u09A8 <code>/list</code> \u09B2\u09BF\u0996\u09C7 \u09A6\u09C7\u0996\u09C7 \u09A8\u09BF\u09A8\u0964`,
+          parse_mode: "HTML",
+          reply_markup: buildMainMenuKeyboard()
+        });
+        return { handled: true, reason: "cmd:import:ok" };
+      }
+      if (cmd === "backup") {
+        const result = await syncCloudBackupToTelegramNow(true);
+        const totalClients = listAllNonRevokedTrials().length;
+        await dispatch("sendMessage", {
+          chat_id: chatId,
+          text: result.ok ? `\u2601\uFE0F <b>Auto Cloud Backup \u09B8\u09AB\u09B2 \u09B9\u09DF\u09C7\u099B\u09C7!</b>
+
+\u{1F465} \u09AE\u09CB\u099F \u0995\u09CD\u09B2\u09BE\u09DF\u09C7\u09A8\u09CD\u099F \u09B8\u09C7\u09AD: <b>${totalClients} \u099C\u09A8</b>
+\u{1F4CC} \u09AA\u09BF\u09A8\u09CD\u09A1 \u09AC\u09CD\u09AF\u09BE\u0995\u0986\u09AA \u09AE\u09C7\u09B8\u09C7\u099C ID: <code>${result.messageId || botConfigState.backupMessageId || "-"}</code>
+
+\u2705 \u098F\u0996\u09A8 Render \u09AF\u09A4\u09AC\u09BE\u09B0\u0987 \u09B0\u09BF\u09B8\u09CD\u099F\u09BE\u09B0\u09CD\u099F \u09AC\u09BE \u09A8\u09A4\u09C1\u09A8 Deploy \u09B9\u09CB\u0995, \u09B8\u09AC \u09A1\u09BE\u099F\u09BE \u0985\u099F\u09CB\u09AE\u09C7\u099F\u09BF\u0995 \u09AB\u09BF\u09B0\u09C7 \u0986\u09B8\u09AC\u09C7\u0964 (\u09AA\u09BF\u09A8 \u0995\u09B0\u09BE \u09AC\u09CD\u09AF\u09BE\u0995\u0986\u09AA \u09AB\u09BE\u0987\u09B2\u099F\u09BF \u09A1\u09BF\u09B2\u09BF\u099F \u09AC\u09BE \u0986\u09A8\u09AA\u09BF\u09A8 \u0995\u09B0\u09AC\u09C7\u09A8 \u09A8\u09BE\u0964)` : `\u26A0\uFE0F Cloud Backup \u09AC\u09CD\u09AF\u09B0\u09CD\u09A5: <code>${escTgHtml(result.error || "Unknown error")}</code>`,
+          parse_mode: "HTML",
+          reply_markup: buildMainMenuKeyboard()
+        });
+        return { handled: true, reason: "cmd:backup" };
+      }
       await dispatch("sendMessage", {
         chat_id: chatId,
         text: "\u2753 \u0985\u099C\u09BE\u09A8\u09BE \u0995\u09AE\u09BE\u09A8\u09CD\u09A1\u0964 <code>/menu</code> \u09AC\u09BE <code>/help</code> \u09B2\u09BF\u0996\u09C7 \u09A6\u09C7\u0996\u09C1\u09A8\u0964",
@@ -8877,6 +8940,31 @@ ${buildClientCardHtml(exact)}`,
         reply_markup: buildMainMenuKeyboard()
       });
       return { handled: true, reason: `cmd:unknown:${cmd}` };
+    }
+    if (!botPendingState.has(chatId) && /cp_tr1_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/.test(text)) {
+      const uniqueKeys = Array.from(new Set(text.match(/cp_tr1_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g) || []));
+      const recoveredNames = [];
+      for (const k of uniqueKeys) {
+        const rec = resolveOrRecoverTrialKey(k);
+        if (rec) {
+          recoveredNames.push(`\u2022 <b>${escTgHtml(rec.clientName)}</b> (${escTgHtml(rec.plan)})`);
+        }
+      }
+      if (recoveredNames.length > 0) {
+        flushTrialStoreSync();
+        await syncCloudBackupToTelegramNow(true);
+        await dispatch("sendMessage", {
+          chat_id: chatId,
+          text: `\u2705 <b>\u0985\u099F\u09CB-\u09B0\u09BF\u0995\u09AD\u09BE\u09B0 \u09B8\u09AE\u09CD\u09AA\u09A8\u09CD\u09A8! (${recoveredNames.length} \u099C\u09A8)</b>
+
+${recoveredNames.slice(0, 30).join("\n")}
+
+\u2601\uFE0F \u0995\u09CD\u09B2\u09BE\u0989\u09A1 \u09AC\u09CD\u09AF\u09BE\u0995\u0986\u09AA\u09C7\u0993 \u09B8\u09C7\u09AD \u09B9\u09DF\u09C7 \u0997\u09C7\u099B\u09C7\u0964 <code>/list</code> \u09B2\u09BF\u0996\u09C7 \u09A6\u09C7\u0996\u09C1\u09A8\u0964`,
+          parse_mode: "HTML",
+          reply_markup: buildMainMenuKeyboard()
+        });
+        return { handled: true, reason: "auto:import:ok" };
+      }
     }
     const pending = botPendingState.get(chatId);
     if (pending && Date.now() - pending.updatedAt < 10 * 6e4) {
@@ -8947,6 +9035,236 @@ ${buildClientCardHtml(exact)}`,
       res.status(500).json({ ok: false, error: err?.message || "Telegram webhook failed" });
     }
   });
+  let cloudBackupTimer = null;
+  let cloudBackupInFlight = false;
+  let lastCloudStructuralHash = "";
+  let lastCloudSyncAt = 0;
+  let cloudRestoreCompleted = false;
+  const getPrimaryTelegramAdminChatId = () => {
+    const ids = Array.from(getAllowedTelegramAdminIds());
+    return ids[0] || "";
+  };
+  const buildCloudBackupSnapshot = () => {
+    const keys = Array.from(trialKeysMap.values()).slice(-1e3);
+    const config = {
+      publicUrl: botConfigState.publicUrl || void 0,
+      workerUrl: botConfigState.workerUrl || void 0,
+      ownerPinHash: botConfigState.ownerPinHash || void 0,
+      ownerPinSalt: botConfigState.ownerPinSalt || void 0
+    };
+    const structuralFingerprint = crypto.createHash("sha1").update(
+      JSON.stringify({
+        config,
+        keys: keys.map((k) => ({
+          key: k.key,
+          clientName: k.clientName,
+          plan: k.plan,
+          expiresAt: k.expiresAt,
+          maxRequests: k.maxRequests,
+          unlimited: Boolean(k.unlimited),
+          active: k.active,
+          revoked: Boolean(k.revoked)
+        }))
+      })
+    ).digest("hex");
+    return {
+      version: 1,
+      updatedAt: Date.now(),
+      config,
+      keys,
+      structuralFingerprint
+    };
+  };
+  const syncCloudBackupToTelegramNow = async (force = false) => {
+    const token = getTelegramBotToken();
+    const adminChatId = getPrimaryTelegramAdminChatId();
+    if (!token || !adminChatId) return { ok: false, error: "Bot token or admin chat ID missing" };
+    if (cloudBackupInFlight) return { ok: true, messageId: botConfigState.backupMessageId };
+    const snap = buildCloudBackupSnapshot();
+    const now = Date.now();
+    const structuralChanged = snap.structuralFingerprint !== lastCloudStructuralHash;
+    if (!force && !structuralChanged && now - lastCloudSyncAt < 3 * 6e4) {
+      return { ok: true, messageId: botConfigState.backupMessageId };
+    }
+    if (!force && snap.keys.length === 0 && !snap.config.publicUrl && !snap.config.workerUrl) {
+      return { ok: true, messageId: botConfigState.backupMessageId };
+    }
+    cloudBackupInFlight = true;
+    try {
+      const payloadJson = JSON.stringify(
+        {
+          version: snap.version,
+          updatedAt: snap.updatedAt,
+          config: snap.config,
+          keys: snap.keys
+        },
+        null,
+        2
+      );
+      const activeCount = snap.keys.filter((k) => !k.revoked).length;
+      const timeStr = (/* @__PURE__ */ new Date()).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+      const caption = `\u2601\uFE0F MovieBox Auto Cloud Backup (\u09A1\u09BF\u09B2\u09BF\u099F \u09AC\u09BE \u0986\u09A8\u09AA\u09BF\u09A8 \u0995\u09B0\u09AC\u09C7\u09A8 \u09A8\u09BE)
+\u{1F465} \u0995\u09CD\u09B2\u09BE\u09DF\u09C7\u09A8\u09CD\u099F: ${activeCount} \u099C\u09A8 | \u{1F552} ${timeStr}`;
+      const existingMsgId = botConfigState.backupMessageId;
+      if (existingMsgId) {
+        const fdEdit = new FormData();
+        fdEdit.append("chat_id", adminChatId);
+        fdEdit.append("message_id", String(existingMsgId));
+        fdEdit.append(
+          "media",
+          JSON.stringify({
+            type: "document",
+            media: "attach://backup_file",
+            caption
+          })
+        );
+        fdEdit.append("backup_file", new Blob([payloadJson], { type: "application/json" }), "moviebox-clients-backup.json");
+        const editResp = await fetch(`https://api.telegram.org/bot${token}/editMessageMedia`, {
+          method: "POST",
+          body: fdEdit,
+          signal: AbortSignal.timeout(2e4)
+        });
+        const editJson = await editResp.json().catch(() => null);
+        if (editJson?.ok || /message is not modified/i.test(String(editJson?.description || ""))) {
+          lastCloudStructuralHash = snap.structuralFingerprint;
+          lastCloudSyncAt = Date.now();
+          return { ok: true, messageId: existingMsgId };
+        }
+      }
+      const fdSend = new FormData();
+      fdSend.append("chat_id", adminChatId);
+      fdSend.append("caption", caption);
+      fdSend.append("disable_notification", "true");
+      fdSend.append("document", new Blob([payloadJson], { type: "application/json" }), "moviebox-clients-backup.json");
+      const sendResp = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+        method: "POST",
+        body: fdSend,
+        signal: AbortSignal.timeout(2e4)
+      });
+      const sendJson = await sendResp.json().catch(() => null);
+      if (!sendJson?.ok || !sendJson.result?.message_id) {
+        return { ok: false, error: sendJson?.description || "sendDocument failed" };
+      }
+      const newMsgId = sendJson.result.message_id;
+      botConfigState.backupMessageId = newMsgId;
+      saveBotConfig(botConfigState, true);
+      await callTelegramBotApi("pinChatMessage", {
+        chat_id: adminChatId,
+        message_id: newMsgId,
+        disable_notification: true
+      }).catch(() => {
+      });
+      lastCloudStructuralHash = snap.structuralFingerprint;
+      lastCloudSyncAt = Date.now();
+      return { ok: true, messageId: newMsgId };
+    } catch (err) {
+      return { ok: false, error: err?.message || "Cloud backup error" };
+    } finally {
+      cloudBackupInFlight = false;
+    }
+  };
+  scheduleCloudBackupToTelegram = (immediate = false) => {
+    if (!cloudRestoreCompleted && !immediate) return;
+    const token = getTelegramBotToken();
+    const adminChatId = getPrimaryTelegramAdminChatId();
+    if (!token || !adminChatId) return;
+    if (cloudBackupTimer) {
+      if (!immediate) return;
+      clearTimeout(cloudBackupTimer);
+      cloudBackupTimer = null;
+    }
+    const snap = buildCloudBackupSnapshot();
+    const structuralChanged = snap.structuralFingerprint !== lastCloudStructuralHash;
+    const delayMs = immediate || structuralChanged ? 2e3 : 12e4;
+    cloudBackupTimer = setTimeout(() => {
+      cloudBackupTimer = null;
+      void syncCloudBackupToTelegramNow(false);
+    }, delayMs);
+  };
+  const restoreCloudBackupFromTelegram = async () => {
+    const token = getTelegramBotToken();
+    const adminChatId = getPrimaryTelegramAdminChatId();
+    if (!token || !adminChatId) {
+      cloudRestoreCompleted = true;
+      return 0;
+    }
+    try {
+      const chatRes = await callTelegramBotApi("getChat", { chat_id: adminChatId });
+      const pinned = chatRes?.result?.pinned_message;
+      const doc = pinned?.document;
+      if (!pinned?.message_id || !doc?.file_id) {
+        cloudRestoreCompleted = true;
+        return 0;
+      }
+      const fname = String(doc.file_name || "");
+      if (!/moviebox-clients-backup|\.json$/i.test(fname)) {
+        cloudRestoreCompleted = true;
+        return 0;
+      }
+      const fileRes = await callTelegramBotApi("getFile", { file_id: doc.file_id });
+      const filePath = String(fileRes?.result?.file_path || "");
+      if (!filePath) {
+        cloudRestoreCompleted = true;
+        return 0;
+      }
+      const dlResp = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`, {
+        signal: AbortSignal.timeout(2e4)
+      });
+      if (!dlResp.ok) {
+        cloudRestoreCompleted = true;
+        return 0;
+      }
+      const parsed = await dlResp.json().catch(() => null);
+      if (!parsed || typeof parsed !== "object") {
+        cloudRestoreCompleted = true;
+        return 0;
+      }
+      let restoredKeys = 0;
+      if (Array.isArray(parsed.keys)) {
+        for (const item of parsed.keys) {
+          if (item && typeof item.key === "string") {
+            const existing = trialKeysMap.get(item.key);
+            if (!existing || (item.usedRequests || 0) > (existing.usedRequests || 0) || item.revoked) {
+              trialKeysMap.set(item.key, item);
+              restoredKeys += 1;
+            }
+          }
+        }
+      }
+      botConfigState.backupMessageId = pinned.message_id;
+      if (parsed.config && typeof parsed.config === "object") {
+        if (!botConfigState.publicUrl && parsed.config.publicUrl) {
+          botConfigState.publicUrl = parsed.config.publicUrl;
+        }
+        if (!botConfigState.workerUrl && parsed.config.workerUrl) {
+          botConfigState.workerUrl = parsed.config.workerUrl;
+        }
+        if (!botConfigState.ownerPinHash && parsed.config.ownerPinHash) {
+          botConfigState.ownerPinHash = parsed.config.ownerPinHash;
+          botConfigState.ownerPinSalt = parsed.config.ownerPinSalt;
+        }
+      }
+      saveBotConfig(botConfigState, true);
+      if (restoredKeys > 0) {
+        try {
+          if (!fs.existsSync(trialDataDir)) fs.mkdirSync(trialDataDir, { recursive: true });
+          const keys = Array.from(trialKeysMap.values()).slice(-1e3);
+          const tmpFile = `${trialStorePath}.tmp`;
+          fs.writeFileSync(tmpFile, JSON.stringify({ keys }, null, 2), "utf8");
+          fs.renameSync(tmpFile, trialStorePath);
+        } catch {
+        }
+      }
+      lastCloudStructuralHash = buildCloudBackupSnapshot().structuralFingerprint;
+      lastCloudSyncAt = Date.now();
+      cloudRestoreCompleted = true;
+      console.log(`[Telegram Cloud Backup] Restored ${restoredKeys} client key(s) from pinned backup #${pinned.message_id}.`);
+      return restoredKeys;
+    } catch {
+      cloudRestoreCompleted = true;
+      return 0;
+    }
+  };
   let telegramPollerStarted = false;
   startTelegramBotPoller = () => {
     if (telegramPollerStarted) return;
@@ -8955,6 +9273,7 @@ ${buildClientCardHtml(exact)}`,
     telegramPollerStarted = true;
     const runLoop = async () => {
       try {
+        await restoreCloudBackupFromTelegram();
         await callTelegramBotApi("deleteWebhook", { drop_pending_updates: false });
         await callTelegramBotApi("setMyCommands", {
           commands: [
@@ -8967,6 +9286,8 @@ ${buildClientCardHtml(exact)}`,
             { command: "renew", description: "\u09AE\u09C7\u09DF\u09BE\u09A6 \u09AC\u09BE\u09DC\u09BE\u09A8 (/renew Name 30)" },
             { command: "unlimited", description: "\u09B0\u09BF\u0995\u09CB\u09DF\u09C7\u09B8\u09CD\u099F \u0986\u09A8\u09B2\u09BF\u09AE\u09BF\u099F\u09C7\u09A1 \u0995\u09B0\u09C1\u09A8" },
             { command: "delete", description: "\u0995\u09CD\u09B2\u09BE\u09DF\u09C7\u09A8\u09CD\u099F Key \u09B8\u09CD\u09A5\u09BE\u09DF\u09C0\u09AD\u09BE\u09AC\u09C7 \u09A1\u09BF\u09B2\u09BF\u099F" },
+            { command: "import", description: "\u09AA\u09C1\u09B0\u09A8\u09CB \u0995\u09CD\u09B2\u09BE\u09DF\u09C7\u09A8\u09CD\u099F Key \u09B0\u09BF\u0995\u09AD\u09BE\u09B0 \u0995\u09B0\u09C1\u09A8" },
+            { command: "backup", description: "\u0995\u09CD\u09B2\u09BE\u0989\u09A1 \u09AC\u09CD\u09AF\u09BE\u0995\u0986\u09AA \u09B8\u09C7\u09AD \u0993 \u09B8\u09CD\u099F\u09CD\u09AF\u09BE\u099F\u09BE\u09B8 \u09A6\u09C7\u0996\u09C1\u09A8" },
             { command: "seturl", description: "\u09B2\u09BE\u0987\u09AD API \u09A1\u09CB\u09AE\u09C7\u0987\u09A8 \u09B8\u09C7\u099F \u0995\u09B0\u09C1\u09A8" },
             { command: "setworker", description: "Cloudflare Worker \u09AD\u09BF\u09A1\u09BF\u0993 \u09AA\u09CD\u09B0\u0995\u09CD\u09B8\u09BF \u09B8\u09C7\u099F \u0995\u09B0\u09C1\u09A8" }
           ]
