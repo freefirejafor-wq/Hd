@@ -4308,22 +4308,26 @@ async function startServer() {
       res.setHeader("X-Frame-Options", "SAMEORIGIN");
     }
     const trialTkEarly = typeof req.query.tk === "string" ? String(req.query.tk).trim() : "";
-    const isCommercialApiOrTrialStream = req.path.startsWith("/api/trial") || (req.path.startsWith("/api/mb-stream") || req.path.startsWith("/api/mb-subtitle-srt")) && Boolean(trialTkEarly && isActiveTrialStreamToken(trialTkEarly));
+    const isMediaProxyPath = req.path.startsWith("/api/mb-stream") || req.path.startsWith("/api/mb-ep-stream") || req.path.startsWith("/api/mb-subtitle-srt");
+    const isCommercialApiOrTrialStream = req.path.startsWith("/api/trial") || isMediaProxyPath && Boolean(trialTkEarly && isActiveTrialStreamToken(trialTkEarly));
     const origin = String(req.headers.origin || "");
     if (isCommercialApiOrTrialStream) {
       res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+      res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, PATCH, DELETE, OPTIONS");
       res.setHeader(
         "Access-Control-Allow-Headers",
         "Content-Type, Accept, Range, X-API-Key, Authorization, X-Trial-Manage-Token, X-Trial-Admin"
       );
       res.setHeader(
         "Access-Control-Expose-Headers",
-        "Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Trial-Plan, X-RateLimit-Limit, X-RateLimit-Remaining, X-Trial-Expires-At"
+        "Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition, X-Trial-Plan, X-RateLimit-Limit, X-RateLimit-Remaining, X-Trial-Expires-At"
       );
+      if (isMediaProxyPath) {
+        res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+      }
     } else if (origin && (origin.includes("localhost") || origin.includes("127.0.0.1") || origin.includes(".run.app"))) {
       res.setHeader("Access-Control-Allow-Origin", origin);
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+      res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, PATCH, DELETE, OPTIONS");
       res.setHeader("Access-Control-Allow-Headers", "Content-Type, Range, X-API-Key, Authorization");
     }
     if (req.method === "OPTIONS") {
@@ -4339,7 +4343,7 @@ async function startServer() {
       return;
     }
     if (req.path.startsWith("/api/") && req.path !== "/api/health" && !req.path.startsWith("/api/trial") && !req.path.startsWith("/api/owner")) {
-      const isStreamOrSubRoute = req.path === "/api/mb-stream" || req.path === "/api/mb-stream.mp4" || req.path === "/api/mb-subtitle-srt";
+      const isStreamOrSubRoute = req.path === "/api/mb-stream" || req.path === "/api/mb-stream.mp4" || req.path === "/api/mb-ep-stream" || req.path === "/api/mb-ep-stream.mp4" || req.path === "/api/mb-subtitle-srt";
       if (!isStreamOrSubRoute) {
         res.status(401).json({
           ok: false,
@@ -4838,7 +4842,8 @@ async function startServer() {
         requestedEnd = m[2] ? parseInt(m[2], 10) : NaN;
       }
     }
-    if (!isDownload && req.method !== "HEAD") {
+    const hasClientRange = Boolean(req.headers.range);
+    if (hasClientRange && !isDownload && req.method !== "HEAD") {
       const ramHit = mbStartupChunkCache.get(targetUrl);
       if (ramHit && ramHit.expiresAt > Date.now() && ramHit.buf.length > 32768) {
         if (!Number.isNaN(requestedEnd) && requestedStart < ramHit.buf.length && requestedEnd < ramHit.buf.length && requestedEnd >= requestedStart) {
@@ -4847,6 +4852,7 @@ async function startServer() {
           res.setHeader("Content-Type", ramHit.contentType || "video/mp4");
           res.setHeader("Accept-Ranges", "bytes");
           res.setHeader("Cache-Control", "public, max-age=3600");
+          res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
           res.setHeader("X-Cache", "VIRTUAL-CHUNK-RAM-HIT");
           res.setHeader("Content-Length", String(chunk.length));
           res.setHeader(
@@ -4862,6 +4868,7 @@ async function startServer() {
           res.setHeader("Content-Type", ramHit.contentType || "video/mp4");
           res.setHeader("Accept-Ranges", "bytes");
           res.setHeader("Cache-Control", "public, max-age=3600");
+          res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
           res.setHeader("X-Cache", "VIRTUAL-CHUNK-RAM-HIT");
           res.setHeader("Content-Length", String(chunk.length));
           res.setHeader(
@@ -4881,12 +4888,10 @@ async function startServer() {
       "Accept-Language": "en-US,en;q=0.9"
     };
     const chunkCap = requestedStart === 0 ? INITIAL_BURST_CHUNK_BYTES : PLAYBACK_MICRO_CHUNK_BYTES;
-    if (req.headers.range && !isDownload) {
+    if (hasClientRange && !isDownload) {
       const cappedEnd = !Number.isNaN(requestedEnd) && requestedEnd >= requestedStart ? Math.min(requestedEnd, requestedStart + chunkCap - 1) : requestedStart + chunkCap - 1;
       forwardHeaders.Range = `bytes=${requestedStart}-${cappedEnd}`;
-    } else if (!req.headers.range && !isDownload && req.method !== "HEAD") {
-      forwardHeaders.Range = `bytes=0-${chunkCap - 1}`;
-    } else if (req.headers.range) {
+    } else if (hasClientRange) {
       forwardHeaders.Range = String(req.headers.range);
     }
     try {
@@ -5298,7 +5303,9 @@ async function startServer() {
         }
       } catch {
       }
-      res.redirect(302, streamRouteUrl);
+      const reqTk = typeof req.query.tk === "string" ? String(req.query.tk).trim() : "";
+      const redirectUrl = reqTk && !streamRouteUrl.includes("tk=") ? `${streamRouteUrl}${streamRouteUrl.includes("?") ? "&" : "?"}tk=${encodeURIComponent(reqTk)}` : streamRouteUrl;
+      res.redirect(302, redirectUrl);
     } catch {
       if (fallbackUrl) {
         await handleMovieBoxVirtualChunkStream(
@@ -5586,9 +5593,15 @@ async function startServer() {
   });
   const demoApiRateMap = /* @__PURE__ */ new Map();
   const getPublicOrigin = (req) => {
-    const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim();
-    const host = String(req.headers["x-forwarded-host"] || req.get("host") || "localhost:3000").split(",")[0].trim();
-    return `${proto}://${host}`;
+    const rawHost = String(req.headers["x-forwarded-host"] || req.get("host") || "localhost:3000").split(",")[0].trim();
+    const fwdProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim().toLowerCase();
+    const cfVisitor = String(req.headers["cf-visitor"] || "").toLowerCase();
+    const isKnownHttpsHost = /\.(run\.app|onrender\.com|railway\.app|vercel\.app|workers\.dev)$/i.test(rawHost);
+    let proto = fwdProto || (cfVisitor.includes("https") ? "https" : req.protocol || "https");
+    if (proto === "http" && isKnownHttpsHost) {
+      proto = "https";
+    }
+    return `${proto}://${rawHost}`;
   };
   const sendPrettyDemoJson = (res, status, payload) => {
     res.status(status);
@@ -6095,14 +6108,80 @@ async function startServer() {
   let startTelegramBotPoller = () => {
   };
   const DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL = "https://mb-stream.rahamanabduar2.workers.dev";
-  let resolveStreamProxyOrigin = (fallbackBase) => {
+  const workerHealthMap = /* @__PURE__ */ new Map();
+  const workerHealthInFlight = /* @__PURE__ */ new Map();
+  const probeCloudflareWorkerHealth = (workerUrl, force = false) => {
+    const clean = String(workerUrl || "").trim().replace(/\/+$/, "");
+    if (!clean || !/^https?:\/\//i.test(clean)) {
+      return Promise.resolve({ healthy: false, version: 0, checkedAt: Date.now(), reason: "disabled" });
+    }
+    const existing = workerHealthMap.get(clean);
+    if (!force && existing && Date.now() - existing.checkedAt < 6e4) {
+      return Promise.resolve(existing);
+    }
+    const inflight = workerHealthInFlight.get(clean);
+    if (inflight) return inflight;
+    const job = (async () => {
+      try {
+        const res = await fetch(`${clean}/health`, { signal: AbortSignal.timeout(2500) });
+        if (!res.ok) {
+          const entry2 = {
+            healthy: false,
+            version: 0,
+            checkedAt: Date.now(),
+            reason: `http-${res.status}`
+          };
+          workerHealthMap.set(clean, entry2);
+          return entry2;
+        }
+        const json = await res.json().catch(() => null);
+        const ver = Number(json?.version || 1);
+        const okV2 = Boolean(json?.ok && ver >= 2);
+        const entry = {
+          healthy: okV2,
+          version: ver,
+          checkedAt: Date.now(),
+          reason: okV2 ? "active-v2" : "outdated-v1-fallback-server"
+        };
+        workerHealthMap.set(clean, entry);
+        return entry;
+      } catch {
+        const entry = {
+          healthy: false,
+          version: 0,
+          checkedAt: Date.now(),
+          reason: "unreachable-fallback-server"
+        };
+        workerHealthMap.set(clean, entry);
+        return entry;
+      } finally {
+        workerHealthInFlight.delete(clean);
+      }
+    })();
+    workerHealthInFlight.set(clean, job);
+    return job;
+  };
+  let getConfiguredWorkerUrl = () => {
     const envWorker = String(
       process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || process.env.CF_WORKER_STREAM_URL || ""
     ).trim().replace(/\/+$/, "");
-    if (/^(off|none|disable|false)$/i.test(envWorker)) return fallbackBase;
+    if (/^(off|none|disable|false)$/i.test(envWorker)) return "";
     if (envWorker && /^https?:\/\//i.test(envWorker)) return envWorker;
-    return DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL || fallbackBase;
+    return DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL;
   };
+  let resolveStreamProxyOrigin = (fallbackBase) => {
+    const candidate = getConfiguredWorkerUrl();
+    if (!candidate) return fallbackBase;
+    const health = workerHealthMap.get(candidate);
+    if (!health || Date.now() - health.checkedAt >= 6e4) {
+      void probeCloudflareWorkerHealth(candidate, false);
+    }
+    if (health && health.healthy) {
+      return candidate;
+    }
+    return fallbackBase;
+  };
+  void probeCloudflareWorkerHealth(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL, true);
   const loadTrialKeysStore = () => {
     try {
       if (!fs.existsSync(trialStorePath)) return;
@@ -6796,8 +6875,10 @@ async function startServer() {
     const toTrialUrl = (u) => {
       if (!u || !u.startsWith("/")) return u;
       const sep = u.includes("?") ? "&" : "?";
-      const needsTk = u.startsWith("/api/mb-stream") || u.startsWith("/api/mb-subtitle-srt");
-      const hostBase = needsTk ? streamBase : base;
+      const isWorkerEligible = u.startsWith("/api/mb-stream") || u.startsWith("/api/mb-subtitle-srt");
+      const isServerEpStream = u.startsWith("/api/mb-ep-stream");
+      const needsTk = isWorkerEligible || isServerEpStream;
+      const hostBase = isWorkerEligible ? streamBase : base;
       return `${hostBase}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ""}`;
     };
     try {
@@ -7409,8 +7490,10 @@ async function startServer() {
       const toAbsoluteWithTrialTk = (u) => {
         if (!u.startsWith("/")) return u;
         const sep = u.includes("?") ? "&" : "?";
-        const needsTk = u.startsWith("/api/mb-stream") || u.startsWith("/api/mb-subtitle-srt");
-        const hostBase = needsTk ? streamBase : base;
+        const isWorkerEligible = u.startsWith("/api/mb-stream") || u.startsWith("/api/mb-subtitle-srt");
+        const isServerEpStream = u.startsWith("/api/mb-ep-stream");
+        const needsTk = isWorkerEligible || isServerEpStream;
+        const hostBase = isWorkerEligible ? streamBase : base;
         return `${hostBase}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ""}`;
       };
       const embedPlayerUrl = `${base}/trial-embed?apiKey=${encodeURIComponent(rec.key)}&subjectId=${encodeURIComponent(
@@ -7986,17 +8069,33 @@ async function startServer() {
   };
   let botConfigState = loadBotConfig();
   let capturedPublicBaseUrl = "";
-  resolveStreamProxyOrigin = (fallbackBase) => {
+  getConfiguredWorkerUrl = () => {
     const envWorker = String(
       process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || process.env.CF_WORKER_STREAM_URL || ""
     ).trim().replace(/\/+$/, "");
-    if (/^(off|none|disable|false)$/i.test(envWorker)) return fallbackBase;
+    if (/^(off|none|disable|false)$/i.test(envWorker)) return "";
     if (envWorker && /^https?:\/\//i.test(envWorker)) return envWorker;
     const savedWorker = String(botConfigState.workerUrl || "").trim().replace(/\/+$/, "");
-    if (/^(off|none|disable|false)$/i.test(savedWorker)) return fallbackBase;
+    if (/^(off|none|disable|false)$/i.test(savedWorker)) return "";
     if (savedWorker && /^https?:\/\//i.test(savedWorker)) return savedWorker;
-    return DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL || fallbackBase;
+    return DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL;
   };
+  resolveStreamProxyOrigin = (fallbackBase) => {
+    const candidate = getConfiguredWorkerUrl();
+    if (!candidate) return fallbackBase;
+    const health = workerHealthMap.get(candidate);
+    if (!health || Date.now() - health.checkedAt >= 6e4) {
+      void probeCloudflareWorkerHealth(candidate, false);
+    }
+    if (health && health.healthy) {
+      return candidate;
+    }
+    return fallbackBase;
+  };
+  const initialConfiguredWorker = getConfiguredWorkerUrl();
+  if (initialConfiguredWorker) {
+    void probeCloudflareWorkerHealth(initialConfiguredWorker, true);
+  }
   capturePublicOriginForBot = (req) => {
     const rawOrigin = getPublicOrigin(req).replace(/\/+$/, "");
     if (!rawOrigin) return;
@@ -8845,13 +8944,14 @@ ${buildClientCardHtml(exact)}`,
       if (cmd === "setworker") {
         const cleanUrl = arg.trim().replace(/\/+$/, "");
         if (!cleanUrl) {
-          const cur = resolveStreamProxyOrigin("");
+          const configured = getConfiguredWorkerUrl();
+          const health2 = configured ? await probeCloudflareWorkerHealth(configured, true) : null;
+          const active = resolveStreamProxyOrigin("");
+          const statusLine = !configured ? "OFF (Direct Server Proxy \u099A\u09BE\u09B2\u09C1)" : health2?.healthy ? `\u{1F7E2} ACTIVE (v${health2.version}) \u2014 <code>${escTgHtml(active)}</code>` : `\u26A0\uFE0F Worker v1 \u09AA\u09C1\u09B0\u09A8\u09CB/\u0985\u0995\u09BE\u09B0\u09CD\u09AF\u0995\u09B0 (<code>${escTgHtml(configured)}</code>) \u2014 \u0985\u099F\u09CB-\u09AB\u09B2\u09AC\u09CD\u09AF\u09BE\u0995 Direct Server Proxy \u099A\u09BE\u09B2\u09C1 \u0986\u099B\u09C7! Worker \u0995\u09CB\u09A1 v2 \u0986\u09AA\u09A1\u09C7\u099F \u0995\u09B0\u09B2\u09C7 \u0985\u099F\u09CB \u099A\u09BE\u09B2\u09C1 \u09B9\u09AC\u09C7\u0964`;
           await dispatch("sendMessage", {
             chat_id: chatId,
             text: `\u26A1 <b>Cloudflare Worker Video Proxy</b>
-\u09AC\u09B0\u09CD\u09A4\u09AE\u09BE\u09A8 Worker: <code>${escTgHtml(
-              cur || "OFF (Direct Server)"
-            )}</code>
+\u09B8\u09CD\u099F\u09CD\u09AF\u09BE\u099F\u09BE\u09B8: ${statusLine}
 
 \u099A\u09BE\u09B2\u09C1 \u0995\u09B0\u09A4\u09C7 \u09B2\u09BF\u0996\u09C1\u09A8:
 <code>/setworker https://your-worker.workers.dev</code>
@@ -8874,10 +8974,11 @@ ${buildClientCardHtml(exact)}`,
         if (/^(reset|default)$/i.test(cleanUrl)) {
           delete botConfigState.workerUrl;
           saveBotConfig(botConfigState);
+          const health2 = await probeCloudflareWorkerHealth(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL, true);
           await dispatch("sendMessage", {
             chat_id: chatId,
-            text: `\u2705 \u09A1\u09BF\u09AB\u09B2\u09CD\u099F Cloudflare Worker \u099A\u09BE\u09B2\u09C1 \u0995\u09B0\u09BE \u09B9\u09DF\u09C7\u099B\u09C7:
-<code>${escTgHtml(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL)}</code>`,
+            text: health2.healthy ? `\u2705 \u09A1\u09BF\u09AB\u09B2\u09CD\u099F Cloudflare Worker (v${health2.version}) \u099A\u09BE\u09B2\u09C1 \u0995\u09B0\u09BE \u09B9\u09DF\u09C7\u099B\u09C7:
+<code>${escTgHtml(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL)}</code>` : `\u26A0\uFE0F \u09A1\u09BF\u09AB\u09B2\u09CD\u099F Worker \u09B8\u09C7\u099F \u09B9\u09DF\u09C7\u099B\u09C7, \u0995\u09BF\u09A8\u09CD\u09A4\u09C1 \u098F\u099F\u09BF \u098F\u0996\u09A8\u0993 \u09AA\u09C1\u09B0\u09A8\u09CB v1 \u0995\u09CB\u09A1\u09C7 \u0986\u099B\u09C7 \u2014 \u09A4\u09BE\u0987 \u09AD\u09BF\u09A1\u09BF\u0993 \u09B8\u099A\u09B2 \u09B0\u09BE\u0996\u09A4\u09C7 \u0985\u099F\u09CB Direct Server \u099A\u09BE\u09B2\u09C1 \u09A5\u09BE\u0995\u099B\u09C7\u0964 Cloudflare-\u098F \u09A8\u09A4\u09C1\u09A8 <code>cloudflare-worker.js</code> (v2) Deploy \u0995\u09B0\u09B2\u09C7\u0987 \u0985\u099F\u09CB Worker \u099A\u09BE\u09B2\u09C1 \u09B9\u09AC\u09C7\u0964`,
             parse_mode: "HTML"
           });
           return { handled: true, reason: "cmd:setworker:reset" };
@@ -8892,11 +8993,12 @@ ${buildClientCardHtml(exact)}`,
         }
         botConfigState.workerUrl = cleanUrl;
         saveBotConfig(botConfigState);
+        const health = await probeCloudflareWorkerHealth(cleanUrl, true);
         await dispatch("sendMessage", {
           chat_id: chatId,
-          text: `\u2705 <b>Cloudflare Worker Video Proxy \u099A\u09BE\u09B2\u09C1 \u09B9\u09DF\u09C7\u099B\u09C7!</b>
+          text: health.healthy ? `\u2705 <b>Cloudflare Worker Video Proxy (v${health.version}) \u099A\u09BE\u09B2\u09C1 \u09B9\u09DF\u09C7\u099B\u09C7!</b>
 \u098F\u0996\u09A8 \u09B8\u09AC \u09AD\u09BF\u09A1\u09BF\u0993 \u09B8\u09CD\u099F\u09CD\u09B0\u09BF\u09AE, \u09A1\u09BE\u0989\u09A8\u09B2\u09CB\u09A1 \u0993 \u09B8\u09BE\u09AC\u099F\u09BE\u0987\u099F\u09C7\u09B2 \u098F\u0987 Worker \u09A6\u09BF\u09DF\u09C7 \u09AF\u09BE\u09AC\u09C7 (\u09B8\u09BE\u09B0\u09CD\u09AD\u09BE\u09B0 \u09AC\u09CD\u09AF\u09BE\u09A8\u09CD\u09A1\u0989\u0987\u09A5 \u09E6% \u0996\u09B0\u099A \u09B9\u09AC\u09C7):
-<code>${escTgHtml(cleanUrl)}</code>`,
+<code>${escTgHtml(cleanUrl)}</code>` : `\u26A0\uFE0F Worker \u09B8\u09C7\u09AD \u09B9\u09DF\u09C7\u099B\u09C7 (<code>${escTgHtml(cleanUrl)}</code>), \u09A4\u09AC\u09C7 <code>/health</code> \u098F v2 \u09AA\u09BE\u0993\u09DF\u09BE \u09AF\u09BE\u09DF\u09A8\u09BF (${health.reason})\u0964 \u09A4\u09BE\u0987 \u09AD\u09BF\u09A1\u09BF\u0993 \u09AC\u09A8\u09CD\u09A7 \u09A8\u09BE \u09B9\u09A4\u09C7 \u0985\u099F\u09CB Direct Server \u099A\u09BE\u09B2\u09C1 \u09A5\u09BE\u0995\u099B\u09C7 \u2014 \u09A8\u09A4\u09C1\u09A8 <code>cloudflare-worker.js</code> Deploy \u0995\u09B0\u09B2\u09C7\u0987 \u0985\u099F\u09CB Worker \u099A\u09BE\u09B2\u09C1 \u09B9\u09DF\u09C7 \u09AF\u09BE\u09AC\u09C7\u0964`,
           parse_mode: "HTML"
         });
         return { handled: true, reason: "cmd:setworker:ok" };
@@ -10590,12 +10692,16 @@ ${recoveredNames.slice(0, 30).join("\n")}
     }
   });
   app.get("/api/health", (_req, res) => {
+    const configuredWorker = getConfiguredWorkerUrl();
+    const workerHealth = configuredWorker ? workerHealthMap.get(configuredWorker) : void 0;
     const activeVideoProxy = resolveStreamProxyOrigin("");
     res.status(200).json({
       ok: true,
       service: "CinePulse HD",
+      videoProxyMode: activeVideoProxy ? "cloudflare-worker-v2" : "direct-server-proxy",
       videoProxyActive: Boolean(activeVideoProxy),
       videoProxyHost: activeVideoProxy ? activeVideoProxy.replace(/^https?:\/\//i, "") : null,
+      workerStatus: !configuredWorker ? "disabled" : workerHealth?.reason || "checking",
       uptimeSeconds: Math.round(process.uptime()),
       timestamp: Date.now()
     });

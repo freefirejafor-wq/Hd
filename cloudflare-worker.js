@@ -106,6 +106,7 @@ function corsHeaders(extra = {}) {
     'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
     'Access-Control-Allow-Headers': 'Range, Content-Type, Accept, X-API-Key',
     'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition',
+    'Cross-Origin-Resource-Policy': 'cross-origin',
     ...extra,
   };
 }

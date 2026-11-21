@@ -90,6 +90,32 @@
       "lastUsedAt": 1795230424609,
       "active": true,
       "createdIp": "synced"
+    },
+    {
+      "key": "cp_tr1_eyJuIjoiRGlhZ1Rlc3QiLCJwIjoiMjRIIiwiYyI6MTc5NTIzNjY5ODU5NywiZSI6MTc5NTI0MDI5ODU5NywibSI6NTAwLCJ1IjowLCJyIjoiZGlhZzEyMzQ1NiJ9.CCHEwfvF_AULnVkpbohlTC",
+      "clientName": "DiagTest",
+      "plan": "24H",
+      "createdAt": 1795236698597,
+      "expiresAt": 1795240298597,
+      "maxRequests": 500,
+      "unlimited": false,
+      "usedRequests": 1,
+      "lastUsedAt": 1795236698819,
+      "active": true,
+      "createdIp": "synced"
+    },
+    {
+      "key": "cp_tr1_eyJuIjoiRGlhZ1Rlc3QyIiwicCI6IjI0SCIsImMiOjE3OTUyMzY3MzI2NzMsImUiOjE3OTUyNDAzMzI2NzMsIm0iOjUwMCwidSI6MCwiciI6ImRpYWcxMjM0NTcifQ.d5zOyy-vbwlfFfv5f-kIIj",
+      "clientName": "DiagTest2",
+      "plan": "24H",
+      "createdAt": 1795236732673,
+      "expiresAt": 1795240332673,
+      "maxRequests": 500,
+      "unlimited": false,
+      "usedRequests": 2,
+      "lastUsedAt": 1795236734258,
+      "active": true,
+      "createdIp": "synced"
     }
   ]
 }

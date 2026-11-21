@@ -4551,26 +4551,32 @@ async function startServer() {
     }
 
     const trialTkEarly = typeof req.query.tk === 'string' ? String(req.query.tk).trim() : '';
+    const isMediaProxyPath =
+      req.path.startsWith('/api/mb-stream') ||
+      req.path.startsWith('/api/mb-ep-stream') ||
+      req.path.startsWith('/api/mb-subtitle-srt');
     const isCommercialApiOrTrialStream =
       req.path.startsWith('/api/trial') ||
-      ((req.path.startsWith('/api/mb-stream') || req.path.startsWith('/api/mb-subtitle-srt')) &&
-        Boolean(trialTkEarly && isActiveTrialStreamToken(trialTkEarly)));
+      (isMediaProxyPath && Boolean(trialTkEarly && isActiveTrialStreamToken(trialTkEarly)));
 
     const origin = String(req.headers.origin || '');
     if (isCommercialApiOrTrialStream) {
       res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PATCH, DELETE, OPTIONS');
       res.setHeader(
         'Access-Control-Allow-Headers',
         'Content-Type, Accept, Range, X-API-Key, Authorization, X-Trial-Manage-Token, X-Trial-Admin'
       );
       res.setHeader(
         'Access-Control-Expose-Headers',
-        'Content-Length, Content-Range, Accept-Ranges, Content-Type, X-Trial-Plan, X-RateLimit-Limit, X-RateLimit-Remaining, X-Trial-Expires-At'
+        'Content-Length, Content-Range, Accept-Ranges, Content-Type, Content-Disposition, X-Trial-Plan, X-RateLimit-Limit, X-RateLimit-Remaining, X-Trial-Expires-At'
       );
+      if (isMediaProxyPath) {
+        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      }
     } else if (origin && (origin.includes('localhost') || origin.includes('127.0.0.1') || origin.includes('.run.app'))) {
       res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, PATCH, DELETE, OPTIONS');
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, X-API-Key, Authorization');
     }
     if (req.method === 'OPTIONS') {
@@ -4601,7 +4607,7 @@ async function startServer() {
       return;
     }
 
-    // Strictly allow only commercial API endpoints (/api/trial/*, /api/owner/*, /api/mb-stream*, /api/mb-subtitle-srt, /api/health)
+    // Strictly allow only commercial API endpoints (/api/trial/*, /api/owner/*, /api/mb-stream*, /api/mb-ep-stream*, /api/mb-subtitle-srt, /api/health)
     if (
       req.path.startsWith('/api/') &&
       req.path !== '/api/health' &&
@@ -4611,6 +4617,8 @@ async function startServer() {
       const isStreamOrSubRoute =
         req.path === '/api/mb-stream' ||
         req.path === '/api/mb-stream.mp4' ||
+        req.path === '/api/mb-ep-stream' ||
+        req.path === '/api/mb-ep-stream.mp4' ||
         req.path === '/api/mb-subtitle-srt';
 
       if (!isStreamOrSubRoute) {
@@ -5216,8 +5224,10 @@ async function startServer() {
       }
     }
 
-    // 1. Check Virtual Micro-Chunk RAM Cache
-    if (!isDownload && req.method !== 'HEAD') {
+    const hasClientRange = Boolean(req.headers.range);
+
+    // 1. Check Virtual Micro-Chunk RAM Cache (only serve 206 partial response when client explicitly sent Range header)
+    if (hasClientRange && !isDownload && req.method !== 'HEAD') {
       const ramHit = mbStartupChunkCache.get(targetUrl);
       if (ramHit && ramHit.expiresAt > Date.now() && ramHit.buf.length > 32768) {
         if (
@@ -5231,6 +5241,7 @@ async function startServer() {
           res.setHeader('Content-Type', ramHit.contentType || 'video/mp4');
           res.setHeader('Accept-Ranges', 'bytes');
           res.setHeader('Cache-Control', 'public, max-age=3600');
+          res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
           res.setHeader('X-Cache', 'VIRTUAL-CHUNK-RAM-HIT');
           res.setHeader('Content-Length', String(chunk.length));
           res.setHeader(
@@ -5246,6 +5257,7 @@ async function startServer() {
           res.setHeader('Content-Type', ramHit.contentType || 'video/mp4');
           res.setHeader('Accept-Ranges', 'bytes');
           res.setHeader('Cache-Control', 'public, max-age=3600');
+          res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
           res.setHeader('X-Cache', 'VIRTUAL-CHUNK-RAM-HIT');
           res.setHeader('Content-Length', String(chunk.length));
           res.setHeader(
@@ -5270,15 +5282,13 @@ async function startServer() {
     const chunkCap =
       requestedStart === 0 ? INITIAL_BURST_CHUNK_BYTES : PLAYBACK_MICRO_CHUNK_BYTES;
 
-    if (req.headers.range && !isDownload) {
+    if (hasClientRange && !isDownload) {
       const cappedEnd =
         !Number.isNaN(requestedEnd) && requestedEnd >= requestedStart
           ? Math.min(requestedEnd, requestedStart + chunkCap - 1)
           : requestedStart + chunkCap - 1;
       forwardHeaders.Range = `bytes=${requestedStart}-${cappedEnd}`;
-    } else if (!req.headers.range && !isDownload && req.method !== 'HEAD') {
-      forwardHeaders.Range = `bytes=0-${chunkCap - 1}`;
-    } else if (req.headers.range) {
+    } else if (hasClientRange) {
       forwardHeaders.Range = String(req.headers.range);
     }
 
@@ -5763,7 +5773,12 @@ async function startServer() {
       } catch {
         // fallback to redirect below
       }
-      res.redirect(302, streamRouteUrl);
+      const reqTk = typeof req.query.tk === 'string' ? String(req.query.tk).trim() : '';
+      const redirectUrl =
+        reqTk && !streamRouteUrl.includes('tk=')
+          ? `${streamRouteUrl}${streamRouteUrl.includes('?') ? '&' : '?'}tk=${encodeURIComponent(reqTk)}`
+          : streamRouteUrl;
+      res.redirect(302, redirectUrl);
     } catch {
       if (fallbackUrl) {
         await handleMovieBoxVirtualChunkStream(
@@ -6084,13 +6099,21 @@ async function startServer() {
   const demoApiRateMap = new Map<string, { count: number; resetAt: number }>();
 
   const getPublicOrigin = (req: express.Request) => {
-    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https')
+    const rawHost = String(req.headers['x-forwarded-host'] || req.get('host') || 'localhost:3000')
       .split(',')[0]
       .trim();
-    const host = String(req.headers['x-forwarded-host'] || req.get('host') || 'localhost:3000')
+    const fwdProto = String(req.headers['x-forwarded-proto'] || '')
       .split(',')[0]
-      .trim();
-    return `${proto}://${host}`;
+      .trim()
+      .toLowerCase();
+    const cfVisitor = String(req.headers['cf-visitor'] || '').toLowerCase();
+    const isKnownHttpsHost =
+      /\.(run\.app|onrender\.com|railway\.app|vercel\.app|workers\.dev)$/i.test(rawHost);
+    let proto = fwdProto || (cfVisitor.includes('https') ? 'https' : req.protocol || 'https');
+    if (proto === 'http' && isKnownHttpsHost) {
+      proto = 'https';
+    }
+    return `${proto}://${rawHost}`;
   };
 
   const sendPrettyDemoJson = (res: express.Response, status: number, payload: unknown) => {
@@ -6664,16 +6687,94 @@ async function startServer() {
   let capturePublicOriginForBot: (req: express.Request) => void = () => {};
   let startTelegramBotPoller: () => void = () => {};
   const DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL = 'https://mb-stream.rahamanabduar2.workers.dev';
-  let resolveStreamProxyOrigin = (fallbackBase: string): string => {
+  interface WorkerHealthEntry {
+    healthy: boolean;
+    version: number;
+    checkedAt: number;
+    reason: string;
+  }
+  const workerHealthMap = new Map<string, WorkerHealthEntry>();
+  const workerHealthInFlight = new Map<string, Promise<WorkerHealthEntry>>();
+
+  const probeCloudflareWorkerHealth = (workerUrl: string, force = false): Promise<WorkerHealthEntry> => {
+    const clean = String(workerUrl || '').trim().replace(/\/+$/, '');
+    if (!clean || !/^https?:\/\//i.test(clean)) {
+      return Promise.resolve({ healthy: false, version: 0, checkedAt: Date.now(), reason: 'disabled' });
+    }
+    const existing = workerHealthMap.get(clean);
+    if (!force && existing && Date.now() - existing.checkedAt < 60_000) {
+      return Promise.resolve(existing);
+    }
+    const inflight = workerHealthInFlight.get(clean);
+    if (inflight) return inflight;
+    const job = (async (): Promise<WorkerHealthEntry> => {
+      try {
+        const res = await fetch(`${clean}/health`, { signal: AbortSignal.timeout(2500) });
+        if (!res.ok) {
+          const entry: WorkerHealthEntry = {
+            healthy: false,
+            version: 0,
+            checkedAt: Date.now(),
+            reason: `http-${res.status}`,
+          };
+          workerHealthMap.set(clean, entry);
+          return entry;
+        }
+        const json = (await res.json().catch(() => null)) as any;
+        const ver = Number(json?.version || 1);
+        // Only route video streams to Cloudflare Worker when v2+ (with working movie-box.co Referer) is deployed!
+        const okV2 = Boolean(json?.ok && ver >= 2);
+        const entry: WorkerHealthEntry = {
+          healthy: okV2,
+          version: ver,
+          checkedAt: Date.now(),
+          reason: okV2 ? 'active-v2' : 'outdated-v1-fallback-server',
+        };
+        workerHealthMap.set(clean, entry);
+        return entry;
+      } catch {
+        const entry: WorkerHealthEntry = {
+          healthy: false,
+          version: 0,
+          checkedAt: Date.now(),
+          reason: 'unreachable-fallback-server',
+        };
+        workerHealthMap.set(clean, entry);
+        return entry;
+      } finally {
+        workerHealthInFlight.delete(clean);
+      }
+    })();
+    workerHealthInFlight.set(clean, job);
+    return job;
+  };
+
+  let getConfiguredWorkerUrl = (): string => {
     const envWorker = String(
       process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || process.env.CF_WORKER_STREAM_URL || ''
     )
       .trim()
       .replace(/\/+$/, '');
-    if (/^(off|none|disable|false)$/i.test(envWorker)) return fallbackBase;
+    if (/^(off|none|disable|false)$/i.test(envWorker)) return '';
     if (envWorker && /^https?:\/\//i.test(envWorker)) return envWorker;
-    return DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL || fallbackBase;
+    return DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL;
   };
+
+  let resolveStreamProxyOrigin = (fallbackBase: string): string => {
+    const candidate = getConfiguredWorkerUrl();
+    if (!candidate) return fallbackBase;
+    const health = workerHealthMap.get(candidate);
+    if (!health || Date.now() - health.checkedAt >= 60_000) {
+      void probeCloudflareWorkerHealth(candidate, false);
+    }
+    if (health && health.healthy) {
+      return candidate;
+    }
+    // Automatically fall back to the server's own working /api/mb-stream.mp4 proxy if worker is v1/down!
+    return fallbackBase;
+  };
+
+  void probeCloudflareWorkerHealth(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL, true);
 
   const loadTrialKeysStore = () => {
     try {
@@ -7478,8 +7579,10 @@ async function startServer() {
     const toTrialUrl = (u: string) => {
       if (!u || !u.startsWith('/')) return u;
       const sep = u.includes('?') ? '&' : '?';
-      const needsTk = u.startsWith('/api/mb-stream') || u.startsWith('/api/mb-subtitle-srt');
-      const hostBase = needsTk ? streamBase : base;
+      const isWorkerEligible = u.startsWith('/api/mb-stream') || u.startsWith('/api/mb-subtitle-srt');
+      const isServerEpStream = u.startsWith('/api/mb-ep-stream');
+      const needsTk = isWorkerEligible || isServerEpStream;
+      const hostBase = isWorkerEligible ? streamBase : base;
       return `${hostBase}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ''}`;
     };
 
@@ -8189,8 +8292,10 @@ async function startServer() {
       const toAbsoluteWithTrialTk = (u: string) => {
         if (!u.startsWith('/')) return u;
         const sep = u.includes('?') ? '&' : '?';
-        const needsTk = u.startsWith('/api/mb-stream') || u.startsWith('/api/mb-subtitle-srt');
-        const hostBase = needsTk ? streamBase : base;
+        const isWorkerEligible = u.startsWith('/api/mb-stream') || u.startsWith('/api/mb-subtitle-srt');
+        const isServerEpStream = u.startsWith('/api/mb-ep-stream');
+        const needsTk = isWorkerEligible || isServerEpStream;
+        const hostBase = isWorkerEligible ? streamBase : base;
         return `${hostBase}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ''}`;
       };
       const embedPlayerUrl = `${base}/trial-embed?apiKey=${encodeURIComponent(rec.key)}&subjectId=${encodeURIComponent(
@@ -8804,19 +8909,37 @@ async function startServer() {
   let botConfigState: BotConfigState = loadBotConfig();
   let capturedPublicBaseUrl = '';
 
-  resolveStreamProxyOrigin = (fallbackBase: string): string => {
+  getConfiguredWorkerUrl = (): string => {
     const envWorker = String(
       process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || process.env.CF_WORKER_STREAM_URL || ''
     )
       .trim()
       .replace(/\/+$/, '');
-    if (/^(off|none|disable|false)$/i.test(envWorker)) return fallbackBase;
+    if (/^(off|none|disable|false)$/i.test(envWorker)) return '';
     if (envWorker && /^https?:\/\//i.test(envWorker)) return envWorker;
     const savedWorker = String(botConfigState.workerUrl || '').trim().replace(/\/+$/, '');
-    if (/^(off|none|disable|false)$/i.test(savedWorker)) return fallbackBase;
+    if (/^(off|none|disable|false)$/i.test(savedWorker)) return '';
     if (savedWorker && /^https?:\/\//i.test(savedWorker)) return savedWorker;
-    return DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL || fallbackBase;
+    return DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL;
   };
+
+  resolveStreamProxyOrigin = (fallbackBase: string): string => {
+    const candidate = getConfiguredWorkerUrl();
+    if (!candidate) return fallbackBase;
+    const health = workerHealthMap.get(candidate);
+    if (!health || Date.now() - health.checkedAt >= 60_000) {
+      void probeCloudflareWorkerHealth(candidate, false);
+    }
+    if (health && health.healthy) {
+      return candidate;
+    }
+    return fallbackBase;
+  };
+
+  const initialConfiguredWorker = getConfiguredWorkerUrl();
+  if (initialConfiguredWorker) {
+    void probeCloudflareWorkerHealth(initialConfiguredWorker, true);
+  }
 
   capturePublicOriginForBot = (req: express.Request) => {
     const rawOrigin = getPublicOrigin(req).replace(/\/+$/, '');
@@ -9774,12 +9897,17 @@ async function startServer() {
       if (cmd === 'setworker') {
         const cleanUrl = arg.trim().replace(/\/+$/, '');
         if (!cleanUrl) {
-          const cur = resolveStreamProxyOrigin('');
+          const configured = getConfiguredWorkerUrl();
+          const health = configured ? await probeCloudflareWorkerHealth(configured, true) : null;
+          const active = resolveStreamProxyOrigin('');
+          const statusLine = !configured
+            ? 'OFF (Direct Server Proxy চালু)'
+            : health?.healthy
+              ? `🟢 ACTIVE (v${health.version}) — <code>${escTgHtml(active)}</code>`
+              : `⚠️ Worker v1 পুরনো/অকার্যকর (<code>${escTgHtml(configured)}</code>) — অটো-ফলব্যাক Direct Server Proxy চালু আছে! Worker কোড v2 আপডেট করলে অটো চালু হবে।`;
           await dispatch('sendMessage', {
             chat_id: chatId,
-            text: `⚡ <b>Cloudflare Worker Video Proxy</b>\nবর্তমান Worker: <code>${escTgHtml(
-              cur || 'OFF (Direct Server)'
-            )}</code>\n\nচালু করতে লিখুন:\n<code>/setworker https://your-worker.workers.dev</code>\nবন্ধ করতে লিখুন:\n<code>/setworker off</code>`,
+            text: `⚡ <b>Cloudflare Worker Video Proxy</b>\nস্ট্যাটাস: ${statusLine}\n\nচালু করতে লিখুন:\n<code>/setworker https://your-worker.workers.dev</code>\nবন্ধ করতে লিখুন:\n<code>/setworker off</code>`,
             parse_mode: 'HTML',
           });
           return { handled: true, reason: 'cmd:setworker:info' };
@@ -9797,9 +9925,12 @@ async function startServer() {
         if (/^(reset|default)$/i.test(cleanUrl)) {
           delete botConfigState.workerUrl;
           saveBotConfig(botConfigState);
+          const health = await probeCloudflareWorkerHealth(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL, true);
           await dispatch('sendMessage', {
             chat_id: chatId,
-            text: `✅ ডিফল্ট Cloudflare Worker চালু করা হয়েছে:\n<code>${escTgHtml(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL)}</code>`,
+            text: health.healthy
+              ? `✅ ডিফল্ট Cloudflare Worker (v${health.version}) চালু করা হয়েছে:\n<code>${escTgHtml(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL)}</code>`
+              : `⚠️ ডিফল্ট Worker সেট হয়েছে, কিন্তু এটি এখনও পুরনো v1 কোডে আছে — তাই ভিডিও সচল রাখতে অটো Direct Server চালু থাকছে। Cloudflare-এ নতুন <code>cloudflare-worker.js</code> (v2) Deploy করলেই অটো Worker চালু হবে।`,
             parse_mode: 'HTML',
           });
           return { handled: true, reason: 'cmd:setworker:reset' };
@@ -9814,9 +9945,12 @@ async function startServer() {
         }
         botConfigState.workerUrl = cleanUrl;
         saveBotConfig(botConfigState);
+        const health = await probeCloudflareWorkerHealth(cleanUrl, true);
         await dispatch('sendMessage', {
           chat_id: chatId,
-          text: `✅ <b>Cloudflare Worker Video Proxy চালু হয়েছে!</b>\nএখন সব ভিডিও স্ট্রিম, ডাউনলোড ও সাবটাইটেল এই Worker দিয়ে যাবে (সার্ভার ব্যান্ডউইথ ০% খরচ হবে):\n<code>${escTgHtml(cleanUrl)}</code>`,
+          text: health.healthy
+            ? `✅ <b>Cloudflare Worker Video Proxy (v${health.version}) চালু হয়েছে!</b>\nএখন সব ভিডিও স্ট্রিম, ডাউনলোড ও সাবটাইটেল এই Worker দিয়ে যাবে (সার্ভার ব্যান্ডউইথ ০% খরচ হবে):\n<code>${escTgHtml(cleanUrl)}</code>`
+            : `⚠️ Worker সেভ হয়েছে (<code>${escTgHtml(cleanUrl)}</code>), তবে <code>/health</code> এ v2 পাওয়া যায়নি (${health.reason})। তাই ভিডিও বন্ধ না হতে অটো Direct Server চালু থাকছে — নতুন <code>cloudflare-worker.js</code> Deploy করলেই অটো Worker চালু হয়ে যাবে।`,
           parse_mode: 'HTML',
         });
         return { handled: true, reason: 'cmd:setworker:ok' };
@@ -11707,12 +11841,18 @@ async function startServer() {
   });
 
   app.get('/api/health', (_req, res) => {
+    const configuredWorker = getConfiguredWorkerUrl();
+    const workerHealth = configuredWorker ? workerHealthMap.get(configuredWorker) : undefined;
     const activeVideoProxy = resolveStreamProxyOrigin('');
     res.status(200).json({
       ok: true,
       service: 'CinePulse HD',
+      videoProxyMode: activeVideoProxy ? 'cloudflare-worker-v2' : 'direct-server-proxy',
       videoProxyActive: Boolean(activeVideoProxy),
       videoProxyHost: activeVideoProxy ? activeVideoProxy.replace(/^https?:\/\//i, '') : null,
+      workerStatus: !configuredWorker
+        ? 'disabled'
+        : workerHealth?.reason || 'checking',
       uptimeSeconds: Math.round(process.uptime()),
       timestamp: Date.now(),
     });
