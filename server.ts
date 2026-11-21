@@ -3171,9 +3171,9 @@ async function fetchCdnByteRangeBuffer(
       targetUrl,
       'GET',
       {
-        'User-Agent': 'okhttp/4.12.0',
-        Referer: 'https://moviebox.ph/',
-        Origin: 'https://moviebox.ph',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Referer: 'https://movie-box.co/',
         Range: `bytes=${startByte}-${endByte}`,
         Accept: '*/*',
       },
@@ -5259,11 +5259,12 @@ async function startServer() {
     }
 
     const chromeUa =
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
     const isMlbdStream = /workers\.dev|r2\.dev|fsldownload|movielinkbd|pixeldrain/i.test(targetUrl);
     const forwardHeaders: Record<string, string> = {
-      'User-Agent': isMlbdStream ? chromeUa : 'okhttp/4.12.0',
+      'User-Agent': chromeUa,
       Accept: '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
     };
 
     const chunkCap =
@@ -5290,9 +5291,10 @@ async function startServer() {
             { 'User-Agent': chromeUa, Referer: `${activeMovieLinkBdOrigin}/` },
           ]
         : [
-            { Referer: 'https://moviebox.ph/', Origin: 'https://moviebox.ph' },
-            { Referer: 'https://movie-box.co/', Origin: 'https://movie-box.co' },
-            { Referer: 'https://movieboxhd.net/', Origin: 'https://movieboxhd.net' },
+            { 'User-Agent': chromeUa, Referer: 'https://movie-box.co/' },
+            { 'User-Agent': chromeUa, Referer: 'https://123movienow.cc/' },
+            { 'User-Agent': chromeUa, Referer: 'https://movieboxhd.net/' },
+            { 'User-Agent': 'okhttp/4.12.0', Referer: 'https://movie-box.co/' },
           ];
       for (let attempt = 0; attempt < refererCandidates.length; attempt++) {
         try {
@@ -5320,8 +5322,8 @@ async function startServer() {
       ) {
         try {
           const fbHeaders: Record<string, string> = {
-            'User-Agent': forwardHeaders['User-Agent'],
-            Referer: isMlbdStream ? `${activeMovieLinkBdOrigin}/` : 'https://moviebox.ph/',
+            'User-Agent': chromeUa,
+            Referer: isMlbdStream ? `${activeMovieLinkBdOrigin}/` : 'https://movie-box.co/',
             Accept: '*/*',
           };
           if (forwardHeaders.Range) fbHeaders.Range = forwardHeaders.Range;
@@ -5341,57 +5343,83 @@ async function startServer() {
         }
       }
 
-      // If Node https.request received 403/5xx from a Cloudflare Worker/CDN, fall back to undici HTTP/2 fetch!
+      // If Node https.request (HTTP/1.1) received 426/403/429/5xx, fall back to undici HTTP/2 fetch with working Referers!
       if (!upstream || (upstream.statusCode !== 200 && upstream.statusCode !== 206)) {
-        try {
-          const undiciHeaders: Record<string, string> = {
-            'User-Agent': isMlbdStream ? chromeUa : 'okhttp/4.12.0',
-            Referer: isMlbdStream ? `${activeMovieLinkBdOrigin}/` : 'https://moviebox.ph/',
-            Origin: isMlbdStream ? activeMovieLinkBdOrigin : 'https://moviebox.ph',
-            Accept: '*/*',
-          };
-          if (forwardHeaders.Range) undiciHeaders.Range = forwardHeaders.Range;
-          const fRes = await fetch(targetUrl, {
-            method: req.method === 'HEAD' ? 'HEAD' : 'GET',
-            headers: undiciHeaders,
-            signal: AbortSignal.timeout(8000),
-          });
-          if (fRes.status === 200 || fRes.status === 206) {
-            let ct = String(fRes.headers.get('content-type') || 'video/mp4')
-              .split(';')[0]
-              .trim();
-            if (!ct || ct === 'application/octet-stream' || ct === 'binary/octet-stream') {
-              ct = /\.mkv(\?|$)/i.test(targetUrl) ? 'video/x-matroska' : 'video/mp4';
+        const fetchTargets = [targetUrl, fallbackUrl].filter((u) => Boolean(u && u.startsWith('http')));
+        const fetchHeaderSets: Record<string, string>[] = isMlbdStream
+          ? [{ 'User-Agent': chromeUa, Referer: `${activeMovieLinkBdOrigin}/`, Accept: '*/*' }]
+          : [
+              {
+                'User-Agent': chromeUa,
+                Referer: 'https://movie-box.co/',
+                Accept: '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+              },
+              {
+                'User-Agent': chromeUa,
+                Referer: 'https://123movienow.cc/',
+                Accept: '*/*',
+              },
+              {
+                'User-Agent': 'okhttp/4.12.0',
+                Referer: 'https://movie-box.co/',
+                Accept: '*/*',
+              },
+            ];
+
+        for (const fTarget of fetchTargets) {
+          for (const hSet of fetchHeaderSets) {
+            try {
+              const undiciHeaders: Record<string, string> = { ...hSet };
+              if (forwardHeaders.Range) undiciHeaders.Range = forwardHeaders.Range;
+              const fRes = await fetch(fTarget, {
+                method: req.method === 'HEAD' ? 'HEAD' : 'GET',
+                headers: undiciHeaders,
+                signal: AbortSignal.timeout(8000),
+              });
+              if (fRes.status === 200 || fRes.status === 206) {
+                let ct = String(fRes.headers.get('content-type') || 'video/mp4')
+                  .split(';')[0]
+                  .trim();
+                if (!ct || ct === 'application/octet-stream' || ct === 'binary/octet-stream') {
+                  ct = /\.mkv(\?|$)/i.test(fTarget) ? 'video/x-matroska' : 'video/mp4';
+                }
+                const cr = String(fRes.headers.get('content-range') || '');
+                const cl = fRes.headers.get('content-length');
+                res.status(fRes.status);
+                res.setHeader('Content-Type', ct);
+                res.setHeader('Accept-Ranges', String(fRes.headers.get('accept-ranges') || 'bytes'));
+                res.setHeader('Cache-Control', 'public, max-age=3600');
+                res.setHeader('X-Cache', 'VIRTUAL-CHUNK-FETCH');
+                if (cl) res.setHeader('Content-Length', cl);
+                if (cr) res.setHeader('Content-Range', cr);
+                if (isDownload) {
+                  res.setHeader(
+                    'Content-Disposition',
+                    `attachment; filename="${rawFilename.endsWith('.mp4') ? rawFilename : `${rawFilename}.mp4`}"`
+                  );
+                }
+                if (req.method === 'HEAD' || !fRes.body) {
+                  res.end();
+                  return;
+                }
+                const { Readable } = await import('stream');
+                const nodeStream = Readable.fromWeb(fRes.body as any);
+                res.on('close', () => {
+                  if (!res.writableEnded) nodeStream.destroy();
+                });
+                nodeStream.pipe(res);
+                return;
+              }
+              try {
+                await fRes.body?.cancel();
+              } catch {
+                // ignore cancel error
+              }
+            } catch {
+              // try next fetch header variant
             }
-            const cr = String(fRes.headers.get('content-range') || '');
-            const cl = fRes.headers.get('content-length');
-            res.status(fRes.status);
-            res.setHeader('Content-Type', ct);
-            res.setHeader('Accept-Ranges', String(fRes.headers.get('accept-ranges') || 'bytes'));
-            res.setHeader('Cache-Control', 'public, max-age=3600');
-            res.setHeader('X-Cache', 'VIRTUAL-CHUNK-FETCH');
-            if (cl) res.setHeader('Content-Length', cl);
-            if (cr) res.setHeader('Content-Range', cr);
-            if (isDownload) {
-              res.setHeader(
-                'Content-Disposition',
-                `attachment; filename="${rawFilename.endsWith('.mp4') ? rawFilename : `${rawFilename}.mp4`}"`
-              );
-            }
-            if (req.method === 'HEAD' || !fRes.body) {
-              res.end();
-              return;
-            }
-            const { Readable } = await import('stream');
-            const nodeStream = Readable.fromWeb(fRes.body as any);
-            res.on('close', () => {
-              if (!res.writableEnded) nodeStream.destroy();
-            });
-            nodeStream.pipe(res);
-            return;
           }
-        } catch {
-          // ignore fetch fallback error
         }
       }
 

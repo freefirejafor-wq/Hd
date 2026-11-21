@@ -77,6 +77,19 @@
       "lastUsedAt": 1795187131839,
       "active": true,
       "createdIp": "synced"
+    },
+    {
+      "key": "cp_tr1_eyJuIjoiRGlhZyIsInAiOiIyNEgiLCJjIjoxNzk1MjMwMjQ4ODk5LCJlIjoxNzk1MjMzODQ4ODk5LCJtIjo1MDAsInUiOmZhbHNlfQ.EeqVra-AchsLa1JO5LTD0E",
+      "clientName": "Diag",
+      "plan": "24H",
+      "createdAt": 1795230248899,
+      "expiresAt": 1795233848899,
+      "maxRequests": 500,
+      "unlimited": false,
+      "usedRequests": 2,
+      "lastUsedAt": 1795230424609,
+      "active": true,
+      "createdIp": "synced"
     }
   ]
 }

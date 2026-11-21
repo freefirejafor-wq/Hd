@@ -1,13 +1,9 @@
 /**
- * CinePulse / MovieBox Commercial API — Free Cloudflare Worker Video & Subtitle Edge Proxy
+ * CinePulse / MovieBox Commercial API — Free Cloudflare Worker Video & Subtitle Edge Proxy (v2)
  *
- * HOW TO DEPLOY (30 SECONDS — $0 FREE UNLIMITED BANDWIDTH):
- * 1. Go to https://dash.cloudflare.com -> Workers & Pages -> Create -> Create Worker
- * 2. Name it (e.g. `mb-stream`), click Deploy, then click "Edit Code"
- * 3. Delete all default code, paste THIS entire file, and click "Deploy"
- * 4. Copy your Worker URL (e.g. `https://mb-stream.yourname.workers.dev`)
- * 5. Set `VIDEO_PROXY_URL=https://mb-stream.yourname.workers.dev` in Render/cPanel Environment Variables
- *    OR send `/setworker https://mb-stream.yourname.workers.dev` in your Telegram Bot!
+ * HOW TO DEPLOY / UPDATE (30 SECONDS — $0 FREE UNLIMITED BANDWIDTH):
+ * 1. Go to https://dash.cloudflare.com -> Workers & Pages -> your Worker (`mb-stream`) -> Edit Code
+ * 2. Select ALL old code, delete it, paste THIS entire file, and click "Deploy"
  */
 
 const MASTER_SECRET = 'CinePulse_AES256_Master_Key_v4_9x7A2mK8pQ4wL1zR6vN3jH5bT0yF';
@@ -90,7 +86,6 @@ async function decodeGatewayToken(token) {
         const iv = b64urlToBytes(parts[1]);
         const tag = b64urlToBytes(parts[2]);
         const cipher = b64urlToBytes(parts[3]);
-        // Web Crypto AES-GCM expects ciphertext || authTag concatenated
         const combined = new Uint8Array(cipher.length + tag.length);
         combined.set(cipher, 0);
         combined.set(tag, cipher.length);
@@ -126,7 +121,7 @@ export default {
 
     if (path === '/' || path === '/health') {
       return new Response(
-        JSON.stringify({ ok: true, service: 'MovieBox Cloudflare Edge Stream Proxy', status: 'ACTIVE' }),
+        JSON.stringify({ ok: true, service: 'MovieBox Cloudflare Edge Stream Proxy', version: 2, status: 'ACTIVE' }),
         { status: 200, headers: corsHeaders({ 'Content-Type': 'application/json' }) }
       );
     }
@@ -163,32 +158,47 @@ export default {
       });
     }
 
+    const chromeUa =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
     const rangeHdr = request.headers.get('Range');
     const baseReqHdr = isVideo && rangeHdr ? { Range: rangeHdr, Accept: '*/*' } : { Accept: '*/*' };
+
+    // MovieBox enacdn/Tengine accepts movie-box.co, 123movienow.cc, and movieboxhd.net (moviebox.ph now returns 429!)
     const headerVariants = [
       {
         ...baseReqHdr,
-        'User-Agent': 'okhttp/4.12.0',
-        Referer: 'https://moviebox.ph/',
-        Origin: 'https://moviebox.ph',
-      },
-      {
-        ...baseReqHdr,
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        Referer: 'https://moviebox.ph/',
-        Origin: 'https://moviebox.ph',
-      },
-      {
-        ...baseReqHdr,
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+        'User-Agent': chromeUa,
         Referer: 'https://movie-box.co/',
-        Origin: 'https://movie-box.co',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Sec-Fetch-Dest': isVideo ? 'video' : 'empty',
+        'Sec-Fetch-Mode': 'no-cors',
+        'Sec-Fetch-Site': 'cross-site',
+      },
+      {
+        ...baseReqHdr,
+        'User-Agent': chromeUa,
+        Referer: 'https://123movienow.cc/',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      {
+        ...baseReqHdr,
+        'User-Agent': chromeUa,
+        Referer: 'https://movieboxhd.net/',
+      },
+      {
+        ...baseReqHdr,
+        'User-Agent': 'okhttp/4.12.0',
+        Referer: 'https://movie-box.co/',
+      },
+      {
+        ...baseReqHdr,
+        'User-Agent': chromeUa,
+        Referer: 'https://moviebox.ph/',
       },
     ];
 
     let upstreamRes = null;
+    let lastStatus = 0;
     outer: for (const target of candidates) {
       for (const hdrs of headerVariants) {
         try {
@@ -196,10 +206,17 @@ export default {
             method: request.method === 'HEAD' ? 'HEAD' : 'GET',
             headers: hdrs,
             redirect: 'follow',
+            cf: { cacheTtl: 0, cacheEverything: false },
           });
           if (res.ok || res.status === 206) {
             upstreamRes = res;
             break outer;
+          }
+          lastStatus = res.status;
+          try {
+            await res.body?.cancel();
+          } catch {
+            // ignore cancel error
           }
         } catch {
           // try next variant
@@ -208,10 +225,17 @@ export default {
     }
 
     if (!upstreamRes) {
-      return new Response(JSON.stringify({ ok: false, error: 'Upstream media unavailable' }), {
-        status: 502,
-        headers: corsHeaders({ 'Content-Type': 'application/json' }),
-      });
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: 'Upstream media unavailable',
+          upstreamStatus: lastStatus || 502,
+        }),
+        {
+          status: 502,
+          headers: corsHeaders({ 'Content-Type': 'application/json' }),
+        }
+      );
     }
 
     const outHeaders = new Headers(corsHeaders());
