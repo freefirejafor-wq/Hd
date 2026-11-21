@@ -38,6 +38,8 @@ export interface StreamSource {
   provider: string;
   url: string;
   downloadUrl: string;
+  directUrl?: string;
+  headers?: Record<string, string>;
   type: string;
   name: string;
   screenshot?: string;

@@ -3227,8 +3227,202 @@ async function resolveCinemetaSeriesSeasons(imdbId) {
     return [];
   }
 }
-function buildEmbedBackupSources(_imdbId, _seasonNum, _epNum, _title, _language) {
-  return [];
+var externalIdsCache = /* @__PURE__ */ new Map();
+async function resolveExternalMediaIds(rawTitle, releaseDateStr = "", isSeries = false) {
+  const cleanTitle = extractBaseSeriesTitle(rawTitle).replace(/\b(19|20)\d{2}\b/g, "").replace(/\s{2,}/g, " ").trim();
+  if (!cleanTitle || cleanTitle.length < 2) return { imdbId: "", tmdbId: "" };
+  const cacheKey = `${cleanTitle.toLowerCase()}::${isSeries ? "tv" : "movie"}`;
+  const cached = externalIdsCache.get(cacheKey);
+  if (cached) return cached;
+  const cmType = isSeries ? "series" : "movie";
+  const altType = isSeries ? "movie" : "series";
+  const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const wantNorm = norm(cleanTitle);
+  const wantYear = parseInt(String(releaseDateStr || "").slice(0, 4), 10) || 0;
+  const searchCinemeta = async (type) => {
+    try {
+      const r = await fetch(
+        `https://v3-cinemeta.strem.io/catalog/${type}/top/search=${encodeURIComponent(cleanTitle)}.json`,
+        {
+          headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" },
+          signal: AbortSignal.timeout(2200)
+        }
+      );
+      if (!r.ok) return { imdbId: "", tmdbId: "" };
+      const j = await r.json();
+      const metas = Array.isArray(j?.metas) ? j.metas : [];
+      if (!metas.length) return { imdbId: "", tmdbId: "" };
+      const scored = metas.slice(0, 8).map((m) => {
+        let sc = 0;
+        const mNorm = norm(m?.name || "");
+        if (mNorm === wantNorm) sc += 60;
+        else if (mNorm.includes(wantNorm) || wantNorm.includes(mNorm)) sc += 30;
+        const y = parseInt(String(m?.releaseInfo || m?.year || "").slice(0, 4), 10) || 0;
+        if (wantYear > 1900 && y > 1900 && Math.abs(y - wantYear) <= 1) sc += 25;
+        return { imdbId: String(m?.imdb_id || m?.id || ""), sc };
+      });
+      scored.sort((a, b) => b.sc - a.sc);
+      const topImdb = scored[0]?.imdbId || "";
+      if (!topImdb.startsWith("tt")) return { imdbId: "", tmdbId: "" };
+      let tmdbId = "";
+      try {
+        const mr = await fetch(`https://v3-cinemeta.strem.io/meta/${type}/${encodeURIComponent(topImdb)}.json`, {
+          headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" },
+          signal: AbortSignal.timeout(1800)
+        });
+        if (mr.ok) {
+          const mj = await mr.json();
+          if (mj?.meta?.moviedb_id) tmdbId = String(mj.meta.moviedb_id);
+        }
+      } catch {
+      }
+      return { imdbId: topImdb, tmdbId };
+    } catch {
+      return { imdbId: "", tmdbId: "" };
+    }
+  };
+  try {
+    const [cmMain, imdbFallback] = await Promise.all([
+      searchCinemeta(cmType),
+      resolveImdbIdForTitle(cleanTitle, releaseDateStr, isSeries)
+    ]);
+    let imdbId = cmMain.imdbId || imdbFallback || "";
+    let tmdbId = cmMain.tmdbId || "";
+    if (!imdbId) {
+      const cmAlt = await searchCinemeta(altType);
+      imdbId = cmAlt.imdbId || "";
+      tmdbId = cmAlt.tmdbId || "";
+    } else if (!tmdbId && imdbId.startsWith("tt")) {
+      try {
+        const mr = await fetch(`https://v3-cinemeta.strem.io/meta/${cmType}/${encodeURIComponent(imdbId)}.json`, {
+          headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" },
+          signal: AbortSignal.timeout(1500)
+        });
+        if (mr.ok) {
+          const mj = await mr.json();
+          if (mj?.meta?.moviedb_id) tmdbId = String(mj.meta.moviedb_id);
+        }
+      } catch {
+      }
+    }
+    const result = { imdbId, tmdbId };
+    if (imdbId || tmdbId) {
+      pruneCacheMap(externalIdsCache, 400);
+      externalIdsCache.set(cacheKey, result);
+    }
+    return result;
+  } catch {
+    return { imdbId: "", tmdbId: "" };
+  }
+}
+var directCdnProbeCache = null;
+var directCdnProbeInFlight = null;
+async function isDirectMp4CdnReachableFromHost(sampleRawUrl, hasHealthyExternalRelay) {
+  if (hasHealthyExternalRelay) return true;
+  if (!sampleRawUrl || !/^https?:\/\//i.test(sampleRawUrl)) return false;
+  if (directCdnProbeCache && Date.now() - directCdnProbeCache.checkedAt < 5 * 6e4) {
+    return directCdnProbeCache.reachable;
+  }
+  if (directCdnProbeInFlight) return directCdnProbeInFlight;
+  directCdnProbeInFlight = (async () => {
+    try {
+      const r = await fetch(sampleRawUrl, {
+        method: "GET",
+        headers: {
+          Range: "bytes=0-63",
+          Referer: "https://movie-box.co/",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+          Accept: "*/*"
+        },
+        redirect: "follow",
+        signal: AbortSignal.timeout(2200)
+      });
+      const ct = String(r.headers.get("content-type") || "").toLowerCase();
+      const ok = (r.status === 200 || r.status === 206) && (ct.includes("video") || ct.includes("octet-stream") || ct === "");
+      try {
+        await r.body?.cancel();
+      } catch {
+      }
+      directCdnProbeCache = { reachable: ok, checkedAt: Date.now(), status: r.status };
+      return ok;
+    } catch {
+      directCdnProbeCache = { reachable: false, checkedAt: Date.now(), status: 0 };
+      return false;
+    } finally {
+      directCdnProbeInFlight = null;
+    }
+  })();
+  return directCdnProbeInFlight;
+}
+function buildEmbedBackupSources(imdbId, seasonNum, epNum, title, language, tmdbId = "") {
+  const cleanImdb = String(imdbId || "").trim();
+  const cleanTmdb = String(tmdbId || "").trim();
+  if (!cleanImdb && !cleanTmdb) return [];
+  const isTv = seasonNum > 0 || epNum > 0;
+  const se = Math.max(1, seasonNum || 1);
+  const ep = Math.max(1, epNum || 1);
+  const epLabel = isTv ? ` S${se}E${ep}` : "";
+  const langLabel = language || "Multi-Audio";
+  const servers = [];
+  if (cleanTmdb) {
+    servers.push({
+      id: `cloud-vidlink-${cleanTmdb}-${se}-${ep}`,
+      provider: "Server 1 \u2022 CinePulse Cloud HD",
+      label: "1080p Cloud HD (Multi-Audio + Subtitles)",
+      url: isTv ? `https://vidlink.pro/tv/${encodeURIComponent(cleanTmdb)}/${se}/${ep}?primaryColor=e50914&autoplay=true` : `https://vidlink.pro/movie/${encodeURIComponent(cleanTmdb)}?primaryColor=e50914&autoplay=true`
+    });
+  }
+  const vfId = cleanTmdb || cleanImdb;
+  if (vfId) {
+    servers.push({
+      id: `cloud-vidfast-${vfId}-${se}-${ep}`,
+      provider: "Server 2 \u2022 CinePulse Fast HD",
+      label: "1080p Fast HLS Auto",
+      url: isTv ? `https://vidfast.pro/tv/${encodeURIComponent(vfId)}/${se}/${ep}?autoPlay=true` : `https://vidfast.pro/movie/${encodeURIComponent(vfId)}?autoPlay=true`
+    });
+  }
+  if (cleanImdb) {
+    servers.push({
+      id: `cloud-vidsrc-${cleanImdb}-${se}-${ep}`,
+      provider: "Server 3 \u2022 CinePulse Ultra HD",
+      label: "1080p Global CDN",
+      url: isTv ? `https://vidsrc.me/embed/tv?imdb=${encodeURIComponent(cleanImdb)}&season=${se}&episode=${ep}` : `https://vidsrc.me/embed/movie?imdb=${encodeURIComponent(cleanImdb)}`
+    });
+    servers.push({
+      id: `cloud-111movies-${cleanImdb}-${se}-${ep}`,
+      provider: "Server 4 \u2022 CinePulse Prime HD",
+      label: "1080p Prime Multi-Server",
+      url: isTv ? `https://111movies.com/tv/${encodeURIComponent(cleanImdb)}/${se}/${ep}` : `https://111movies.com/movie/${encodeURIComponent(cleanImdb)}`
+    });
+  }
+  if (cleanTmdb) {
+    servers.push({
+      id: `cloud-vidnest-${cleanTmdb}-${se}-${ep}`,
+      provider: "Server 5 \u2022 CinePulse Global HD",
+      label: "1080p Global Backup",
+      url: isTv ? `https://vidnest.fun/tv/${encodeURIComponent(cleanTmdb)}/${se}/${ep}` : `https://vidnest.fun/movie/${encodeURIComponent(cleanTmdb)}`
+    });
+  }
+  if (cleanImdb) {
+    servers.push({
+      id: `cloud-2embed-${cleanImdb}-${se}-${ep}`,
+      provider: "Server 6 \u2022 CinePulse Backup HD",
+      label: "720p/1080p Backup Mirror",
+      url: isTv ? `https://www.2embed.cc/embedtv/${encodeURIComponent(cleanImdb)}&s=${se}&e=${ep}` : `https://www.2embed.cc/embed/${encodeURIComponent(cleanImdb)}`
+    });
+  }
+  return servers.map((sv) => ({
+    id: sv.id,
+    quality: 1080,
+    qualityLabel: sv.label,
+    audio: langLabel,
+    audioLanguages: [langLabel],
+    provider: sv.provider,
+    url: sv.url,
+    downloadUrl: "",
+    type: "embed",
+    name: `${title}${epLabel} \u2014 ${sv.provider}`
+  }));
 }
 var mbStartupChunkCache = /* @__PURE__ */ new Map();
 var VIRTUAL_CHUNK_0_BYTES = 768 * 1024;
@@ -3369,6 +3563,11 @@ async function fetchMovieBoxPlayStreams(subjectId, detailPath, seasonNum, epNum,
         provider: `CinePulse HD ${resNum}p`,
         url: proxiedStreamUrl,
         downloadUrl: proxiedDlUrl,
+        directUrl: rawStreamUrl,
+        headers: {
+          Referer: "https://movie-box.co/",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        },
         type: "mp4",
         name: `${title} (${resNum}p MP4 \u2022 ${sizeMb})`
       });
@@ -3394,6 +3593,11 @@ async function fetchMovieBoxPlayStreams(subjectId, detailPath, seasonNum, epNum,
         provider: "CinePulse HD 720p",
         url: proxiedStreamUrl,
         downloadUrl: proxiedDlUrl,
+        directUrl: String(fallbackVideoUrl),
+        headers: {
+          Referer: "https://movie-box.co/",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        },
         type: "mp4",
         name: `${title} (HD MP4)`
       });
@@ -6265,7 +6469,13 @@ async function startServer() {
   const probeCloudflareWorkerHealth = (workerUrl, force = false) => {
     const clean = String(workerUrl || "").trim().replace(/\/+$/, "");
     if (!clean || !/^https?:\/\//i.test(clean)) {
-      return Promise.resolve({ healthy: false, version: 0, checkedAt: Date.now(), reason: "disabled" });
+      return Promise.resolve({
+        healthy: false,
+        version: 0,
+        supportsEpStream: false,
+        checkedAt: Date.now(),
+        reason: "disabled"
+      });
     }
     const existing = workerHealthMap.get(clean);
     if (!force && existing && Date.now() - existing.checkedAt < 6e4) {
@@ -6280,6 +6490,7 @@ async function startServer() {
           const entry2 = {
             healthy: false,
             version: 0,
+            supportsEpStream: false,
             checkedAt: Date.now(),
             reason: `http-${res.status}`
           };
@@ -6288,12 +6499,14 @@ async function startServer() {
         }
         const json = await res.json().catch(() => null);
         const ver = Number(json?.version || 1);
-        const okV2 = Boolean(json?.ok && ver >= 2);
+        const isCinePulseNode = String(json?.service || "").toLowerCase().includes("cinepulse");
+        const okV2 = Boolean(json?.ok && (ver >= 2 || isCinePulseNode));
         const entry = {
           healthy: okV2,
           version: ver,
+          supportsEpStream: isCinePulseNode,
           checkedAt: Date.now(),
-          reason: okV2 ? "active-v2" : "outdated-v1-fallback-server"
+          reason: okV2 ? isCinePulseNode ? "active-node-relay" : "active-v2" : "outdated-v1-fallback-server"
         };
         workerHealthMap.set(clean, entry);
         return entry;
@@ -6301,6 +6514,7 @@ async function startServer() {
         const entry = {
           healthy: false,
           version: 0,
+          supportsEpStream: false,
           checkedAt: Date.now(),
           reason: "unreachable-fallback-server"
         };
@@ -7024,13 +7238,15 @@ async function startServer() {
       targetPath = `/mb/${subjectId}/${slug}`;
     }
     const streamBase = resolveStreamProxyOrigin(base);
+    const streamHealth = streamBase !== base ? workerHealthMap.get(streamBase) : void 0;
     const toTrialUrl = (u) => {
       if (!u || !u.startsWith("/")) return u;
       const sep = u.includes("?") ? "&" : "?";
       const isWorkerEligible = u.startsWith("/api/mb-stream") || u.startsWith("/api/mb-subtitle-srt");
       const isServerEpStream = u.startsWith("/api/mb-ep-stream");
       const needsTk = isWorkerEligible || isServerEpStream;
-      const hostBase = isWorkerEligible ? streamBase : base;
+      const useStreamHost = isWorkerEligible || isServerEpStream && Boolean(streamHealth?.supportsEpStream);
+      const hostBase = useStreamHost ? streamBase : base;
       return `${hostBase}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ""}`;
     };
     try {
@@ -7066,40 +7282,64 @@ async function startServer() {
       const seasons = Array.from(
         new Set((detail.episodes || []).map((e) => e.season).filter((s) => s !== null && s > 0))
       ).sort((a, b) => a - b);
+      const isSeriesDetail = seasons.length > 0 || detail.typeBadge === "SERIES";
+      const firstSe = isSeriesDetail ? seasons[0] || 1 : 0;
+      const firstEp = isSeriesDetail ? detail.episodes?.[0]?.number ?? 1 : 0;
+      const extIds = await Promise.race([
+        resolveExternalMediaIds(detail.title, detail.releaseDate || "", isSeriesDetail),
+        new Promise((r) => setTimeout(() => r({ imdbId: "", tmdbId: "" }), 2200))
+      ]);
+      const embedServers = buildEmbedBackupSources(
+        extIds.imdbId,
+        firstSe,
+        firstEp,
+        detail.title,
+        detail.language || "Original Audio",
+        extIds.tmdbId
+      );
+      const makeEmbedUrl = (seNum, epNum) => `${base}/trial-embed?apiKey=${encodeURIComponent(rec.key)}&subjectId=${encodeURIComponent(
+        resolvedId
+      )}&detailPath=${encodeURIComponent(resolvedSlug)}&se=${seNum}&ep=${epNum}&title=${encodeURIComponent(detail.title)}`;
       sendPrettyDemoJson(res, 200, {
         ok: true,
         source: "official-moviebox-original",
         trial: buildTrialSummary(rec),
         subjectId: resolvedId,
         detailPath: resolvedSlug,
+        imdbId: extIds.imdbId || null,
+        tmdbId: extIds.tmdbId || null,
         totalSeasons: seasons.length || (detail.typeBadge === "SERIES" ? 1 : 0),
         seasons,
         totalEpisodes: detail.episodes?.length || 0,
-        embedPlayerUrl: `${base}/trial-embed?apiKey=${encodeURIComponent(rec.key)}&subjectId=${encodeURIComponent(
-          resolvedId
-        )}&detailPath=${encodeURIComponent(resolvedSlug)}&se=${seasons[0] || 0}&ep=${detail.episodes?.[0]?.number ?? 0}&title=${encodeURIComponent(detail.title)}`,
+        embedPlayerUrl: makeEmbedUrl(firstSe, firstEp),
+        embedServers,
         detail: {
           ...detail,
           dubs: Array.isArray(detail.dubs) ? detail.dubs.map((d) => ({
             ...d,
             detailsEndpoint: d?.path ? `${base}/api/trial/details?path=${encodeURIComponent(d.path)}` : void 0,
-            streamEndpoint: d?.path ? `${base}/api/trial/stream?path=${encodeURIComponent(d.path)}&se=${seasons[0] || 0}&ep=${detail.episodes?.[0]?.number ?? 0}&title=${encodeURIComponent(detail.title)}` : void 0
+            streamEndpoint: d?.path ? `${base}/api/trial/stream?path=${encodeURIComponent(d.path)}&se=${firstSe}&ep=${firstEp}&title=${encodeURIComponent(detail.title)}` : void 0
           })) : void 0,
           downloadButtons: (detail.downloadButtons || []).map((b) => ({
             ...b,
             url: toTrialUrl(b.url)
           })),
-          episodes: (detail.episodes || []).map((ep) => ({
-            ...ep,
-            sources: (ep.sources || []).map((s) => ({
-              ...s,
-              url: toTrialUrl(s.url),
-              downloadUrl: s.downloadUrl ? toTrialUrl(s.downloadUrl) : void 0
-            })),
-            streamEndpoint: `${base}/api/trial/stream?subjectId=${encodeURIComponent(
-              resolvedId
-            )}&detailPath=${encodeURIComponent(resolvedSlug)}&se=${ep.season ?? 0}&ep=${ep.number ?? 0}&title=${encodeURIComponent(detail.title)}`
-          }))
+          episodes: (detail.episodes || []).map((ep) => {
+            const epSe = ep.season ?? (isSeriesDetail ? 1 : 0);
+            const epNo = ep.number ?? (isSeriesDetail ? 1 : 0);
+            return {
+              ...ep,
+              embedPlayerUrl: makeEmbedUrl(epSe, epNo),
+              sources: (ep.sources || []).map((s) => ({
+                ...s,
+                url: toTrialUrl(s.url),
+                downloadUrl: s.downloadUrl ? toTrialUrl(s.downloadUrl) : void 0
+              })),
+              streamEndpoint: `${base}/api/trial/stream?subjectId=${encodeURIComponent(
+                resolvedId
+              )}&detailPath=${encodeURIComponent(resolvedSlug)}&se=${epSe}&ep=${epNo}&title=${encodeURIComponent(detail.title)}`
+            };
+          })
         },
         relatedMovies: relatedRaw.map((item) => ({
           ...item,
@@ -7550,13 +7790,16 @@ async function startServer() {
       }
       const activeDubEntry = dubList.find((d) => String(d?.id) === subjectId);
       const activeAudioLabel = activeDubEntry?.label || streamDetailObj?.language || lang || "Original Audio";
-      const [initialPlayRes, imdbId] = await Promise.all([
+      const isSeriesHint = se > 0 || ep > 0 || streamDetailObj?.typeBadge === "SERIES";
+      const [initialPlayRes, extIds] = await Promise.all([
         fetchMovieBoxPlayStreams(subjectId, detailPath, se, ep, title, activeAudioLabel, ""),
         Promise.race([
-          resolveImdbIdForTitle(title, "", se > 0),
-          new Promise((r) => setTimeout(() => r(""), 650))
+          resolveExternalMediaIds(streamDetailObj?.title || title, streamDetailObj?.releaseDate || "", isSeriesHint),
+          new Promise((r) => setTimeout(() => r({ imdbId: "", tmdbId: "" }), 2200))
         ])
       ]);
+      const imdbId = extIds.imdbId;
+      const tmdbId = extIds.tmdbId;
       let playRes = initialPlayRes;
       let effectiveSe = se;
       let effectiveEp = ep;
@@ -7637,33 +7880,48 @@ async function startServer() {
           (r) => setTimeout(() => r([]), 900)
         )
       ]).catch(() => []);
-      const embedBackups = buildEmbedBackupSources(imdbId, effectiveSe, effectiveEp, title, activeAudioLabel);
+      const embedBackups = buildEmbedBackupSources(
+        imdbId,
+        effectiveSe,
+        effectiveEp,
+        streamDetailObj?.title || title,
+        activeAudioLabel,
+        tmdbId
+      );
       const streamBase = resolveStreamProxyOrigin(base);
+      const streamHealth = streamBase !== base ? workerHealthMap.get(streamBase) : void 0;
+      const sampleDirectMp4Url = playRes.sources.find((s) => s.directUrl)?.directUrl || "";
+      const directProxyWorking = await isDirectMp4CdnReachableFromHost(sampleDirectMp4Url, streamBase !== base);
       const toAbsoluteWithTrialTk = (u) => {
         if (!u.startsWith("/")) return u;
         const sep = u.includes("?") ? "&" : "?";
         const isWorkerEligible = u.startsWith("/api/mb-stream") || u.startsWith("/api/mb-subtitle-srt");
         const isServerEpStream = u.startsWith("/api/mb-ep-stream");
         const needsTk = isWorkerEligible || isServerEpStream;
-        const hostBase = isWorkerEligible ? streamBase : base;
+        const useStreamHost = isWorkerEligible || isServerEpStream && Boolean(streamHealth?.supportsEpStream);
+        const hostBase = useStreamHost ? streamBase : base;
         return `${hostBase}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ""}`;
       };
       const embedPlayerUrl = `${base}/trial-embed?apiKey=${encodeURIComponent(rec.key)}&subjectId=${encodeURIComponent(
         subjectId
-      )}&detailPath=${encodeURIComponent(detailPath)}&se=${effectiveSe}&ep=${effectiveEp}&title=${encodeURIComponent(title)}`;
+      )}&detailPath=${encodeURIComponent(detailPath)}&se=${effectiveSe}&ep=${effectiveEp}&title=${encodeURIComponent(
+        streamDetailObj?.title || title
+      )}`;
       const primarySources = playRes.sources.map((s) => ({
         ...s,
         audio: activeAudioLabel,
         audioLanguages: [activeAudioLabel]
       }));
-      const combinedSources = [...primarySources, ...extraDubSources, ...embedBackups];
+      const combinedSources = directProxyWorking ? [...primarySources, ...extraDubSources, ...embedBackups] : [...embedBackups, ...primarySources, ...extraDubSources];
       sendPrettyDemoJson(res, 200, {
         ok: true,
         source: "official-moviebox-original",
+        playbackMode: directProxyWorking ? "direct-mp4" : "cloud-embed",
+        directProxyWorking,
         trial: buildTrialSummary(rec),
         subjectId,
         detailPath,
-        title,
+        title: streamDetailObj?.title || title,
         activeAudio: activeAudioLabel,
         availableDubs: dubList.map((d) => ({
           id: d.id,
@@ -7675,7 +7933,9 @@ async function startServer() {
         season: effectiveSe,
         episode: effectiveEp,
         imdbId: imdbId || null,
+        tmdbId: tmdbId || null,
         embedPlayerUrl,
+        embedServers: embedBackups,
         directMp4Count: primarySources.length + extraDubSources.length,
         cloudHlsCount: embedBackups.length,
         subtitleCount: captions.length,
@@ -7726,6 +7986,7 @@ async function startServer() {
     const ep = Math.max(0, parseInt(String(req.query.ep || req.query.episode || "0"), 10) || 0);
     let title = String(req.query.title || detailPath).trim();
     const lang = String(req.query.lang || "Original Audio").trim();
+    const preferDirect = String(req.query.mode || "").toLowerCase() === "mp4";
     try {
       if (!subjectId && title && title !== "movie") {
         const searchRes = await fetchMovieBoxCatalog("/", 1, title);
@@ -7737,53 +7998,139 @@ async function startServer() {
           title = searchRes.items[0]?.title || title;
         }
       }
-      let playRes = subjectId ? await fetchMovieBoxPlayStreams(subjectId, detailPath, se, ep, title, lang, "") : { sources: [], buttons: [] };
+      const [playResInitial, extIds] = await Promise.all([
+        subjectId ? fetchMovieBoxPlayStreams(subjectId, detailPath, se, ep, title, lang, "") : Promise.resolve({ sources: [], buttons: [] }),
+        Promise.race([
+          resolveExternalMediaIds(title, "", se > 0 || ep > 0),
+          new Promise((r) => setTimeout(() => r({ imdbId: "", tmdbId: "" }), 2400))
+        ])
+      ]);
+      let playRes = playResInitial;
+      let effSe = se;
+      let effEp = ep;
       if (subjectId && playRes.sources.length === 0 && (se > 0 || ep > 0)) {
         const fbMovie = await fetchMovieBoxPlayStreams(subjectId, detailPath, 0, 0, title, lang, "");
-        if (fbMovie.sources.length > 0) playRes = fbMovie;
+        if (fbMovie.sources.length > 0) {
+          playRes = fbMovie;
+          effSe = 0;
+          effEp = 0;
+        }
       } else if (subjectId && playRes.sources.length === 0 && se === 0 && ep === 0) {
         const fbSeries = await fetchMovieBoxPlayStreams(subjectId, detailPath, 1, 1, title, lang, "");
-        if (fbSeries.sources.length > 0) playRes = fbSeries;
+        if (fbSeries.sources.length > 0) {
+          playRes = fbSeries;
+          effSe = 1;
+          effEp = 1;
+        }
       }
       const embedStreamBase = resolveStreamProxyOrigin(base);
+      const sampleDirectMp4Url = playRes.sources.find((s) => s.directUrl)?.directUrl || "";
+      const directProxyWorking = await isDirectMp4CdnReachableFromHost(sampleDirectMp4Url, embedStreamBase !== base);
       const mp4Sources = (playRes.sources || []).filter((s) => s.url && s.url.startsWith("/api/mb-stream")).map((s) => ({
-        label: `${s.quality}p`,
+        kind: "mp4",
+        label: `Direct MP4 \u2022 ${s.quality}p`,
         url: `${embedStreamBase}${s.url}${s.url.includes("?") ? "&" : "?"}tk=${encodeURIComponent(rec.key)}`
       }));
-      const firstSrc = mp4Sources[0]?.url || "";
+      const cloudServers = buildEmbedBackupSources(extIds.imdbId, effSe, effEp, title, lang, extIds.tmdbId).map((s) => ({
+        kind: "embed",
+        label: s.provider,
+        url: s.url
+      }));
+      const allServers = directProxyWorking || preferDirect || cloudServers.length === 0 ? [...mp4Sources, ...cloudServers] : [...cloudServers, ...mp4Sources];
       const safeTitle = title.replace(/[<>&"']/g, "");
+      const serversJson = JSON.stringify(allServers).replace(/</g, "\\u003c");
       res.send(`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1.0" />
-  <title>${safeTitle} \u2014 CinePulse Trial Embed</title>
+  <title>${safeTitle} \u2014 CinePulse HD Player</title>
   <style>
     * { box-sizing:border-box; }
-    html,body { margin:0; padding:0; width:100%; height:100%; background:#000; color:#fff; font-family:system-ui,sans-serif; overflow:hidden; }
-    .wrap { position:relative; width:100%; height:100%; display:flex; align-items:center; justify-content:center; }
-    video { width:100%; height:100%; object-fit:contain; background:#000; }
-    .bar { position:absolute; top:10px; right:10px; display:flex; gap:6px; align-items:center; z-index:10; }
-    select { background:rgba(15,15,20,.85); color:#fff; border:1px solid rgba(255,255,255,.22); border-radius:6px; padding:5px 8px; font-size:12px; }
-    .tag { background:rgba(229,9,20,.9); color:#fff; font-size:11px; font-weight:700; padding:4px 8px; border-radius:6px; }
+    html,body { margin:0; padding:0; width:100%; height:100%; background:#050608; color:#fff; font-family:system-ui,-apple-system,sans-serif; overflow:hidden; }
+    .wrap { position:relative; width:100%; height:100%; display:flex; align-items:center; justify-content:center; background:#000; }
+    video, iframe { width:100%; height:100%; border:0; background:#000; display:block; }
+    video { object-fit:contain; }
+    .bar { position:absolute; top:10px; right:10px; left:10px; display:flex; justify-content:space-between; align-items:center; gap:8px; z-index:20; pointer-events:none; }
+    .bar > * { pointer-events:auto; }
+    .tag { background:rgba(15,17,24,.82); backdrop-filter:blur(8px); border:1px solid rgba(255,255,255,.14); color:#fff; font-size:11.5px; font-weight:700; padding:5px 10px; border-radius:7px; max-width:52%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .controls { display:flex; gap:6px; align-items:center; }
+    select { background:rgba(15,17,24,.9); backdrop-filter:blur(8px); color:#fff; border:1px solid rgba(255,255,255,.22); border-radius:7px; padding:5px 9px; font-size:12px; font-weight:600; cursor:pointer; max-width:210px; }
+    .next-btn { background:#e50914; color:#fff; border:0; border-radius:7px; padding:6px 10px; font-size:11.5px; font-weight:700; cursor:pointer; white-space:nowrap; }
+    .empty { text-align:center; padding:24px; color:#a1a1aa; font-size:14px; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="bar">
-      <span class="tag">${safeTitle}</span>
-      ${mp4Sources.length > 1 ? `<select id="qSel" onchange="switchQ(this.value)">${mp4Sources.map((s, idx) => `<option value="${s.url}" ${idx === 0 ? "selected" : ""}>${s.label}</option>`).join("")}</select>` : ""}
+      <span class="tag">${safeTitle}${effSe > 0 ? ` \u2022 S${effSe}E${effEp}` : ""}</span>
+      <div class="controls" id="ctrlBar" style="display:none;">
+        <select id="srvSel" onchange="selectServer(Number(this.value))"></select>
+        <button class="next-btn" onclick="nextServer()" title="Switch Server">Next Server</button>
+      </div>
     </div>
-    ${firstSrc ? `<video id="vid" src="${firstSrc}" controls autoplay playsinline preload="metadata"></video>` : `<div style="text-align:center;padding:24px;color:#a1a1aa;">No direct MP4 stream found for this title/episode yet.</div>`}
+    <div id="stage" style="width:100%;height:100%;"></div>
   </div>
   <script>
-    function switchQ(u) {
-      const v = document.getElementById('vid');
-      if (!v) return;
-      const t = v.currentTime || 0;
-      v.src = u;
-      v.addEventListener('loadedmetadata', () => { try { v.currentTime = t; v.play(); } catch(e){} }, { once: true });
+    const SERVERS = ${serversJson};
+    let activeIdx = 0;
+
+    function init() {
+      if (!SERVERS.length) {
+        document.getElementById('stage').innerHTML = '<div class="empty">No stream found for this title/episode yet.</div>';
+        return;
+      }
+      const sel = document.getElementById('srvSel');
+      SERVERS.forEach((s, i) => {
+        const opt = document.createElement('option');
+        opt.value = String(i);
+        opt.textContent = s.label;
+        sel.appendChild(opt);
+      });
+      if (SERVERS.length > 1) document.getElementById('ctrlBar').style.display = 'flex';
+      selectServer(0);
     }
+
+    function nextServer() {
+      if (SERVERS.length < 2) return;
+      selectServer((activeIdx + 1) % SERVERS.length);
+    }
+
+    function selectServer(idx) {
+      if (idx < 0 || idx >= SERVERS.length) return;
+      activeIdx = idx;
+      const sel = document.getElementById('srvSel');
+      if (sel) sel.value = String(idx);
+      const s = SERVERS[idx];
+      const stage = document.getElementById('stage');
+      stage.innerHTML = '';
+
+      if (s.kind === 'mp4') {
+        const v = document.createElement('video');
+        v.controls = true;
+        v.autoplay = true;
+        v.playsInline = true;
+        v.preload = 'metadata';
+        v.src = s.url;
+        v.onerror = function() {
+          const fallbackEmbedIdx = SERVERS.findIndex((item) => item.kind === 'embed');
+          if (fallbackEmbedIdx !== -1 && fallbackEmbedIdx !== activeIdx) {
+            selectServer(fallbackEmbedIdx);
+          }
+        };
+        stage.appendChild(v);
+        v.play().catch(function(){});
+      } else {
+        const f = document.createElement('iframe');
+        f.src = s.url;
+        f.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';
+        f.allowFullscreen = true;
+        f.setAttribute('referrerpolicy', 'origin');
+        stage.appendChild(f);
+      }
+    }
+
+    init();
   </script>
 </body>
 </html>`);
@@ -7950,7 +8297,7 @@ async function startServer() {
               <button class="sec sm" onclick="closePreviewPlayer()">Close</button>
             </div>
           </div>
-          <video id="previewVideo" controls playsinline style="width:100%;max-height:360px;background:#000;border-radius:10px;"></video>
+          <div id="previewStage" style="width:100%;aspect-ratio:16/9;background:#000;border-radius:10px;overflow:hidden;"></div>
         </div>
 
         <div class="card">
@@ -8000,13 +8347,15 @@ async function startServer() {
       const box = document.getElementById('snippetBox');
       if (snippetMode === 'widget') {
         box.textContent = [
-          '<!-- Direct MovieBox API + HTML5 MP4 Player -->',
+          '<!-- Universal MovieBox API + Self-Healing Multi-Server HD Player -->',
           '<div id="cp-moviebox-widget" style="background:#0b0c10;color:#fff;padding:16px;border-radius:12px;font-family:sans-serif">',
           '  <div style="display:flex;gap:8px;margin-bottom:12px">',
           '    <input id="cp-q" placeholder="Search Movie / Series..." style="flex:1;padding:10px;border-radius:8px;border:1px solid #333;background:#14161d;color:#fff" />',
           '    <button onclick="cpLoadMovies()" style="background:#e50914;color:#fff;border:0;padding:10px 16px;border-radius:8px;cursor:pointer;font-weight:700">Search</button>',
           '  </div>',
-          '  <video id="cp-video" controls autoplay playsinline style="display:none;width:100%;max-height:420px;background:#000;border-radius:10px;margin-bottom:14px"></video>',
+          '  <div id="cp-player-wrap" style="display:none;width:100%;aspect-ratio:16/9;background:#000;border-radius:10px;overflow:hidden;margin-bottom:14px">',
+          '    <iframe id="cp-iframe" style="width:100%;height:100%;border:0" allowfullscreen allow="autoplay; fullscreen; encrypted-media"></iframe>',
+          '  </div>',
           '  <div id="cp-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px"></div>',
           '</div>',
           '<script>',
@@ -8032,29 +8381,30 @@ async function startServer() {
           '  var q = m.path ? ("path=" + encodeURIComponent(m.path)) : ("title=" + encodeURIComponent(m.title));',
           '  const r = await fetch(CP_API + "/api/trial/stream?" + q + "&se=" + (isMovie ? 0 : 1) + "&ep=" + (isMovie ? 0 : 1), { headers: { "X-API-Key": CP_KEY } });',
           '  const d = await r.json();',
-          '  const mp4 = (d.sources || []).find(function(s){ return s.type === "mp4" && s.url; });',
-          '  if (!mp4) return;',
-          '  const v = document.getElementById("cp-video");',
-          '  v.style.display = "block"; v.src = mp4.url; v.play();',
+          '  if (!d.embedPlayerUrl) return;',
+          '  document.getElementById("cp-player-wrap").style.display = "block";',
+          '  document.getElementById("cp-iframe").src = d.embedPlayerUrl;',
           '}',
           'cpLoadMovies();',
           '</' + 'script>',
         ].join('\\n');
       } else if (snippetMode === 'android') {
         box.textContent = [
-          '// Android OkHttp + ExoPlayer Example (Kotlin)',
-          'val client = OkHttpClient()',
-          'val req = Request.Builder()',
-          '  .url("' + SHARE_BASE + '/api/trial/stream?title=Squid+Game&se=1&ep=1")',
-          '  .addHeader("X-API-Key", "' + k + '")',
-          '  .build()',
-          '// Parse JSON -> sources[0].url -> pass directly to ExoPlayer:',
-          '// val mediaItem = MediaItem.fromUri(streamUrl)',
-          '// exoPlayer.setMediaItem(mediaItem); exoPlayer.prepare(); exoPlayer.play()',
+          '// Android APK: Option 1 (Direct MP4 in ExoPlayer \u2014 ZERO Server Block!)',
+          '// GET ' + SHARE_BASE + '/api/trial/stream?title=Squid+Game&se=1&ep=1  (Header: X-API-Key: ' + k + ')',
+          '// Pick any source with type == "mp4", read source.directUrl + source.headers:',
+          'val dataSourceFactory = DefaultHttpDataSource.Factory()',
+          '  .setDefaultRequestProperties(mapOf("Referer" to "https://movie-box.co/"))',
+          'val mediaSource = ProgressiveMediaSource.Factory(dataSourceFactory)',
+          '  .createMediaSource(MediaItem.fromUri(directUrl))',
+          'exoPlayer.setMediaSource(mediaSource); exoPlayer.prepare(); exoPlayer.play()',
+          '',
+          '// Android APK: Option 2 (Universal Multi-Server HD WebView Player):',
+          '// webView.loadUrl(response.embedPlayerUrl) // Plays all 6 HD Cloud Servers automatically!',
         ].join('\\n');
       } else if (snippetMode === 'iframe') {
         const title = encodeURIComponent(val('titleInput') || 'Squid Game');
-        box.textContent = '<iframe src="' + SHARE_BASE + '/trial-embed?apiKey=' + k + '&title=' + title + '&se=1&ep=1" width="100%" height="460" allowfullscreen frameborder="0"></iframe>';
+        box.textContent = '<iframe src="' + SHARE_BASE + '/trial-embed?apiKey=' + k + '&title=' + title + '&se=1&ep=1" width="100%" height="460" allowfullscreen allow="autoplay; fullscreen; encrypted-media" frameborder="0"></iframe>';
       } else if (snippetMode === 'curl') {
         box.textContent = 'curl -H "X-API-Key: ' + k + '" "' + url + '"';
       } else {
@@ -8112,38 +8462,78 @@ async function startServer() {
         errEl.style.display = 'block';
       }
     }
+    let previewItems = [];
+    function renderPreviewItem(item, autoPlay) {
+      const stage = document.getElementById('previewStage');
+      stage.innerHTML = '';
+      if (!item) return;
+      if (item.type === 'mp4') {
+        const vid = document.createElement('video');
+        vid.controls = true;
+        vid.playsInline = true;
+        vid.style.cssText = 'width:100%;height:100%;object-fit:contain;background:#000;';
+        vid.src = item.url;
+        vid.onerror = function() {
+          const fallback = previewItems.find(function(x) { return x.type === 'embed'; });
+          if (fallback) {
+            document.getElementById('previewQualitySel').value = String(previewItems.indexOf(fallback));
+            renderPreviewItem(fallback, true);
+          }
+        };
+        stage.appendChild(vid);
+        if (autoPlay) vid.play().catch(function(){});
+      } else {
+        const ifr = document.createElement('iframe');
+        ifr.src = item.url;
+        ifr.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';
+        ifr.allowFullscreen = true;
+        ifr.style.cssText = 'width:100%;height:100%;border:0;background:#000;';
+        stage.appendChild(ifr);
+      }
+    }
     function showPreviewPlayer(parsed, autoPlay) {
-      const mp4s = (parsed.sources || []).filter(function(s) { return s.type === 'mp4' && s.url; });
-      if (!mp4s.length) return;
+      const list = [];
+      if (parsed.embedPlayerUrl) {
+        list.push({ type: 'embed', label: 'Universal HD Player (All 6 Servers)', url: parsed.embedPlayerUrl });
+      }
+      (parsed.sources || []).forEach(function(s) {
+        if (!s || !s.url) return;
+        if (s.type === 'mp4') {
+          list.push({ type: 'mp4', label: (s.quality || 'HD') + 'p Direct MP4', url: s.url });
+        } else if (s.type === 'embed') {
+          list.push({ type: 'embed', label: s.provider || s.name || 'Cloud HD', url: s.url });
+        }
+      });
+      if (!list.length) return;
+      previewItems = list;
       const box = document.getElementById('previewPlayerBox');
       const titleEl = document.getElementById('previewTitle');
       const sel = document.getElementById('previewQualitySel');
-      const vid = document.getElementById('previewVideo');
       titleEl.textContent = (parsed.title || 'MovieBox Preview') + (parsed.season ? ' (S' + parsed.season + ' E' + parsed.episode + ')' : '');
       sel.innerHTML = '';
-      mp4s.forEach(function(s, idx) {
+      list.forEach(function(item, idx) {
         const opt = document.createElement('option');
-        opt.value = s.url;
-        opt.textContent = (s.quality || 'HD') + 'p MP4';
+        opt.value = String(idx);
+        opt.textContent = item.label;
         if (idx === 0) opt.selected = true;
         sel.appendChild(opt);
       });
       box.style.display = 'block';
-      vid.src = mp4s[0].url;
-      if (autoPlay) vid.play().catch(function(){});
+      const startIdx = parsed.directProxyWorking
+        ? Math.max(0, list.findIndex(function(x) { return x.type === 'mp4'; }))
+        : 0;
+      sel.value = String(startIdx);
+      renderPreviewItem(list[startIdx], autoPlay);
     }
     function switchPreviewQuality() {
       const sel = document.getElementById('previewQualitySel');
-      const vid = document.getElementById('previewVideo');
-      if (!sel.value) return;
-      const t = vid.currentTime || 0;
-      vid.src = sel.value;
-      vid.onloadedmetadata = function() { try { vid.currentTime = t; } catch {} vid.play().catch(function(){}); };
+      const idx = Number(sel.value);
+      if (Number.isFinite(idx) && previewItems[idx]) {
+        renderPreviewItem(previewItems[idx], true);
+      }
     }
     function closePreviewPlayer() {
-      const vid = document.getElementById('previewVideo');
-      vid.pause();
-      vid.removeAttribute('src');
+      document.getElementById('previewStage').innerHTML = '';
       document.getElementById('previewPlayerBox').style.display = 'none';
     }
     async function callTrial(path, autoPlay) {
@@ -10841,14 +11231,16 @@ ${recoveredNames.slice(0, 30).join("\n")}
       `);
     }
   });
-  app.get("/api/health", (_req, res) => {
+  app.get(["/api/health", "/health"], (_req, res) => {
     const configuredWorker = getConfiguredWorkerUrl();
     const workerHealth = configuredWorker ? workerHealthMap.get(configuredWorker) : void 0;
     const activeVideoProxy = resolveStreamProxyOrigin("");
     res.status(200).json({
       ok: true,
+      version: 3,
       service: "CinePulse HD",
-      videoProxyMode: activeVideoProxy ? "cloudflare-worker-v2" : "direct-server-proxy",
+      multiServerCloudPlayer: true,
+      videoProxyMode: activeVideoProxy ? workerHealth?.supportsEpStream ? "cloud-node-relay" : "cloudflare-worker-v2" : "universal-multi-server-hd",
       videoProxyActive: Boolean(activeVideoProxy),
       videoProxyHost: activeVideoProxy ? activeVideoProxy.replace(/^https?:\/\//i, "") : null,
       workerStatus: !configuredWorker ? "disabled" : workerHealth?.reason || "checking",
