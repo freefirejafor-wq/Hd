@@ -912,14 +912,20 @@ function storeDetailInCaches(itemPath, det, expiresAt) {
     pruneCacheMap(detailCache, 180);
     detailCache.set(itemPath, { data: det, expiresAt: safeExpiresAt });
   }
-  if (det.title && det.episodes?.length) {
-    pruneCacheMap(detailTitleCache, 240);
+  if (det.title) {
+    pruneCacheMap(detailTitleCache, 320);
     const isMbSource = Boolean(itemPath.startsWith("/mb/") || det.url?.startsWith("/mb/"));
     const scopePrefix = isMbSource ? "mb::" : "ml::";
-    const canon = getCanonicalTitleKey(det.title);
-    if (canon) detailTitleCache.set(`${scopePrefix}${canon}`, { data: det, expiresAt: safeExpiresAt });
-    const base = extractBaseSeriesTitle(det.title).toLowerCase();
-    if (base) detailTitleCache.set(`${scopePrefix}${base}`, { data: det, expiresAt: safeExpiresAt });
+    const exactLower = det.title.trim().toLowerCase();
+    if (exactLower && isMbSource) {
+      detailTitleCache.set(`mb-exact::${exactLower}`, { data: det, expiresAt: safeExpiresAt });
+    }
+    if (det.episodes?.length) {
+      const canon = getCanonicalTitleKey(det.title);
+      if (canon) detailTitleCache.set(`${scopePrefix}${canon}`, { data: det, expiresAt: safeExpiresAt });
+      const base = extractBaseSeriesTitle(det.title).toLowerCase();
+      if (base) detailTitleCache.set(`${scopePrefix}${base}`, { data: det, expiresAt: safeExpiresAt });
+    }
   }
 }
 function findCachedDetailByPathOrTitle(itemPath, rawTitle = "") {
@@ -942,6 +948,11 @@ function findCachedDetailByPathOrTitle(itemPath, rawTitle = "") {
     return null;
   }
   if (rawTitle) {
+    const exactLower = rawTitle.trim().toLowerCase();
+    const byMbExact = exactLower ? detailTitleCache.get(`mb-exact::${exactLower}`) : void 0;
+    if (byMbExact && byMbExact.expiresAt > now && byMbExact.data?.url?.startsWith("/mb/")) {
+      return byMbExact.data;
+    }
     const canon = getCanonicalTitleKey(rawTitle);
     for (const pfx of ["mb::", "ml::", ""]) {
       const byCanon = canon ? detailTitleCache.get(`${pfx}${canon}`) : void 0;
@@ -3130,10 +3141,134 @@ async function fetchMovieBoxCatalog(rawPath, page = 1, search = "") {
   }
   return { items: cards, maxPage };
 }
+function stripNoiseFromMediaTitle(rawTitle) {
+  return extractBaseSeriesTitle(String(rawTitle || "")).replace(/\[[^\]]*\]/g, " ").replace(/\((?:19|20)\d{2}\)/g, " ").replace(/\bS\d+(?:\s*[-–]\s*S?\d+)?\b/gi, " ").replace(/\b(Full\s*HD|HD|1080p|720p|480p|CAM|HDCAM|TS|WEB-?DL|HDRip|Dual\s*Audio)\b/gi, " ").replace(/\s{2,}/g, " ").trim();
+}
+function computeTitleSimilarityScore(candidateTitle, requestedTitle) {
+  const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const tokenize = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().split(/\s+/).filter((w) => w.length >= 2);
+  const aClean = stripNoiseFromMediaTitle(candidateTitle);
+  const bClean = stripNoiseFromMediaTitle(requestedTitle);
+  const aNorm = norm(aClean);
+  const bNorm = norm(bClean);
+  if (!aNorm || !bNorm) return 0;
+  if (aNorm === bNorm) return 100;
+  const aToks = tokenize(aClean);
+  const bToks = tokenize(bClean);
+  if (aToks.length > 0 && bToks.length > 0) {
+    const aSet = new Set(aToks);
+    const bSet = new Set(bToks);
+    let overlap = 0;
+    for (const t of bSet) {
+      if (aSet.has(t)) overlap++;
+    }
+    const union = (/* @__PURE__ */ new Set([...aSet, ...bSet])).size || 1;
+    const jaccard = overlap / union;
+    const recall = overlap / bSet.size;
+    const precision = overlap / aSet.size;
+    if (jaccard >= 0.85) return 90;
+    if (jaccard >= 0.65) return 75;
+    if (jaccard >= 0.5 && recall >= 0.6 && precision >= 0.5) return 60;
+    if (bSet.size >= 2 && overlap >= 2 && (recall >= 0.7 || precision >= 0.7) && jaccard >= 0.45) return 52;
+  }
+  const minLen = Math.min(aNorm.length, bNorm.length);
+  const maxLen = Math.max(aNorm.length, bNorm.length);
+  if (minLen >= 4 && minLen / maxLen >= 0.68 && (aNorm.includes(bNorm) || bNorm.includes(aNorm))) {
+    return 65;
+  }
+  return 0;
+}
+async function resolveMovieBoxSubjectByTitle(requestedTitle, se, ep) {
+  const trimmed = String(requestedTitle || "").trim();
+  if (!trimmed || trimmed.toLowerCase() === "movie") return null;
+  const cachedExact = findCachedDetailByPathOrTitle("", trimmed);
+  if (cachedExact && cachedExact.url?.startsWith("/mb/")) {
+    const cachedSim = computeTitleSimilarityScore(cachedExact.title || "", trimmed);
+    const reqHasBracket = /\[[^\]]+\]/.test(trimmed);
+    const reqBracket = (trimmed.match(/\[([^\]]+)\]/)?.[1] || "").toLowerCase();
+    const cachedBracket = ((cachedExact.title || "").match(/\[([^\]]+)\]/)?.[1] || "").toLowerCase();
+    const bracketCompatible = !reqHasBracket || !cachedBracket || reqBracket === cachedBracket;
+    if (cachedSim >= 85 && bracketCompatible) {
+      const segs2 = cachedExact.url.replace(/^\/mb\//, "").split("/");
+      if (segs2[0]) {
+        return {
+          subjectId: segs2[0],
+          detailPath: segs2[1] || "movie",
+          title: cachedExact.title || trimmed,
+          releaseDate: cachedExact.releaseDate || "",
+          isSeries: cachedExact.typeBadge === "SERIES"
+        };
+      }
+    }
+  }
+  const cleaned = stripNoiseFromMediaTitle(trimmed);
+  const queries = Array.from(new Set([trimmed, cleaned].filter((q) => q && q.length >= 2)));
+  const candidates = [];
+  const seenPaths = /* @__PURE__ */ new Set();
+  for (const q of queries) {
+    try {
+      const res = await fetchMovieBoxCatalog("/", 1, q);
+      for (const it of res.items || []) {
+        if (it?.path?.startsWith("/mb/") && !seenPaths.has(it.path)) {
+          seenPaths.add(it.path);
+          candidates.push(it);
+        }
+      }
+      if (candidates.some((c) => computeTitleSimilarityScore(c.title || "", trimmed) >= 95)) {
+        break;
+      }
+    } catch {
+    }
+  }
+  if (!candidates.length) return null;
+  const wantSeries = se > 0 || ep > 0;
+  const wantMovieExplicit = /\bthe\s+movie\b/i.test(trimmed);
+  const wantYear = parseInt(trimmed.match(/\b((?:19|20)\d{2})\b/)?.[1] || "", 10) || 0;
+  const reqLangTag = (trimmed.match(/\[(Hindi|Bangla|Bengali|Urdu|Tamil|Telugu|English)\]/i)?.[1] || "").toLowerCase();
+  let best = null;
+  for (const item of candidates) {
+    const sim = computeTitleSimilarityScore(item.title || "", trimmed);
+    if (sim < 55) continue;
+    let score = sim;
+    const itemTitle = String(item.title || "");
+    const itemIsSeries = item.typeBadge === "SERIES" || /\bS\d+(?:-S?\d+)?\b/i.test(itemTitle);
+    const itemLangTag = (itemTitle.match(/\[(Hindi|Bangla|Bengali|Urdu|Tamil|Telugu|English)\]/i)?.[1] || "").toLowerCase();
+    const itemYear = parseInt(itemTitle.match(/\b((?:19|20)\d{2})\b/)?.[1] || String(item.year || item.releaseDate || ""), 10) || 0;
+    if (wantMovieExplicit && itemIsSeries) score -= 35;
+    else if (wantSeries && itemIsSeries) score += 15;
+    else if (!wantSeries && !itemIsSeries) score += 15;
+    else if (!wantSeries && itemIsSeries) score -= 12;
+    if (reqLangTag) {
+      if (itemLangTag === reqLangTag) score += 12;
+      else if (itemLangTag && itemLangTag !== reqLangTag) score -= 8;
+    } else if (!itemLangTag) {
+      score += 6;
+    }
+    if (wantYear > 1900 && itemYear > 1900) {
+      if (Math.abs(itemYear - wantYear) <= 1) score += 18;
+      else if (Math.abs(itemYear - wantYear) >= 3) score -= 22;
+    }
+    if (!best || score > best.score) {
+      best = { item, score, sim };
+    }
+  }
+  if (!best || best.score < 50) return null;
+  const segs = best.item.path.replace(/^\/mb\//, "").split("/");
+  if (!segs[0]) return null;
+  const matchedYear = (best.item.title || "").match(/\b((?:19|20)\d{2})\b/)?.[1] || String(best.item.year || best.item.releaseDate || "");
+  return {
+    subjectId: segs[0],
+    detailPath: segs[1] || "movie",
+    title: best.item.title || trimmed,
+    releaseDate: matchedYear,
+    isSeries: best.item.typeBadge === "SERIES"
+  };
+}
 async function resolveImdbIdForTitle(rawTitle, releaseDateStr = "", isSeries = false) {
-  const cleanTitle = extractBaseSeriesTitle(rawTitle).replace(/\b(19|20)\d{2}\b/g, "").replace(/\s{2,}/g, " ").trim();
+  const cleanTitle = stripNoiseFromMediaTitle(rawTitle).replace(/\b(19|20)\d{2}\b/g, "").replace(/\s{2,}/g, " ").trim();
   if (!cleanTitle || cleanTitle.length < 2) return "";
-  const cacheKey = `${cleanTitle.toLowerCase()}::${isSeries ? "tv" : "movie"}`;
+  const wantYear = parseInt(String(releaseDateStr || "").slice(0, 4), 10) || parseInt(String(rawTitle || "").match(/\b((?:19|20)\d{2})\b/)?.[1] || "", 10) || 0;
+  const cacheKey = `${cleanTitle.toLowerCase()}::${wantYear || "any"}::${isSeries ? "tv" : "movie"}`;
   const cached = imdbIdCache.get(cacheKey);
   if (cached !== void 0) return cached;
   try {
@@ -3151,20 +3286,21 @@ async function resolveImdbIdForTitle(rawTitle, releaseDateStr = "", isSeries = f
       imdbIdCache.set(cacheKey, "");
       return "";
     }
-    const wantYear = parseInt(String(releaseDateStr || "").slice(0, 4), 10) || 0;
-    const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-    const wantNorm = norm(cleanTitle);
     const scored = list.map((item) => {
-      let sc = 0;
-      const itemNorm = norm(item.l || "");
-      if (itemNorm === wantNorm) sc += 50;
-      else if (itemNorm.includes(wantNorm) || wantNorm.includes(itemNorm)) sc += 25;
+      const sim = computeTitleSimilarityScore(item.l || "", cleanTitle);
+      if (sim < 55) return { id: String(item.id), sc: -1 };
+      let sc = sim;
       const qStr = String(item.q || item.qid || "").toLowerCase();
       const itemIsTv = qStr.includes("tv") || qStr.includes("series") || qStr.includes("mini");
-      if (isSeries === itemIsTv) sc += 30;
-      if (wantYear > 1900 && item.y && Math.abs(Number(item.y) - wantYear) <= 1) sc += 25;
+      if (isSeries === itemIsTv) sc += 25;
+      else sc -= 15;
+      if (wantYear > 1900 && item.y) {
+        const diff = Math.abs(Number(item.y) - wantYear);
+        if (diff <= 1) sc += 25;
+        else if (diff >= 3) sc -= 22;
+      }
       return { id: String(item.id), sc };
-    });
+    }).filter((x) => x.sc >= 50);
     scored.sort((a, b) => b.sc - a.sc);
     const bestId = scored[0]?.id || "";
     if (bestId) {
@@ -3229,16 +3365,14 @@ async function resolveCinemetaSeriesSeasons(imdbId) {
 }
 var externalIdsCache = /* @__PURE__ */ new Map();
 async function resolveExternalMediaIds(rawTitle, releaseDateStr = "", isSeries = false) {
-  const cleanTitle = extractBaseSeriesTitle(rawTitle).replace(/\b(19|20)\d{2}\b/g, "").replace(/\s{2,}/g, " ").trim();
+  const cleanTitle = stripNoiseFromMediaTitle(rawTitle).replace(/\b(19|20)\d{2}\b/g, "").replace(/\s{2,}/g, " ").trim();
   if (!cleanTitle || cleanTitle.length < 2) return { imdbId: "", tmdbId: "" };
-  const cacheKey = `${cleanTitle.toLowerCase()}::${isSeries ? "tv" : "movie"}`;
+  const wantYear = parseInt(String(releaseDateStr || "").slice(0, 4), 10) || parseInt(String(rawTitle || "").match(/\b((?:19|20)\d{2})\b/)?.[1] || "", 10) || 0;
+  const cacheKey = `${cleanTitle.toLowerCase()}::${wantYear || "any"}::${isSeries ? "tv" : "movie"}`;
   const cached = externalIdsCache.get(cacheKey);
   if (cached) return cached;
   const cmType = isSeries ? "series" : "movie";
   const altType = isSeries ? "movie" : "series";
-  const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-  const wantNorm = norm(cleanTitle);
-  const wantYear = parseInt(String(releaseDateStr || "").slice(0, 4), 10) || 0;
   const searchCinemeta = async (type) => {
     try {
       const r = await fetch(
@@ -3252,15 +3386,18 @@ async function resolveExternalMediaIds(rawTitle, releaseDateStr = "", isSeries =
       const j = await r.json();
       const metas = Array.isArray(j?.metas) ? j.metas : [];
       if (!metas.length) return { imdbId: "", tmdbId: "" };
-      const scored = metas.slice(0, 8).map((m) => {
-        let sc = 0;
-        const mNorm = norm(m?.name || "");
-        if (mNorm === wantNorm) sc += 60;
-        else if (mNorm.includes(wantNorm) || wantNorm.includes(mNorm)) sc += 30;
+      const scored = metas.slice(0, 10).map((m) => {
+        const sim = computeTitleSimilarityScore(m?.name || "", cleanTitle);
+        if (sim < 55) return { imdbId: "", sc: -1 };
+        let sc = sim;
         const y = parseInt(String(m?.releaseInfo || m?.year || "").slice(0, 4), 10) || 0;
-        if (wantYear > 1900 && y > 1900 && Math.abs(y - wantYear) <= 1) sc += 25;
+        if (wantYear > 1900 && y > 1900) {
+          const diff = Math.abs(y - wantYear);
+          if (diff <= 1) sc += 25;
+          else if (diff >= 3) sc -= 22;
+        }
         return { imdbId: String(m?.imdb_id || m?.id || ""), sc };
-      });
+      }).filter((x) => x.sc >= 50 && x.imdbId.startsWith("tt"));
       scored.sort((a, b) => b.sc - a.sc);
       const topImdb = scored[0]?.imdbId || "";
       if (!topImdb.startsWith("tt")) return { imdbId: "", tmdbId: "" };
@@ -7312,6 +7449,11 @@ async function startServer() {
         embedServers,
         detail: {
           ...detail,
+          subjectId: resolvedId,
+          id: resolvedId,
+          detailPath: resolvedSlug,
+          imdbId: extIds.imdbId || null,
+          tmdbId: extIds.tmdbId || null,
           dubs: Array.isArray(detail.dubs) ? detail.dubs.map((d) => ({
             ...d,
             detailsEndpoint: d?.path ? `${base}/api/trial/details?path=${encodeURIComponent(d.path)}` : void 0,
@@ -7738,22 +7880,14 @@ async function startServer() {
     const lang = String(req.query.lang || "Original Audio").trim();
     try {
       if (!subjectId && title && title !== "movie") {
-        let searchRes = await fetchMovieBoxCatalog("/", 1, title);
-        if (!searchRes.items.length) {
-          const cleanTitle = title.replace(/\s*(Full\s*HD|HD|1080p|720p)\s*$/i, "").replace(/\s*\(\d{4}\)\s*/g, " ").trim();
-          if (cleanTitle && cleanTitle !== title) {
-            searchRes = await fetchMovieBoxCatalog("/", 1, cleanTitle);
-          }
-        }
-        const firstPath = searchRes.items[0]?.path || "";
-        if (firstPath.startsWith("/mb/")) {
-          const segs = firstPath.replace(/^\/mb\//, "").split("/");
-          subjectId = segs[0] || "";
-          detailPath = segs[1] || detailPath;
-          title = searchRes.items[0]?.title || title;
+        const matched = await resolveMovieBoxSubjectByTitle(title, se, ep);
+        if (matched) {
+          subjectId = matched.subjectId;
+          detailPath = matched.detailPath || detailPath;
+          title = matched.title || title;
         }
       }
-      if (!subjectId) {
+      if (!subjectId && (!title || title === "movie")) {
         sendPrettyDemoJson(res, 400, {
           ok: false,
           error: "Provide ?path=/mb/<id>/<slug>, ?subjectId=<id>&detailPath=<slug>, or ?title=<name>",
@@ -7763,13 +7897,13 @@ async function startServer() {
       }
       const requestedLangRaw = String(req.query.lang || "").trim();
       const requestedLangLower = requestedLangRaw.toLowerCase();
-      const streamMbPath = `/mb/${subjectId}/${detailPath}`;
-      const cachedDetailForStream = findCachedDetailByPathOrTitle(streamMbPath, title);
-      const streamDetailObj = cachedDetailForStream && cachedDetailForStream.url?.startsWith("/mb/") ? cachedDetailForStream : await Promise.race([
+      const streamMbPath = subjectId ? `/mb/${subjectId}/${detailPath}` : "";
+      const cachedDetailForStream = streamMbPath ? findCachedDetailByPathOrTitle(streamMbPath, title) : null;
+      const streamDetailObj = cachedDetailForStream && cachedDetailForStream.url?.startsWith("/mb/") ? cachedDetailForStream : subjectId ? await Promise.race([
         fetchMovieBoxDetail(streamMbPath),
         new Promise((r) => setTimeout(() => r(null), 1600))
-      ]).catch(() => null);
-      if (streamDetailObj) {
+      ]).catch(() => null) : null;
+      if (streamDetailObj && streamMbPath) {
         storeDetailInCaches(streamMbPath, streamDetailObj, Date.now() + 12 * 6e4);
       }
       const dubList = Array.isArray(streamDetailObj?.dubs) ? streamDetailObj.dubs : [];
@@ -7789,7 +7923,7 @@ async function startServer() {
       const activeAudioLabel = activeDubEntry?.label || streamDetailObj?.language || lang || "Original Audio";
       const isSeriesHint = se > 0 || ep > 0 || streamDetailObj?.typeBadge === "SERIES";
       const [initialPlayRes, extIds] = await Promise.all([
-        fetchMovieBoxPlayStreams(subjectId, detailPath, se, ep, title, activeAudioLabel, ""),
+        subjectId ? fetchMovieBoxPlayStreams(subjectId, detailPath, se, ep, title, activeAudioLabel, "") : Promise.resolve({ sources: [], buttons: [], streamId: "" }),
         Promise.race([
           resolveExternalMediaIds(streamDetailObj?.title || title, streamDetailObj?.releaseDate || "", isSeriesHint),
           new Promise((r) => setTimeout(() => r({ imdbId: "", tmdbId: "" }), 2200))
@@ -7800,7 +7934,7 @@ async function startServer() {
       let playRes = initialPlayRes;
       let effectiveSe = se;
       let effectiveEp = ep;
-      if (playRes.sources.length === 0 && se > 1) {
+      if (subjectId && playRes.sources.length === 0 && se > 1) {
         const fbSe1 = await fetchMovieBoxPlayStreams(subjectId, detailPath, 1, ep || 1, title, activeAudioLabel, "");
         if (fbSe1.sources.length > 0) {
           playRes = fbSe1;
@@ -7808,14 +7942,14 @@ async function startServer() {
           effectiveEp = ep || 1;
         }
       }
-      if (playRes.sources.length === 0 && (se > 0 || ep > 0)) {
+      if (subjectId && playRes.sources.length === 0 && (se > 0 || ep > 0)) {
         const fbMovie = await fetchMovieBoxPlayStreams(subjectId, detailPath, 0, 0, title, activeAudioLabel, "");
         if (fbMovie.sources.length > 0) {
           playRes = fbMovie;
           effectiveSe = 0;
           effectiveEp = 0;
         }
-      } else if (playRes.sources.length === 0 && se === 0 && ep === 0) {
+      } else if (subjectId && playRes.sources.length === 0 && se === 0 && ep === 0) {
         const fbSeries = await fetchMovieBoxPlayStreams(subjectId, detailPath, 1, 1, title, activeAudioLabel, "");
         if (fbSeries.sources.length > 0) {
           playRes = fbSeries;
@@ -7865,7 +7999,7 @@ async function startServer() {
           }
         }
       }
-      const captions = await Promise.race([
+      const captions = subjectId ? await Promise.race([
         fetchMovieBoxOfficialCaptions(
           subjectId,
           detailPath,
@@ -7876,7 +8010,7 @@ async function startServer() {
         new Promise(
           (r) => setTimeout(() => r([]), 900)
         )
-      ]).catch(() => []);
+      ]).catch(() => []) : [];
       const embedBackups = buildEmbedBackupSources(
         imdbId,
         effectiveSe,
@@ -7899,11 +8033,17 @@ async function startServer() {
         const hostBase = useStreamHost ? streamBase : base;
         return `${hostBase}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ""}`;
       };
-      const embedPlayerUrl = `${base}/trial-embed?apiKey=${encodeURIComponent(rec.key)}&subjectId=${encodeURIComponent(
-        subjectId
-      )}&detailPath=${encodeURIComponent(detailPath)}&se=${effectiveSe}&ep=${effectiveEp}&title=${encodeURIComponent(
-        streamDetailObj?.title || title
-      )}`;
+      const embedParams = new URLSearchParams({
+        apiKey: rec.key,
+        se: String(effectiveSe),
+        ep: String(effectiveEp),
+        title: streamDetailObj?.title || title
+      });
+      if (subjectId) {
+        embedParams.set("subjectId", subjectId);
+        if (detailPath) embedParams.set("detailPath", detailPath);
+      }
+      const embedPlayerUrl = `${base}/trial-embed?${embedParams.toString()}`;
       const primarySources = playRes.sources.map((s) => ({
         ...s,
         audio: activeAudioLabel,
@@ -7985,20 +8125,29 @@ async function startServer() {
     const lang = String(req.query.lang || "Original Audio").trim();
     const preferDirect = String(req.query.mode || "").toLowerCase() === "mp4";
     try {
+      let resolvedReleaseDate = "";
+      let resolvedIsSeries = se > 0 || ep > 0;
       if (!subjectId && title && title !== "movie") {
-        const searchRes = await fetchMovieBoxCatalog("/", 1, title);
-        const firstPath = searchRes.items[0]?.path || "";
-        if (firstPath.startsWith("/mb/")) {
-          const segs = firstPath.replace(/^\/mb\//, "").split("/");
-          subjectId = segs[0] || "";
-          detailPath = segs[1] || detailPath;
-          title = searchRes.items[0]?.title || title;
+        const matched = await resolveMovieBoxSubjectByTitle(title, se, ep);
+        if (matched) {
+          subjectId = matched.subjectId;
+          detailPath = matched.detailPath || detailPath;
+          title = matched.title || title;
+          resolvedReleaseDate = matched.releaseDate || "";
+          if (matched.isSeries) resolvedIsSeries = true;
+        }
+      }
+      if (subjectId) {
+        const cachedEmbedDetail = findCachedDetailByPathOrTitle(`/mb/${subjectId}/${detailPath}`, title);
+        if (cachedEmbedDetail) {
+          if (cachedEmbedDetail.releaseDate) resolvedReleaseDate = cachedEmbedDetail.releaseDate;
+          if (cachedEmbedDetail.typeBadge === "SERIES") resolvedIsSeries = true;
         }
       }
       const [playResInitial, extIds] = await Promise.all([
         subjectId ? fetchMovieBoxPlayStreams(subjectId, detailPath, se, ep, title, lang, "") : Promise.resolve({ sources: [], buttons: [] }),
         Promise.race([
-          resolveExternalMediaIds(title, "", se > 0 || ep > 0),
+          resolveExternalMediaIds(title, resolvedReleaseDate, resolvedIsSeries),
           new Promise((r) => setTimeout(() => r({ imdbId: "", tmdbId: "" }), 2400))
         ])
       ]);
