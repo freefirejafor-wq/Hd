@@ -3223,14 +3223,37 @@ function buildEmbedBackupSources(
 
   const servers: Array<{ id: string; provider: string; label: string; url: string }> = [];
 
+  // Sandbox-safe ad-free servers first (popups & redirects blocked at browser level)
   if (cleanTmdb) {
     servers.push({
       id: `cloud-vidlink-${cleanTmdb}-${se}-${ep}`,
       provider: 'Server 1 • CinePulse Cloud HD',
-      label: '1080p Cloud HD (Multi-Audio + Subtitles)',
+      label: '1080p Cloud HD (Ad-Free + Subtitles)',
       url: isTv
         ? `https://vidlink.pro/tv/${encodeURIComponent(cleanTmdb)}/${se}/${ep}?primaryColor=e50914&autoplay=true`
         : `https://vidlink.pro/movie/${encodeURIComponent(cleanTmdb)}?primaryColor=e50914&autoplay=true`,
+    });
+  }
+
+  if (cleanImdb) {
+    servers.push({
+      id: `cloud-111movies-${cleanImdb}-${se}-${ep}`,
+      provider: 'Server 2 • CinePulse Prime HD',
+      label: '1080p Prime HD (Ad-Free)',
+      url: isTv
+        ? `https://111movies.com/tv/${encodeURIComponent(cleanImdb)}/${se}/${ep}`
+        : `https://111movies.com/movie/${encodeURIComponent(cleanImdb)}`,
+    });
+  }
+
+  if (cleanTmdb) {
+    servers.push({
+      id: `cloud-vidnest-${cleanTmdb}-${se}-${ep}`,
+      provider: 'Server 3 • CinePulse Global HD',
+      label: '1080p Global HD (Ad-Free)',
+      url: isTv
+        ? `https://vidnest.fun/tv/${encodeURIComponent(cleanTmdb)}/${se}/${ep}`
+        : `https://vidnest.fun/movie/${encodeURIComponent(cleanTmdb)}`,
     });
   }
 
@@ -3238,7 +3261,7 @@ function buildEmbedBackupSources(
   if (vfId) {
     servers.push({
       id: `cloud-vidfast-${vfId}-${se}-${ep}`,
-      provider: 'Server 2 • CinePulse Fast HD',
+      provider: 'Server 4 • CinePulse Fast HD',
       label: '1080p Fast HLS Auto',
       url: isTv
         ? `https://vidfast.pro/tv/${encodeURIComponent(vfId)}/${se}/${ep}?autoPlay=true`
@@ -3249,34 +3272,12 @@ function buildEmbedBackupSources(
   if (cleanImdb) {
     servers.push({
       id: `cloud-vidsrc-${cleanImdb}-${se}-${ep}`,
-      provider: 'Server 3 • CinePulse Ultra HD',
+      provider: 'Server 5 • CinePulse Ultra HD',
       label: '1080p Global CDN',
       url: isTv
         ? `https://vidsrc.me/embed/tv?imdb=${encodeURIComponent(cleanImdb)}&season=${se}&episode=${ep}`
         : `https://vidsrc.me/embed/movie?imdb=${encodeURIComponent(cleanImdb)}`,
     });
-    servers.push({
-      id: `cloud-111movies-${cleanImdb}-${se}-${ep}`,
-      provider: 'Server 4 • CinePulse Prime HD',
-      label: '1080p Prime Multi-Server',
-      url: isTv
-        ? `https://111movies.com/tv/${encodeURIComponent(cleanImdb)}/${se}/${ep}`
-        : `https://111movies.com/movie/${encodeURIComponent(cleanImdb)}`,
-    });
-  }
-
-  if (cleanTmdb) {
-    servers.push({
-      id: `cloud-vidnest-${cleanTmdb}-${se}-${ep}`,
-      provider: 'Server 5 • CinePulse Global HD',
-      label: '1080p Global Backup',
-      url: isTv
-        ? `https://vidnest.fun/tv/${encodeURIComponent(cleanTmdb)}/${se}/${ep}`
-        : `https://vidnest.fun/movie/${encodeURIComponent(cleanTmdb)}`,
-    });
-  }
-
-  if (cleanImdb) {
     servers.push({
       id: `cloud-2embed-${cleanImdb}-${se}-${ep}`,
       provider: 'Server 6 • CinePulse Backup HD',
@@ -9016,6 +9017,11 @@ async function startServer() {
         v.play().catch(function(){});
       } else {
         const f = document.createElement('iframe');
+        const isSandboxSafe = /vidlink\.pro|111movies\.com|vidnest\.fun/i.test(s.url);
+        if (isSandboxSafe) {
+          // Strictly block all popup ads and top-level ad redirects while allowing full video playback & fullscreen
+          f.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-presentation');
+        }
         f.src = s.url;
         f.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';
         f.allowFullscreen = true;
@@ -9024,6 +9030,7 @@ async function startServer() {
       }
     }
 
+    try { window.open = function() { return null; }; } catch {}
     init();
   </script>
 </body>
@@ -12471,6 +12478,17 @@ async function startServer() {
 
   app.all('/api/noop', (_req, res) => {
     res.status(204).end();
+  });
+
+  app.get('/mb-proxy.zip', (_req, res) => {
+    const zipPath = path.join(process.cwd(), 'public', 'mb-proxy.zip');
+    if (!fs.existsSync(zipPath)) {
+      res.status(404).send('Proxy zip not found');
+      return;
+    }
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', 'attachment; filename="mb-proxy.zip"');
+    res.sendFile(zipPath);
   });
 
   // Root route redirects directly to the Commercial Client API Tester & Docs Portal (/trial)
