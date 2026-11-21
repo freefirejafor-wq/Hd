@@ -6107,7 +6107,7 @@ async function startServer() {
   };
   let startTelegramBotPoller = () => {
   };
-  const DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL = "https://mb-stream.rahamanabduar2.workers.dev";
+  const DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL = "";
   const workerHealthMap = /* @__PURE__ */ new Map();
   const workerHealthInFlight = /* @__PURE__ */ new Map();
   const probeCloudflareWorkerHealth = (workerUrl, force = false) => {
@@ -8974,11 +8974,9 @@ ${buildClientCardHtml(exact)}`,
         if (/^(reset|default)$/i.test(cleanUrl)) {
           delete botConfigState.workerUrl;
           saveBotConfig(botConfigState);
-          const health2 = await probeCloudflareWorkerHealth(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL, true);
           await dispatch("sendMessage", {
             chat_id: chatId,
-            text: health2.healthy ? `\u2705 \u09A1\u09BF\u09AB\u09B2\u09CD\u099F Cloudflare Worker (v${health2.version}) \u099A\u09BE\u09B2\u09C1 \u0995\u09B0\u09BE \u09B9\u09DF\u09C7\u099B\u09C7:
-<code>${escTgHtml(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL)}</code>` : `\u26A0\uFE0F \u09A1\u09BF\u09AB\u09B2\u09CD\u099F Worker \u09B8\u09C7\u099F \u09B9\u09DF\u09C7\u099B\u09C7, \u0995\u09BF\u09A8\u09CD\u09A4\u09C1 \u098F\u099F\u09BF \u098F\u0996\u09A8\u0993 \u09AA\u09C1\u09B0\u09A8\u09CB v1 \u0995\u09CB\u09A1\u09C7 \u0986\u099B\u09C7 \u2014 \u09A4\u09BE\u0987 \u09AD\u09BF\u09A1\u09BF\u0993 \u09B8\u099A\u09B2 \u09B0\u09BE\u0996\u09A4\u09C7 \u0985\u099F\u09CB Direct Server \u099A\u09BE\u09B2\u09C1 \u09A5\u09BE\u0995\u099B\u09C7\u0964 Cloudflare-\u098F \u09A8\u09A4\u09C1\u09A8 <code>cloudflare-worker.js</code> (v2) Deploy \u0995\u09B0\u09B2\u09C7\u0987 \u0985\u099F\u09CB Worker \u099A\u09BE\u09B2\u09C1 \u09B9\u09AC\u09C7\u0964`,
+            text: "\u2705 \u09A1\u09BF\u09AB\u09B2\u09CD\u099F Direct Server Video Proxy \u099A\u09BE\u09B2\u09C1 \u0995\u09B0\u09BE \u09B9\u09DF\u09C7\u099B\u09C7 (\u09B8\u09AC \u09AD\u09BF\u09A1\u09BF\u0993 \u09B8\u09B0\u09BE\u09B8\u09B0\u09BF \u0986\u09AA\u09A8\u09BE\u09B0 \u09B8\u09BE\u09B0\u09CD\u09AD\u09BE\u09B0 \u09A5\u09C7\u0995\u09C7 206 MP4 \u09B8\u09CD\u099F\u09CD\u09B0\u09BF\u09AE \u09B9\u09AC\u09C7)\u0964",
             parse_mode: "HTML"
           });
           return { handled: true, reason: "cmd:setworker:reset" };

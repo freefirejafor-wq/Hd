@@ -6686,7 +6686,8 @@ async function startServer() {
   let notifyTelegramTrialAlert: (rec: StoredTrialKey, reason: 'EXPIRED' | 'QUOTA_EXHAUSTED') => void = () => {};
   let capturePublicOriginForBot: (req: express.Request) => void = () => {};
   let startTelegramBotPoller: () => void = () => {};
-  const DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL = 'https://mb-stream.rahamanabduar2.workers.dev';
+  // Direct Server Proxy is default because MovieBox CDN (bcdnxw.hakunaymatata.com) blocks Cloudflare Worker egress IPs with HTTP 429.
+  const DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL = '';
   interface WorkerHealthEntry {
     healthy: boolean;
     version: number;
@@ -9925,12 +9926,9 @@ async function startServer() {
         if (/^(reset|default)$/i.test(cleanUrl)) {
           delete botConfigState.workerUrl;
           saveBotConfig(botConfigState);
-          const health = await probeCloudflareWorkerHealth(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL, true);
           await dispatch('sendMessage', {
             chat_id: chatId,
-            text: health.healthy
-              ? `✅ ডিফল্ট Cloudflare Worker (v${health.version}) চালু করা হয়েছে:\n<code>${escTgHtml(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL)}</code>`
-              : `⚠️ ডিফল্ট Worker সেট হয়েছে, কিন্তু এটি এখনও পুরনো v1 কোডে আছে — তাই ভিডিও সচল রাখতে অটো Direct Server চালু থাকছে। Cloudflare-এ নতুন <code>cloudflare-worker.js</code> (v2) Deploy করলেই অটো Worker চালু হবে।`,
+            text: '✅ ডিফল্ট Direct Server Video Proxy চালু করা হয়েছে (সব ভিডিও সরাসরি আপনার সার্ভার থেকে 206 MP4 স্ট্রিম হবে)।',
             parse_mode: 'HTML',
           });
           return { handled: true, reason: 'cmd:setworker:reset' };
