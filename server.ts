@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import express from 'express';
 import fs from 'fs';
 import http from 'http';
+import http2 from 'http2';
 import https from 'https';
 import path from 'path';
 import { Readable } from 'stream';
@@ -5325,6 +5326,180 @@ async function startServer() {
         }
       }
 
+      // If Node https.request (HTTP/1.1) received 426 (Upgrade Required) / 403 / 429 / 5xx on targetUrl,
+      // try REAL native HTTP/2 (node:http2) on targetUrl FIRST (before falling back to trailer fallbackUrl)!
+      const tryStreamViaHttp2 = async (
+        h2Target: string,
+        h2Headers: Record<string, string>,
+        timeoutMs = 8000,
+        redirectDepth = 0
+      ): Promise<boolean> => {
+        if (!h2Target.startsWith('https://') || redirectDepth > 4) return false;
+        let parsed: URL;
+        try {
+          parsed = new URL(h2Target);
+        } catch {
+          return false;
+        }
+        return new Promise<boolean>((resolve) => {
+          let settled = false;
+          const finish = (ok: boolean) => {
+            if (!settled) {
+              settled = true;
+              resolve(ok);
+            }
+          };
+          let client: http2.ClientHttp2Session;
+          try {
+            client = http2.connect(parsed.origin);
+          } catch {
+            finish(false);
+            return;
+          }
+          const safeCloseClient = () => {
+            try {
+              if (!client.destroyed) client.close();
+            } catch {
+              // ignore
+            }
+          };
+          const timer = setTimeout(() => {
+            safeCloseClient();
+            finish(false);
+          }, timeoutMs);
+
+          client.on('error', () => {
+            clearTimeout(timer);
+            safeCloseClient();
+            finish(false);
+          });
+
+          const reqHeaders: http2.OutgoingHttpHeaders = {
+            ':method': req.method === 'HEAD' ? 'HEAD' : 'GET',
+            ':path': parsed.pathname + parsed.search,
+          };
+          for (const [k, v] of Object.entries(h2Headers)) {
+            if (v) reqHeaders[k.toLowerCase()] = v;
+          }
+
+          let h2Req: http2.ClientHttp2Stream;
+          try {
+            h2Req = client.request(reqHeaders);
+          } catch {
+            clearTimeout(timer);
+            safeCloseClient();
+            finish(false);
+            return;
+          }
+
+          h2Req.on('error', () => {
+            clearTimeout(timer);
+            safeCloseClient();
+            if (res.headersSent && !res.writableEnded) res.end();
+            finish(false);
+          });
+
+          h2Req.on('response', (hdrs) => {
+            clearTimeout(timer);
+            const status = Number(hdrs[':status'] || 0);
+            const loc = hdrs.location ? String(hdrs.location) : '';
+            if (
+              (status === 301 || status === 302 || status === 303 || status === 307 || status === 308) &&
+              loc
+            ) {
+              h2Req.close();
+              safeCloseClient();
+              const nextUrl = new URL(loc, parsed).toString();
+              void tryStreamViaHttp2(nextUrl, h2Headers, timeoutMs, redirectDepth + 1).then(finish);
+              return;
+            }
+            if (status !== 200 && status !== 206) {
+              h2Req.close();
+              safeCloseClient();
+              finish(false);
+              return;
+            }
+            let ct = String(hdrs['content-type'] || 'video/mp4')
+              .split(';')[0]
+              .trim();
+            if (!ct || ct === 'application/octet-stream' || ct === 'binary/octet-stream') {
+              ct = /\.mkv(\?|$)/i.test(h2Target) ? 'video/x-matroska' : 'video/mp4';
+            }
+            const cr = hdrs['content-range'] ? String(hdrs['content-range']) : '';
+            const cl = hdrs['content-length'] ? String(hdrs['content-length']) : '';
+            res.status(status);
+            res.setHeader('Content-Type', ct);
+            res.setHeader('Accept-Ranges', String(hdrs['accept-ranges'] || 'bytes'));
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+            res.setHeader('X-Cache', 'VIRTUAL-CHUNK-H2');
+            if (cl) res.setHeader('Content-Length', cl);
+            if (cr) res.setHeader('Content-Range', cr);
+            if (isDownload) {
+              res.setHeader(
+                'Content-Disposition',
+                `attachment; filename="${rawFilename.endsWith('.mp4') ? rawFilename : `${rawFilename}.mp4`}"`
+              );
+            }
+            if (req.method === 'HEAD') {
+              h2Req.close();
+              safeCloseClient();
+              res.end();
+              finish(true);
+              return;
+            }
+            res.on('close', () => {
+              try {
+                if (!h2Req.destroyed) h2Req.close();
+              } catch {
+                // ignore
+              }
+              safeCloseClient();
+            });
+            h2Req.on('end', () => {
+              safeCloseClient();
+            });
+            h2Req.pipe(res);
+            finish(true);
+          });
+
+          h2Req.end();
+        });
+      };
+
+      if (!upstream || (upstream.statusCode !== 200 && upstream.statusCode !== 206)) {
+        const h2HeaderSets: Record<string, string>[] = isMlbdStream
+          ? [{ 'User-Agent': chromeUa, Referer: `${activeMovieLinkBdOrigin}/`, Accept: '*/*' }]
+          : [
+              {
+                'User-Agent': chromeUa,
+                Referer: 'https://movie-box.co/',
+                Accept: '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Sec-Fetch-Dest': 'video',
+                'Sec-Fetch-Mode': 'no-cors',
+                'Sec-Fetch-Site': 'cross-site',
+              },
+              {
+                'User-Agent': chromeUa,
+                Referer: 'https://123movienow.cc/',
+                Accept: '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+              },
+              {
+                'User-Agent': 'okhttp/4.12.0',
+                Referer: 'https://movie-box.co/',
+                Accept: '*/*',
+              },
+            ];
+        for (const hSet of h2HeaderSets) {
+          const h2Hdrs: Record<string, string> = { ...hSet };
+          if (forwardHeaders.Range) h2Hdrs.Range = forwardHeaders.Range;
+          const okH2 = await tryStreamViaHttp2(targetUrl, h2Hdrs, 8000);
+          if (okH2) return;
+        }
+      }
+
       if (
         (!upstream || (upstream.statusCode !== 200 && upstream.statusCode !== 206)) &&
         fallbackUrl &&
@@ -5353,7 +5528,7 @@ async function startServer() {
         }
       }
 
-      // If Node https.request (HTTP/1.1) received 426/403/429/5xx, fall back to undici HTTP/2 fetch with working Referers!
+      // Final undici fetch fallback if both HTTP/1.1 socket and HTTP/2 failed
       if (!upstream || (upstream.statusCode !== 200 && upstream.statusCode !== 206)) {
         const fetchTargets = [targetUrl, fallbackUrl].filter((u) => Boolean(u && u.startsWith('http')));
         const fetchHeaderSets: Record<string, string>[] = isMlbdStream
@@ -5400,6 +5575,7 @@ async function startServer() {
                 res.setHeader('Content-Type', ct);
                 res.setHeader('Accept-Ranges', String(fRes.headers.get('accept-ranges') || 'bytes'));
                 res.setHeader('Cache-Control', 'public, max-age=3600');
+                res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
                 res.setHeader('X-Cache', 'VIRTUAL-CHUNK-FETCH');
                 if (cl) res.setHeader('Content-Length', cl);
                 if (cr) res.setHeader('Content-Range', cr);
