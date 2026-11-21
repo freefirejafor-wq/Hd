@@ -127,8 +127,9 @@ async function discoverActiveMovieLinkBdOrigin(force = false): Promise<string> {
 }
 
 const MOVIEBOX_ORIGIN = 'https://movie-box.co';
+const MOVIEBOX_LATEST_ORIGIN = 'https://moviebox01.com';
 const MOVIEBOX_BACKUP_ORIGIN = 'https://movieboxhd.net';
-const MOVIEBOX_API_ORIGIN = 'https://movie-box.co';
+const MOVIEBOX_API_ORIGIN = 'https://moviebox01.com';
 const MOVIEBOX_FALLBACK_API_ORIGIN = 'https://h5-api.aoneroom.com';
 
 interface CacheEntry<T> {
@@ -6148,6 +6149,46 @@ async function startServer() {
 
   // 6a-1. CinePulse HD Turbo Virtual Micro-Chunk Stream & Download Proxy
   app.get(['/api/mb-stream', '/api/mb-stream.mp4'], async (req, res) => {
+    const relayOrigin = resolveStreamProxyOrigin('');
+    const isExternalTunnelRelay = Boolean(
+      relayOrigin &&
+        /^https?:\/\//i.test(relayOrigin) &&
+        /trycloudflare\.com|lhr\.life|localhost\.run|ngrok-free\.app|serveo\.net|loca\.lt/i.test(relayOrigin)
+    );
+    if (isExternalTunnelRelay) {
+      try {
+        const relayHeaders: Record<string, string> = {
+          'User-Agent': String(req.headers['user-agent'] || 'Mozilla/5.0'),
+          Accept: '*/*',
+        };
+        if (req.headers.range) relayHeaders.Range = String(req.headers.range);
+        const ac = new AbortController();
+        req.on('close', () => ac.abort());
+        const up = await fetch(`${relayOrigin}${req.originalUrl}`, {
+          method: 'GET',
+          headers: relayHeaders,
+          signal: ac.signal,
+        });
+        if (up.status === 200 || up.status === 206) {
+          res.status(up.status);
+          for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'content-disposition', 'cache-control']) {
+            const v = up.headers.get(h);
+            if (v) res.setHeader(h, v);
+          }
+          res.setHeader('Access-Control-Allow-Origin', '*');
+          if (up.body) {
+            Readable.fromWeb(up.body as any).pipe(res);
+          } else {
+            res.end();
+          }
+          return;
+        }
+        try { await up.body?.cancel(); } catch {}
+      } catch {
+        if (res.headersSent) return;
+      }
+    }
+
     const token = String(req.query.t || '').trim();
     const fbToken = String(req.query.fb || '').trim();
     const isDownload = String(req.query.dl || '0') === '1';
@@ -8188,6 +8229,7 @@ async function startServer() {
 
     const streamBase = resolveStreamProxyOrigin(base);
     const streamHealth = streamBase !== base ? workerHealthMap.get(streamBase) : undefined;
+    const keepMainHostForTunnel = /trycloudflare\.com|lhr\.life|localhost\.run|ngrok-free\.app|serveo\.net|loca\.lt/i.test(streamBase);
 
     const toTrialUrl = (u: string) => {
       if (!u || !u.startsWith('/')) return u;
@@ -8195,7 +8237,7 @@ async function startServer() {
       const isWorkerEligible = u.startsWith('/api/mb-stream') || u.startsWith('/api/mb-subtitle-srt');
       const isServerEpStream = u.startsWith('/api/mb-ep-stream');
       const needsTk = isWorkerEligible || isServerEpStream;
-      const useStreamHost = isWorkerEligible || (isServerEpStream && Boolean(streamHealth?.supportsEpStream));
+      const useStreamHost = !keepMainHostForTunnel && (isWorkerEligible || (isServerEpStream && Boolean(streamHealth?.supportsEpStream)));
       const hostBase = useStreamHost ? streamBase : base;
       return `${hostBase}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ''}`;
     };
@@ -8522,25 +8564,45 @@ async function startServer() {
     const platform = String(req.query.name || req.query.platform || 'Netflix').trim() || 'Netflix';
     const page = Math.min(50, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
     try {
-      const headers = await getMovieBoxAuthHeaders(MOVIEBOX_ORIGIN);
-      const platJson = await Promise.any(
-        ['https://moviebox01.com', MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_API_ORIGIN].map(async (origin) => {
+      const headers = await getMovieBoxAuthHeaders(MOVIEBOX_LATEST_ORIGIN);
+      const platPayload = await Promise.any(
+        [MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_LATEST_ORIGIN, MOVIEBOX_ORIGIN].map(async (origin) => {
+          // MovieBox platform/play-list caps perPage at 6 months per request (perPage > 6 returns HTTP 400)
           const r = await fetch(
-            `${origin}/wefeed-h5api-bff/platform/play-list?page=${page}&perPage=24&platform=${encodeURIComponent(platform)}`,
+            `${origin}/wefeed-h5api-bff/platform/play-list?page=${page}&perPage=6&platform=${encodeURIComponent(platform)}`,
             { headers, signal: AbortSignal.timeout(4500) }
           );
           if (!r.ok) throw new Error('Bad status');
           const j = (await r.json()) as any;
-          const list = j?.data?.subjectList || j?.data?.items || [];
-          if (!Array.isArray(list) || list.length === 0) throw new Error('Empty');
-          return list;
+          const monthList: any[] = Array.isArray(j?.data?.monthList) ? j.data.monthList : [];
+          const directList: any[] = j?.data?.subjectList || j?.data?.items || [];
+          const flat =
+            monthList.length > 0
+              ? monthList.flatMap((m: any) => (Array.isArray(m?.subjects) ? m.subjects : Array.isArray(m?.subjectList) ? m.subjectList : []))
+              : directList;
+          if (!Array.isArray(flat) || flat.length === 0) throw new Error('Empty');
+          return { flat, monthList };
         })
       ).catch(() => null);
+
       let items: MovieCardItem[] = [];
-      if (Array.isArray(platJson) && platJson.length > 0) {
+      let months: Array<{ month: string; count: number; items: Array<MovieCardItem & { detailsEndpoint: string }> }> = [];
+      if (platPayload && platPayload.flat.length > 0) {
         items = normalizeMovieCardList(
-          platJson.map((raw: any, i: number) => mapMovieBoxItemToCard(raw, i)).filter(Boolean) as MovieCardItem[]
+          platPayload.flat.map((raw: any, i: number) => mapMovieBoxItemToCard(raw, i)).filter(Boolean) as MovieCardItem[]
         );
+        months = platPayload.monthList
+          .map((m: any) => {
+            const rawSubs: any[] = Array.isArray(m?.subjects) ? m.subjects : Array.isArray(m?.subjectList) ? m.subjectList : [];
+            const cards = normalizeMovieCardList(
+              rawSubs.map((raw: any, i: number) => mapMovieBoxItemToCard(raw, i)).filter(Boolean) as MovieCardItem[]
+            ).map((item) => ({
+              ...item,
+              detailsEndpoint: `${base}/api/trial/details?path=${encodeURIComponent(item.path)}`,
+            }));
+            return { month: String(m?.month || ''), count: cards.length, items: cards };
+          })
+          .filter((m) => m.count > 0);
       } else {
         const fb = await fetchMovieBoxCatalog('/', page, platform);
         items = normalizeMovieCardList(fb.items);
@@ -8553,6 +8615,7 @@ async function startServer() {
         availablePlatforms: ['Netflix', 'PrimeVideo', 'Disney', 'AppleTV', 'Viu', 'Hulu', 'Zee5', 'Vivamax', 'Hoichoi', 'Showmax'],
         page,
         count: items.length,
+        months,
         items: items.map((item) => ({
           ...item,
           detailsEndpoint: `${base}/api/trial/details?path=${encodeURIComponent(item.path)}`,
@@ -8560,6 +8623,69 @@ async function startServer() {
       });
     } catch (err: any) {
       sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Platform feed failed' });
+    }
+  });
+
+  // Official MovieBox Top Rankings & Charts (/wefeed-h5api-bff/ranking-list/content + subject/trending)
+  app.get('/api/trial/rankings', requireValidTrialKey, async (req, res) => {
+    const rec = (req as any)._trialKeyRec as StoredTrialKey;
+    const base = getPublicOrigin(req);
+    const page = Math.min(30, Math.max(1, parseInt(String(req.query.page || '1'), 10) || 1));
+    const perPage = Math.min(30, Math.max(6, parseInt(String(req.query.perPage || '20'), 10) || 20));
+    const rankingId = String(req.query.id || '872031290915189720').trim();
+    const chartType = String(req.query.type || 'trending').trim().toLowerCase();
+    try {
+      const headers = await getMovieBoxAuthHeaders(MOVIEBOX_LATEST_ORIGIN);
+      const rankPayload = await Promise.any(
+        [MOVIEBOX_FALLBACK_API_ORIGIN, MOVIEBOX_LATEST_ORIGIN, MOVIEBOX_ORIGIN].map(async (origin) => {
+          const url =
+            chartType === 'global' || chartType === 'hot'
+              ? `${origin}/wefeed-h5api-bff/subject/trending?page=${page}&perPage=${perPage}`
+              : `${origin}/wefeed-h5api-bff/ranking-list/content?id=${encodeURIComponent(rankingId)}&page=${page}&perPage=${perPage}`;
+          const r = await fetch(url, { headers, signal: AbortSignal.timeout(4500) });
+          if (!r.ok) throw new Error('Bad status');
+          const j = (await r.json()) as any;
+          const list = j?.data?.subjectList || j?.data?.items || [];
+          if (!Array.isArray(list) || list.length === 0) throw new Error('Empty');
+          return { title: String(j?.data?.title || 'Trending Now'), list };
+        })
+      ).catch(() => null);
+
+      let items: MovieCardItem[] = [];
+      let chartTitle = 'Trending Now';
+      if (rankPayload && rankPayload.list.length > 0) {
+        chartTitle = rankPayload.title || chartTitle;
+        items = normalizeMovieCardList(
+          rankPayload.list.map((raw: any, i: number) => mapMovieBoxItemToCard(raw, i)).filter(Boolean) as MovieCardItem[]
+        );
+      } else {
+        const fb = await fetchMovieBoxCatalog('/', page, '');
+        items = normalizeMovieCardList(fb.items);
+      }
+
+      if (chartType === 'movies' || chartType === 'movie') {
+        items = items.filter((it) => it.typeBadge !== 'SERIES');
+      } else if (chartType === 'series' || chartType === 'tv') {
+        items = items.filter((it) => it.typeBadge === 'SERIES');
+      }
+
+      sendPrettyDemoJson(res, 200, {
+        ok: true,
+        source: 'official-moviebox-original',
+        trial: buildTrialSummary(rec),
+        chartTitle,
+        rankingId,
+        type: chartType,
+        page,
+        count: items.length,
+        items: items.map((item, idx) => ({
+          rank: (page - 1) * perPage + idx + 1,
+          ...item,
+          detailsEndpoint: `${base}/api/trial/details?path=${encodeURIComponent(item.path)}`,
+        })),
+      });
+    } catch (err: any) {
+      sendPrettyDemoJson(res, 500, { ok: false, error: err?.message || 'Rankings feed failed' });
     }
   });
 
@@ -8934,6 +9060,7 @@ async function startServer() {
       );
       const streamBase = resolveStreamProxyOrigin(base);
       const streamHealth = streamBase !== base ? workerHealthMap.get(streamBase) : undefined;
+      const keepMainHostForTunnel = /trycloudflare\.com|lhr\.life|localhost\.run|ngrok-free\.app|serveo\.net|loca\.lt/i.test(streamBase);
       const sampleDirectMp4Url = playRes.sources.find((s) => s.directUrl)?.directUrl || '';
       const directProxyWorking = await isDirectMp4CdnReachableFromHost(sampleDirectMp4Url, streamBase !== base);
       const toAbsoluteWithTrialTk = (u: string) => {
@@ -8942,7 +9069,7 @@ async function startServer() {
         const isWorkerEligible = u.startsWith('/api/mb-stream') || u.startsWith('/api/mb-subtitle-srt');
         const isServerEpStream = u.startsWith('/api/mb-ep-stream');
         const needsTk = isWorkerEligible || isServerEpStream;
-        const useStreamHost = isWorkerEligible || (isServerEpStream && Boolean(streamHealth?.supportsEpStream));
+        const useStreamHost = !keepMainHostForTunnel && (isWorkerEligible || (isServerEpStream && Boolean(streamHealth?.supportsEpStream)));
         const hostBase = useStreamHost ? streamBase : base;
         return `${hostBase}${u}${needsTk ? `${sep}tk=${encodeURIComponent(rec.key)}` : ''}`;
       };
@@ -9104,6 +9231,8 @@ async function startServer() {
       }
 
       const embedStreamBase = resolveStreamProxyOrigin(base);
+      const keepMainHostForTunnel = /trycloudflare\.com|lhr\.life|localhost\.run|ngrok-free\.app|serveo\.net|loca\.lt/i.test(embedStreamBase);
+      const publicEmbedStreamHost = keepMainHostForTunnel ? base : embedStreamBase;
       const sampleDirectMp4Url = playRes.sources.find((s) => s.directUrl)?.directUrl || '';
       const directProxyWorking = await isDirectMp4CdnReachableFromHost(sampleDirectMp4Url, embedStreamBase !== base);
 
@@ -9112,7 +9241,7 @@ async function startServer() {
         .map((s) => ({
           kind: 'mp4' as const,
           label: `Direct MP4 • ${s.quality}p`,
-          url: `${embedStreamBase}${s.url}${s.url.includes('?') ? '&' : '?'}tk=${encodeURIComponent(rec.key)}`,
+          url: `${publicEmbedStreamHost}${s.url}${s.url.includes('?') ? '&' : '?'}tk=${encodeURIComponent(rec.key)}`,
         }));
 
       const cloudServers = buildEmbedBackupSources(extIds.imdbId, effSe, effEp, title, lang, extIds.tmdbId).map((s) => ({
