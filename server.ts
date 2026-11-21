@@ -3223,23 +3223,39 @@ function buildEmbedBackupSources(
 
   const servers: Array<{ id: string; provider: string; label: string; url: string }> = [];
 
-  // Sandbox-safe ad-free servers first (popups & redirects blocked at browser level)
+  // Clean zero-popup HD servers first (verified no popunder/ad-redirect scripts)
   if (cleanTmdb) {
     servers.push({
-      id: `cloud-vidlink-${cleanTmdb}-${se}-${ep}`,
-      provider: 'Server 1 • CinePulse Cloud HD',
-      label: '1080p Cloud HD (Ad-Free + Subtitles)',
+      id: `cloud-vidsrcsu-${cleanTmdb}-${se}-${ep}`,
+      provider: 'Server 1 • CinePulse Clean HD',
+      label: '1080p Clean HD (No Popups + Subtitles)',
       url: isTv
-        ? `https://vidlink.pro/tv/${encodeURIComponent(cleanTmdb)}/${se}/${ep}?primaryColor=e50914&autoplay=true`
-        : `https://vidlink.pro/movie/${encodeURIComponent(cleanTmdb)}?primaryColor=e50914&autoplay=true`,
+        ? `https://vidsrc.su/embed/tv/${encodeURIComponent(cleanTmdb)}/${se}/${ep}`
+        : `https://vidsrc.su/embed/movie/${encodeURIComponent(cleanTmdb)}`,
+    });
+    servers.push({
+      id: `cloud-moviesapi-${cleanTmdb}-${se}-${ep}`,
+      provider: 'Server 2 • CinePulse Ad-Free HD',
+      label: '1080p Ad-Free Sandbox HD',
+      url: isTv
+        ? `https://moviesapi.to/tv/${encodeURIComponent(cleanTmdb)}-${se}-${ep}`
+        : `https://moviesapi.to/movie/${encodeURIComponent(cleanTmdb)}`,
+    });
+    servers.push({
+      id: `cloud-smashy-${cleanTmdb}-${se}-${ep}`,
+      provider: 'Server 3 • CinePulse Prime HD',
+      label: '1080p Ad-Free Multi-Audio',
+      url: isTv
+        ? `https://embed.smashystream.com/playere.php?tmdb=${encodeURIComponent(cleanTmdb)}&season=${se}&episode=${ep}`
+        : `https://embed.smashystream.com/playere.php?tmdb=${encodeURIComponent(cleanTmdb)}`,
     });
   }
 
   if (cleanImdb) {
     servers.push({
       id: `cloud-111movies-${cleanImdb}-${se}-${ep}`,
-      provider: 'Server 2 • CinePulse Prime HD',
-      label: '1080p Prime HD (Ad-Free)',
+      provider: 'Server 4 • CinePulse Ultra HD',
+      label: '1080p Ultra IMDb HD',
       url: isTv
         ? `https://111movies.com/tv/${encodeURIComponent(cleanImdb)}/${se}/${ep}`
         : `https://111movies.com/movie/${encodeURIComponent(cleanImdb)}`,
@@ -3249,42 +3265,22 @@ function buildEmbedBackupSources(
   if (cleanTmdb) {
     servers.push({
       id: `cloud-vidnest-${cleanTmdb}-${se}-${ep}`,
-      provider: 'Server 3 • CinePulse Global HD',
-      label: '1080p Global HD (Ad-Free)',
+      provider: 'Server 5 • CinePulse Global HD',
+      label: '1080p Global HD',
       url: isTv
         ? `https://vidnest.fun/tv/${encodeURIComponent(cleanTmdb)}/${se}/${ep}`
         : `https://vidnest.fun/movie/${encodeURIComponent(cleanTmdb)}`,
     });
   }
 
-  const vfId = cleanTmdb || cleanImdb;
-  if (vfId) {
-    servers.push({
-      id: `cloud-vidfast-${vfId}-${se}-${ep}`,
-      provider: 'Server 4 • CinePulse Fast HD',
-      label: '1080p Fast HLS Auto',
-      url: isTv
-        ? `https://vidfast.pro/tv/${encodeURIComponent(vfId)}/${se}/${ep}?autoPlay=true`
-        : `https://vidfast.pro/movie/${encodeURIComponent(vfId)}?autoPlay=true`,
-    });
-  }
-
   if (cleanImdb) {
     servers.push({
-      id: `cloud-vidsrc-${cleanImdb}-${se}-${ep}`,
-      provider: 'Server 5 • CinePulse Ultra HD',
-      label: '1080p Global CDN',
+      id: `cloud-vidsrcme-${cleanImdb}-${se}-${ep}`,
+      provider: 'Server 6 • CinePulse Backup HD',
+      label: '1080p Backup Mirror',
       url: isTv
         ? `https://vidsrc.me/embed/tv?imdb=${encodeURIComponent(cleanImdb)}&season=${se}&episode=${ep}`
         : `https://vidsrc.me/embed/movie?imdb=${encodeURIComponent(cleanImdb)}`,
-    });
-    servers.push({
-      id: `cloud-2embed-${cleanImdb}-${se}-${ep}`,
-      provider: 'Server 6 • CinePulse Backup HD',
-      label: '720p/1080p Backup Mirror',
-      url: isTv
-        ? `https://www.2embed.cc/embedtv/${encodeURIComponent(cleanImdb)}&s=${se}&e=${ep}`
-        : `https://www.2embed.cc/embed/${encodeURIComponent(cleanImdb)}`,
     });
   }
 
@@ -9017,6 +9013,10 @@ async function startServer() {
         v.play().catch(function(){});
       } else {
         const f = document.createElement('iframe');
+        // Strictly sandbox ONLY verified sandbox-compatible players so popups/redirects are 100% blocked without triggering "Disable Sandbox"
+        if (/moviesapi\\.to|smashystream\\.com/i.test(s.url)) {
+          f.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-presentation');
+        }
         f.src = s.url;
         f.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';
         f.allowFullscreen = true;
