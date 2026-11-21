@@ -8939,12 +8939,18 @@ async function startServer() {
     .wrap { position:relative; width:100%; height:100%; display:flex; align-items:center; justify-content:center; background:#000; }
     video, iframe { width:100%; height:100%; border:0; background:#000; display:block; }
     video { object-fit:contain; }
-    .bar { position:absolute; top:10px; right:10px; left:10px; display:flex; justify-content:space-between; align-items:center; gap:8px; z-index:20; pointer-events:none; }
+    .bar { position:absolute; top:8px; right:8px; left:8px; display:flex; justify-content:space-between; align-items:center; gap:6px; z-index:20; pointer-events:none; }
     .bar > * { pointer-events:auto; }
-    .tag { background:rgba(15,17,24,.82); backdrop-filter:blur(8px); border:1px solid rgba(255,255,255,.14); color:#fff; font-size:11.5px; font-weight:700; padding:5px 10px; border-radius:7px; max-width:52%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-    .controls { display:flex; gap:6px; align-items:center; }
-    select { background:rgba(15,17,24,.9); backdrop-filter:blur(8px); color:#fff; border:1px solid rgba(255,255,255,.22); border-radius:7px; padding:5px 9px; font-size:12px; font-weight:600; cursor:pointer; max-width:210px; }
-    .next-btn { background:#e50914; color:#fff; border:0; border-radius:7px; padding:6px 10px; font-size:11.5px; font-weight:700; cursor:pointer; white-space:nowrap; }
+    .tag { background:rgba(15,17,24,.82); backdrop-filter:blur(8px); border:1px solid rgba(255,255,255,.14); color:#fff; font-size:11.5px; font-weight:700; padding:5px 10px; border-radius:7px; max-width:46%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .controls { display:flex; gap:6px; align-items:center; min-width:0; margin-left:auto; }
+    select { background:rgba(15,17,24,.9); backdrop-filter:blur(8px); color:#fff; border:1px solid rgba(255,255,255,.22); border-radius:7px; padding:5px 8px; font-size:11.5px; font-weight:600; cursor:pointer; max-width:210px; min-width:0; }
+    .next-btn { background:#e50914; color:#fff; border:0; border-radius:7px; padding:5px 10px; font-size:11.5px; font-weight:700; cursor:pointer; white-space:nowrap; flex-shrink:0; }
+    @media (max-width: 520px) {
+      .tag { display:none; }
+      .controls { width:100%; justify-content:space-between; }
+      select { flex:1; max-width:none; font-size:11px; padding:4px 7px; }
+      .next-btn { font-size:11px; padding:5px 8px; }
+    }
     .empty { text-align:center; padding:24px; color:#a1a1aa; font-size:14px; }
   </style>
 </head>
@@ -8954,7 +8960,7 @@ async function startServer() {
       <span class="tag">${safeTitle}${effSe > 0 ? ` • S${effSe}E${effEp}` : ''}</span>
       <div class="controls" id="ctrlBar" style="display:none;">
         <select id="srvSel" onchange="selectServer(Number(this.value))"></select>
-        <button class="next-btn" onclick="nextServer()" title="Switch Server">Next Server</button>
+        <button class="next-btn" onclick="nextServer()" title="Switch Server">Next</button>
       </div>
     </div>
     <div id="stage" style="width:100%;height:100%;"></div>
