@@ -8128,11 +8128,6 @@ async function startServer() {
         v.play().catch(function(){});
       } else {
         const f = document.createElement('iframe');
-        const isSandboxSafe = /vidlink.pro|111movies.com|vidnest.fun/i.test(s.url);
-        if (isSandboxSafe) {
-          // Strictly block all popup ads and top-level ad redirects while allowing full video playback & fullscreen
-          f.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-presentation');
-        }
         f.src = s.url;
         f.allow = 'autoplay; fullscreen; encrypted-media; picture-in-picture';
         f.allowFullscreen = true;
