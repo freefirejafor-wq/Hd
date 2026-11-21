@@ -6066,11 +6066,14 @@ async function startServer() {
   };
   let startTelegramBotPoller = () => {
   };
+  const DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL = "https://mb-stream.rahamanabduar2.workers.dev";
   let resolveStreamProxyOrigin = (fallbackBase) => {
     const envWorker = String(
       process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || process.env.CF_WORKER_STREAM_URL || ""
     ).trim().replace(/\/+$/, "");
-    return envWorker && /^https?:\/\//i.test(envWorker) ? envWorker : fallbackBase;
+    if (/^(off|none|disable|false)$/i.test(envWorker)) return fallbackBase;
+    if (envWorker && /^https?:\/\//i.test(envWorker)) return envWorker;
+    return DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL || fallbackBase;
   };
   const loadTrialKeysStore = () => {
     try {
@@ -7956,11 +7959,12 @@ async function startServer() {
     const envWorker = String(
       process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || process.env.CF_WORKER_STREAM_URL || ""
     ).trim().replace(/\/+$/, "");
+    if (/^(off|none|disable|false)$/i.test(envWorker)) return fallbackBase;
     if (envWorker && /^https?:\/\//i.test(envWorker)) return envWorker;
-    if (botConfigState.workerUrl && /^https?:\/\//i.test(botConfigState.workerUrl)) {
-      return botConfigState.workerUrl.replace(/\/+$/, "");
-    }
-    return fallbackBase;
+    const savedWorker = String(botConfigState.workerUrl || "").trim().replace(/\/+$/, "");
+    if (/^(off|none|disable|false)$/i.test(savedWorker)) return fallbackBase;
+    if (savedWorker && /^https?:\/\//i.test(savedWorker)) return savedWorker;
+    return DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL || fallbackBase;
   };
   capturePublicOriginForBot = (req) => {
     const rawOrigin = getPublicOrigin(req).replace(/\/+$/, "");
@@ -8826,15 +8830,26 @@ ${buildClientCardHtml(exact)}`,
           });
           return { handled: true, reason: "cmd:setworker:info" };
         }
-        if (/^(off|none|reset|disable)$/i.test(cleanUrl)) {
+        if (/^(off|none|disable)$/i.test(cleanUrl)) {
+          botConfigState.workerUrl = "off";
+          saveBotConfig(botConfigState);
+          await dispatch("sendMessage", {
+            chat_id: chatId,
+            text: "\u2705 Cloudflare Worker Video Proxy \u09AC\u09A8\u09CD\u09A7 \u0995\u09B0\u09BE \u09B9\u09DF\u09C7\u099B\u09C7 (\u098F\u0996\u09A8 \u09B8\u09BE\u09B0\u09CD\u09AD\u09BE\u09B0 \u09A5\u09C7\u0995\u09C7 \u09B8\u09B0\u09BE\u09B8\u09B0\u09BF \u09B8\u09CD\u099F\u09CD\u09B0\u09BF\u09AE \u09B9\u09AC\u09C7)\u0964\n\u0986\u09AC\u09BE\u09B0 \u09A1\u09BF\u09AB\u09B2\u09CD\u099F Worker \u099A\u09BE\u09B2\u09C1 \u0995\u09B0\u09A4\u09C7 \u09B2\u09BF\u0996\u09C1\u09A8: <code>/setworker reset</code>",
+            parse_mode: "HTML"
+          });
+          return { handled: true, reason: "cmd:setworker:off" };
+        }
+        if (/^(reset|default)$/i.test(cleanUrl)) {
           delete botConfigState.workerUrl;
           saveBotConfig(botConfigState);
           await dispatch("sendMessage", {
             chat_id: chatId,
-            text: "\u2705 Cloudflare Worker Video Proxy \u09AC\u09A8\u09CD\u09A7 \u0995\u09B0\u09BE \u09B9\u09DF\u09C7\u099B\u09C7 (\u098F\u0996\u09A8 \u09B8\u09BE\u09B0\u09CD\u09AD\u09BE\u09B0 \u09A5\u09C7\u0995\u09C7 \u09B8\u09B0\u09BE\u09B8\u09B0\u09BF \u09B8\u09CD\u099F\u09CD\u09B0\u09BF\u09AE \u09B9\u09AC\u09C7)\u0964",
+            text: `\u2705 \u09A1\u09BF\u09AB\u09B2\u09CD\u099F Cloudflare Worker \u099A\u09BE\u09B2\u09C1 \u0995\u09B0\u09BE \u09B9\u09DF\u09C7\u099B\u09C7:
+<code>${escTgHtml(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL)}</code>`,
             parse_mode: "HTML"
           });
-          return { handled: true, reason: "cmd:setworker:off" };
+          return { handled: true, reason: "cmd:setworker:reset" };
         }
         if (!/^https?:\/\/.+/i.test(cleanUrl)) {
           await dispatch("sendMessage", {
@@ -10230,11 +10245,12 @@ ${buildClientCardHtml(exact)}`,
     }
   });
   app.get("/api/health", (_req, res) => {
-    const videoProxy = (process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || "").trim();
+    const activeVideoProxy = resolveStreamProxyOrigin("");
     res.status(200).json({
       ok: true,
       service: "CinePulse HD",
-      videoProxyActive: Boolean(videoProxy),
+      videoProxyActive: Boolean(activeVideoProxy),
+      videoProxyHost: activeVideoProxy ? activeVideoProxy.replace(/^https?:\/\//i, "") : null,
       uptimeSeconds: Math.round(process.uptime()),
       timestamp: Date.now()
     });

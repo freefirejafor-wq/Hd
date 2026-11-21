@@ -6631,13 +6631,16 @@ async function startServer() {
   let notifyTelegramTrialAlert: (rec: StoredTrialKey, reason: 'EXPIRED' | 'QUOTA_EXHAUSTED') => void = () => {};
   let capturePublicOriginForBot: (req: express.Request) => void = () => {};
   let startTelegramBotPoller: () => void = () => {};
+  const DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL = 'https://mb-stream.rahamanabduar2.workers.dev';
   let resolveStreamProxyOrigin = (fallbackBase: string): string => {
     const envWorker = String(
       process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || process.env.CF_WORKER_STREAM_URL || ''
     )
       .trim()
       .replace(/\/+$/, '');
-    return envWorker && /^https?:\/\//i.test(envWorker) ? envWorker : fallbackBase;
+    if (/^(off|none|disable|false)$/i.test(envWorker)) return fallbackBase;
+    if (envWorker && /^https?:\/\//i.test(envWorker)) return envWorker;
+    return DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL || fallbackBase;
   };
 
   const loadTrialKeysStore = () => {
@@ -8771,11 +8774,12 @@ async function startServer() {
     )
       .trim()
       .replace(/\/+$/, '');
+    if (/^(off|none|disable|false)$/i.test(envWorker)) return fallbackBase;
     if (envWorker && /^https?:\/\//i.test(envWorker)) return envWorker;
-    if (botConfigState.workerUrl && /^https?:\/\//i.test(botConfigState.workerUrl)) {
-      return botConfigState.workerUrl.replace(/\/+$/, '');
-    }
-    return fallbackBase;
+    const savedWorker = String(botConfigState.workerUrl || '').trim().replace(/\/+$/, '');
+    if (/^(off|none|disable|false)$/i.test(savedWorker)) return fallbackBase;
+    if (savedWorker && /^https?:\/\//i.test(savedWorker)) return savedWorker;
+    return DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL || fallbackBase;
   };
 
   capturePublicOriginForBot = (req: express.Request) => {
@@ -9744,15 +9748,25 @@ async function startServer() {
           });
           return { handled: true, reason: 'cmd:setworker:info' };
         }
-        if (/^(off|none|reset|disable)$/i.test(cleanUrl)) {
+        if (/^(off|none|disable)$/i.test(cleanUrl)) {
+          botConfigState.workerUrl = 'off';
+          saveBotConfig(botConfigState);
+          await dispatch('sendMessage', {
+            chat_id: chatId,
+            text: '✅ Cloudflare Worker Video Proxy বন্ধ করা হয়েছে (এখন সার্ভার থেকে সরাসরি স্ট্রিম হবে)।\nআবার ডিফল্ট Worker চালু করতে লিখুন: <code>/setworker reset</code>',
+            parse_mode: 'HTML',
+          });
+          return { handled: true, reason: 'cmd:setworker:off' };
+        }
+        if (/^(reset|default)$/i.test(cleanUrl)) {
           delete botConfigState.workerUrl;
           saveBotConfig(botConfigState);
           await dispatch('sendMessage', {
             chat_id: chatId,
-            text: '✅ Cloudflare Worker Video Proxy বন্ধ করা হয়েছে (এখন সার্ভার থেকে সরাসরি স্ট্রিম হবে)।',
+            text: `✅ ডিফল্ট Cloudflare Worker চালু করা হয়েছে:\n<code>${escTgHtml(DEFAULT_CLOUDFLARE_VIDEO_WORKER_URL)}</code>`,
             parse_mode: 'HTML',
           });
-          return { handled: true, reason: 'cmd:setworker:off' };
+          return { handled: true, reason: 'cmd:setworker:reset' };
         }
         if (!/^https?:\/\/.+/i.test(cleanUrl)) {
           await dispatch('sendMessage', {
@@ -11318,11 +11332,12 @@ async function startServer() {
   });
 
   app.get('/api/health', (_req, res) => {
-    const videoProxy = (process.env.VIDEO_PROXY_URL || process.env.CF_VIDEO_WORKER_URL || '').trim();
+    const activeVideoProxy = resolveStreamProxyOrigin('');
     res.status(200).json({
       ok: true,
       service: 'CinePulse HD',
-      videoProxyActive: Boolean(videoProxy),
+      videoProxyActive: Boolean(activeVideoProxy),
+      videoProxyHost: activeVideoProxy ? activeVideoProxy.replace(/^https?:\/\//i, '') : null,
       uptimeSeconds: Math.round(process.uptime()),
       timestamp: Date.now(),
     });
